@@ -1,0 +1,12 @@
+node_modules/
+.env
+.env.local
+.env.*
+.DS_Store
+*.log
+coverage/
+dist/
+build/
+downloads/**
+!downloads/.gitkeep
+desktop/src-tauri/target/

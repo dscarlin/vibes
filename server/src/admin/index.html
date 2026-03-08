@@ -1,0 +1,143 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Vibes Platform Admin</title>
+    <link rel="stylesheet" href="/admin/static/admin.css" />
+  </head>
+  <body>
+    <main class="page">
+      <header class="header">
+        <div>
+          <h1>Admin Dashboard</h1>
+          <p class="subtle">Platform capacity, workload health, and audit visibility.</p>
+        </div>
+        <button id="logoutBtn" class="ghost" hidden>Log out</button>
+      </header>
+
+      <section id="loginSection" class="card">
+        <h2>Admin Login</h2>
+        <p class="subtle">Use your platform admin account.</p>
+        <form id="loginForm">
+          <label>
+            Email
+            <input type="email" id="loginEmail" required />
+          </label>
+          <label>
+            Password
+            <input type="password" id="loginPassword" required />
+          </label>
+          <button type="submit">Sign in</button>
+          <p id="loginError" class="error"></p>
+        </form>
+      </section>
+
+      <section id="dashboardSection" hidden>
+        <div class="toolbar">
+          <button id="refreshBtn">Refresh</button>
+          <span id="statusBadge" class="badge">Idle</span>
+          <button id="metricsExportJson" class="ghost small">Export Current JSON</button>
+          <button id="metricsExportCsv" class="ghost small">Export Current CSV</button>
+        </div>
+        <div id="metricsSummary" class="metrics-summary"></div>
+        <div id="metricsMeta" class="metrics-meta"></div>
+
+        <section class="grid">
+          <div class="card">
+            <h2>Capacity</h2>
+            <div id="capacitySummary" class="stat-grid"></div>
+            <div class="spark-grid">
+              <div class="spark-block">
+                <div class="spark-label">CPU % (last 30)</div>
+                <svg id="cpuSpark" class="spark" viewBox="0 0 240 40"></svg>
+              </div>
+              <div class="spark-block">
+                <div class="spark-label">Memory % (last 30)</div>
+                <svg id="memSpark" class="spark" viewBox="0 0 240 40"></svg>
+              </div>
+            </div>
+          </div>
+          <div class="card">
+            <h2>Pod Health</h2>
+            <div id="podSummary" class="stat-grid"></div>
+            <div id="crashLoopList" class="log"></div>
+          </div>
+          <div class="card">
+            <h2>Queue Health</h2>
+            <div id="queueSummary" class="stat-grid"></div>
+            <p id="queueNotice" class="subtle"></p>
+          </div>
+        </section>
+
+        <section class="grid">
+          <div class="card span-2">
+            <h2>Nodegroups</h2>
+            <div id="nodegroupTable"></div>
+          </div>
+        </section>
+
+        <section class="grid">
+          <div class="card">
+            <h2>Namespaces</h2>
+            <div id="namespaceTable"></div>
+          </div>
+          <div class="card">
+            <h2>Projects</h2>
+            <div id="projectSummary" class="stat-grid"></div>
+          </div>
+          <div class="card span-2" id="alertsCard">
+            <div class="card-header">
+              <h2>Alerts</h2>
+              <div class="card-actions">
+                <button class="ghost small" type="button" id="alertsExport">Export CSV</button>
+                <button class="ghost small" type="button" id="alertsRefresh">Refresh</button>
+                <button class="ghost small" type="button" id="alertsToggle">Show acknowledged</button>
+              </div>
+            </div>
+            <div class="alerts-controls">
+              <input id="alertsSearch" type="text" placeholder="Search alerts" />
+              <select id="alertsType">
+                <option value="">All types</option>
+                <option value="healthcheck_failed">healthcheck_failed</option>
+                <option value="queue_backlog">queue_backlog</option>
+              </select>
+              <select id="alertsLevel">
+                <option value="">All levels</option>
+                <option value="warning">warning</option>
+                <option value="error">error</option>
+              </select>
+              <button class="small" type="button" id="alertsApply">Apply</button>
+              <button class="ghost small" type="button" id="alertsClear">Clear</button>
+            </div>
+            <div id="alertsList" class="log"></div>
+          </div>
+          <div class="card span-2 audit-card" id="auditCard">
+            <div class="card-header">
+              <h2>Audit Log</h2>
+              <div class="card-actions">
+                <button class="ghost small" type="button" id="auditExport">Export CSV</button>
+                <button class="ghost small" type="button" id="auditToggle">Expand</button>
+              </div>
+            </div>
+            <div class="audit-controls">
+              <input id="auditSearch" type="text" placeholder="Search log entries" />
+              <input id="auditAction" type="text" placeholder="Action (exact match)" />
+              <input id="auditSince" type="datetime-local" />
+              <select id="auditLimit">
+                <option value="50">Last 50</option>
+                <option value="100">Last 100</option>
+                <option value="200">Last 200</option>
+                <option value="500">Last 500</option>
+              </select>
+              <button class="small" type="button" id="auditApply">Apply</button>
+              <button class="ghost small" type="button" id="auditClear">Clear</button>
+            </div>
+            <div id="auditLog"></div>
+          </div>
+        </section>
+      </section>
+    </main>
+    <script src="/admin/static/admin.js"></script>
+  </body>
+</html>

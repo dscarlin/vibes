@@ -1,0 +1,162 @@
+namespace: vibes-platform
+resources:
+  - ../worker-service-account.yaml
+  - ../worker-deployment-template.yaml
+
+configMapGenerator:
+  - name: worker-config
+    literals:
+      - DATABASE_URL=REPLACE_WITH_PLATFORM_DB_URL
+      - CUSTOMER_DB_ADMIN_URL=REPLACE_WITH_CUSTOMER_DB_ADMIN_URL
+      - CUSTOMER_DB_HOST=REPLACE_WITH_CUSTOMER_DB_HOST
+      - CUSTOMER_DB_PORT=5432
+      - CUSTOMER_DB_USER=REPLACE_WITH_CUSTOMER_DB_USER
+      - CUSTOMER_DB_SSLMODE=disable
+      - REDIS_HOST=REPLACE_WITH_REDIS_HOST
+      - REDIS_PORT=6379
+      - STARTER_REPO_URL=REPLACE_WITH_STARTER_REPO_URL
+      - STARTER_REPO_REF=main
+      - SERVER_SOCKET_URL=REPLACE_WITH_SERVER_SOCKET_URL
+      - AWS_REGION=REPLACE_WITH_AWS_REGION
+      - AWS_ACCOUNT_ID=REPLACE_WITH_AWS_ACCOUNT_ID
+      - ECR_REPO=REPLACE_WITH_ECR_REPO
+      - DEV_DEPLOY_COMMAND=./infra/k8s/deploy.sh
+      - TEST_DEPLOY_COMMAND=./infra/k8s/deploy.sh
+      - PROD_DEPLOY_COMMAND=./infra/k8s/deploy.sh
+      - DOMAIN=REPLACE_WITH_DOMAIN
+      - HEALTHCHECK_PATH=/health
+      - HEALTHCHECK_TIMEOUT_MS=60000
+      - HEALTHCHECK_INTERVAL_MS=3000
+
+secretGenerator:
+  - name: worker-secrets
+    literals:
+      - CUSTOMER_DB_PASSWORD=REPLACE_WITH_CUSTOMER_DB_PASSWORD
+      - GIT_TOKEN=REPLACE_WITH_GIT_TOKEN
+
+patches:
+  - target:
+      kind: Deployment
+      name: vibes-worker
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/image
+        value: REPLACE_WITH_WORKER_IMAGE
+      - op: replace
+        path: /spec/template/spec/containers/0/env
+        value:
+          - name: DATABASE_URL
+            valueFrom:
+              configMapKeyRef:
+                name: worker-config
+                key: DATABASE_URL
+          - name: CUSTOMER_DB_ADMIN_URL
+            valueFrom:
+              configMapKeyRef:
+                name: worker-config
+                key: CUSTOMER_DB_ADMIN_URL
+          - name: CUSTOMER_DB_HOST
+            valueFrom:
+              configMapKeyRef:
+                name: worker-config
+                key: CUSTOMER_DB_HOST
+          - name: CUSTOMER_DB_PORT
+            valueFrom:
+              configMapKeyRef:
+                name: worker-config
+                key: CUSTOMER_DB_PORT
+          - name: CUSTOMER_DB_USER
+            valueFrom:
+              configMapKeyRef:
+                name: worker-config
+                key: CUSTOMER_DB_USER
+          - name: CUSTOMER_DB_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: worker-secrets
+                key: CUSTOMER_DB_PASSWORD
+          - name: CUSTOMER_DB_SSLMODE
+            valueFrom:
+              configMapKeyRef:
+                name: worker-config
+                key: CUSTOMER_DB_SSLMODE
+          - name: REDIS_HOST
+            valueFrom:
+              configMapKeyRef:
+                name: worker-config
+                key: REDIS_HOST
+          - name: REDIS_PORT
+            valueFrom:
+              configMapKeyRef:
+                name: worker-config
+                key: REDIS_PORT
+          - name: STARTER_REPO_URL
+            valueFrom:
+              configMapKeyRef:
+                name: worker-config
+                key: STARTER_REPO_URL
+          - name: STARTER_REPO_REF
+            valueFrom:
+              configMapKeyRef:
+                name: worker-config
+                key: STARTER_REPO_REF
+          - name: GIT_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: worker-secrets
+                key: GIT_TOKEN
+          - name: SERVER_SOCKET_URL
+            valueFrom:
+              configMapKeyRef:
+                name: worker-config
+                key: SERVER_SOCKET_URL
+          - name: AWS_REGION
+            valueFrom:
+              configMapKeyRef:
+                name: worker-config
+                key: AWS_REGION
+          - name: AWS_ACCOUNT_ID
+            valueFrom:
+              configMapKeyRef:
+                name: worker-config
+                key: AWS_ACCOUNT_ID
+          - name: ECR_REPO
+            valueFrom:
+              configMapKeyRef:
+                name: worker-config
+                key: ECR_REPO
+          - name: DEV_DEPLOY_COMMAND
+            valueFrom:
+              configMapKeyRef:
+                name: worker-config
+                key: DEV_DEPLOY_COMMAND
+          - name: TEST_DEPLOY_COMMAND
+            valueFrom:
+              configMapKeyRef:
+                name: worker-config
+                key: TEST_DEPLOY_COMMAND
+          - name: PROD_DEPLOY_COMMAND
+            valueFrom:
+              configMapKeyRef:
+                name: worker-config
+                key: PROD_DEPLOY_COMMAND
+          - name: DOMAIN
+            valueFrom:
+              configMapKeyRef:
+                name: worker-config
+                key: DOMAIN
+          - name: HEALTHCHECK_PATH
+            valueFrom:
+              configMapKeyRef:
+                name: worker-config
+                key: HEALTHCHECK_PATH
+          - name: HEALTHCHECK_TIMEOUT_MS
+            valueFrom:
+              configMapKeyRef:
+                name: worker-config
+                key: HEALTHCHECK_TIMEOUT_MS
+          - name: HEALTHCHECK_INTERVAL_MS
+            valueFrom:
+              configMapKeyRef:
+                name: worker-config
+                key: HEALTHCHECK_INTERVAL_MS

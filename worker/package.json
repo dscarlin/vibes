@@ -1,0 +1,16 @@
+{
+  "name": "vibes-worker",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "bullmq": "^5.16.0",
+    "dotenv": "^16.4.5",
+    "socket.io-client": "^4.7.5",
+    "pg": "^8.11.5",
+    "tar": "^6.2.1",
+    "fs-extra": "^11.2.0"
+  }
+}

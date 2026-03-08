@@ -1,0 +1,66 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vibes-worker
+  namespace: vibes-platform
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vibes-worker
+  template:
+    metadata:
+      labels:
+        app: vibes-worker
+    spec:
+      serviceAccountName: worker-sa
+      containers:
+        - name: worker
+          image: REPLACE_WITH_WORKER_IMAGE
+          env:
+            - name: DATABASE_URL
+              value: REPLACE_WITH_PLATFORM_DB_URL
+            - name: CUSTOMER_DB_ADMIN_URL
+              value: REPLACE_WITH_CUSTOMER_DB_ADMIN_URL
+            - name: CUSTOMER_DB_HOST
+              value: REPLACE_WITH_CUSTOMER_DB_HOST
+            - name: CUSTOMER_DB_PORT
+              value: "5432"
+            - name: CUSTOMER_DB_USER
+              value: REPLACE_WITH_CUSTOMER_DB_USER
+            - name: CUSTOMER_DB_PASSWORD
+              value: REPLACE_WITH_CUSTOMER_DB_PASSWORD
+            - name: CUSTOMER_DB_SSLMODE
+              value: disable
+            - name: REDIS_HOST
+              value: REPLACE_WITH_REDIS_HOST
+            - name: REDIS_PORT
+              value: "6379"
+            - name: STARTER_REPO_URL
+              value: REPLACE_WITH_STARTER_REPO_URL
+            - name: STARTER_REPO_REF
+              value: main
+            - name: GIT_TOKEN
+              value: REPLACE_WITH_GIT_TOKEN
+            - name: SERVER_SOCKET_URL
+              value: REPLACE_WITH_SERVER_SOCKET_URL
+            - name: AWS_REGION
+              value: REPLACE_WITH_AWS_REGION
+            - name: AWS_ACCOUNT_ID
+              value: REPLACE_WITH_AWS_ACCOUNT_ID
+            - name: ECR_REPO
+              value: REPLACE_WITH_ECR_REPO
+            - name: DEV_DEPLOY_COMMAND
+              value: ""
+            - name: TEST_DEPLOY_COMMAND
+              value: ./infra/k8s/deploy.sh
+            - name: PROD_DEPLOY_COMMAND
+              value: ./infra/k8s/deploy.sh
+            - name: DOMAIN
+              value: REPLACE_WITH_DOMAIN
+            - name: HEALTHCHECK_PATH
+              value: /
+            - name: HEALTHCHECK_TIMEOUT_MS
+              value: "60000"
+            - name: HEALTHCHECK_INTERVAL_MS
+              value: "3000"

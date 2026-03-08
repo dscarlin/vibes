@@ -1,0 +1,66 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vibes-postgres
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vibes-postgres
+  template:
+    metadata:
+      labels:
+        app: vibes-postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16
+          env:
+            - name: POSTGRES_USER
+              value: postgres
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: vibes-db-secret
+                  key: password
+            - name: POSTGRES_DB
+              value: vibes
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: vibes-postgres-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vibes-postgres
+spec:
+  selector:
+    app: vibes-postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vibes-postgres-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vibes-db-secret
+type: Opaque
+stringData:
+  password: postgres

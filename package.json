@@ -1,0 +1,16 @@
+{
+  "name": "vibes-platform",
+  "private": true,
+  "workspaces": [
+    "server",
+    "worker",
+    "web"
+  ],
+  "scripts": {
+    "dev": "node server/src/index.js",
+    "worker": "node worker/src/index.js"
+  },
+  "devDependencies": {
+    "@openai/codex": "^0.104.0"
+  }
+}

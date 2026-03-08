@@ -1,0 +1,16 @@
+#SET UP DB BACKUP
+
+bash:
+DB_INSTANCE_ID=vibes-dev-db \
+AWS_REGION=us-east-1 \
+BACKUP_RETENTION_DAYS=14 \
+DELETION_PROTECTION=true \
+COPY_TAGS_TO_SNAPSHOT=true \
+BACKUP_WINDOW=03:00-04:00 \
+APPLY_IMMEDIATELY=true \
+CREATE_SNAPSHOT=true \
+./scripts/aws/rds-backup-plan.sh
+
+
+#Set up webhook endpoint for admin alerts
+#use that endpoint to test deploy webhook

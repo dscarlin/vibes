@@ -1,0 +1,2584 @@
+import dotenv from 'dotenv';
+import fsSync from 'fs';
+import { Queue, Worker } from 'bullmq';
+import pg from 'pg';
+import os, { type } from 'os';
+import path from 'path';
+import fs from 'fs/promises';
+import { execFile, spawn } from 'child_process';
+import { promisify } from 'util';
+import tar from 'tar';
+import { io as socketIoClient } from 'socket.io-client';
+import crypto from 'crypto';
+import zlib from 'zlib';
+import readline from 'readline';
+
+if (fsSync.existsSync('.env.local')) {
+  dotenv.config({ path: '.env.local', override: true });
+}
+dotenv.config({ override: true });
+
+const { Pool } = pg;
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+const adminPool = new Pool({ connectionString: process.env.CUSTOMER_DB_ADMIN_URL });
+const exec = promisify(execFile);
+
+const SNAPSHOT_ARTIFACTS = new Set([
+  'snapshot.tar.gz',
+  'snapshot-updated.tar.gz',
+  'deploy-snapshot.tar.gz'
+]);
+
+function isSnapshotArtifact(entryPath) {
+  if (!entryPath) return false;
+  const normalized = entryPath.replace(/^\.\//, '');
+  return SNAPSHOT_ARTIFACTS.has(normalized);
+}
+
+async function stripSnapshotArtifacts(repoPath) {
+  await Promise.all(
+    Array.from(SNAPSHOT_ARTIFACTS).map((name) =>
+      fs.rm(path.join(repoPath, name), { force: true }).catch(() => {})
+    )
+  );
+}
+
+async function createSnapshotArchive(repoPath, namePrefix) {
+  await stripSnapshotArtifacts(repoPath);
+  const archiveDir = await fs.mkdtemp(path.join(os.tmpdir(), 'vibes-archive-'));
+  const archivePath = path.join(archiveDir, `${namePrefix}.tar.gz`);
+  await tar.c(
+    {
+      gzip: true,
+      file: archivePath,
+      cwd: repoPath,
+      filter: (entryPath) => !isSnapshotArtifact(entryPath)
+    },
+    ['.']
+  );
+  return { archivePath, archiveDir };
+}
+
+async function createSnapshotBlob(repoPath, namePrefix) {
+  const { archivePath, archiveDir } = await createSnapshotArchive(repoPath, namePrefix);
+  const blob = await fs.readFile(archivePath);
+  await fs.rm(archiveDir, { recursive: true, force: true });
+  return blob;
+}
+
+async function hashFile(filePath) {
+  const data = await fs.readFile(filePath);
+  return crypto.createHash('sha256').update(data).digest('hex');
+}
+
+async function fileExists(filePath) {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function parseRuntimeQuotas(raw) {
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function parsePlanLimits(raw) {
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function normalizePlanName(name) {
+  const normalized = String(name || '').trim().toLowerCase();
+  if (['starter', 'builder', 'business', 'agency'].includes(normalized)) return normalized;
+  return DEFAULT_USER_PLAN;
+}
+
+function runtimeQuotaMs(planName, environment) {
+  const planKey = normalizePlanName(planName);
+  const planLimits = RUNTIME_QUOTAS[planKey] || {};
+  const envKey = String(environment || '').toLowerCase();
+  const hoursRaw = planLimits[envKey];
+  const hours = Number(hoursRaw);
+  if (!hours || Number.isNaN(hours) || hours <= 0) return null;
+  return hours * 60 * 60 * 1000;
+}
+
+function resolvePlanLimits(planName) {
+  const planKey = normalizePlanName(planName);
+  const defaults = PLAN_LIMIT_DEFAULTS[planKey] || {};
+  const overrides = PLAN_LIMITS[planKey] || {};
+  return { ...defaults, ...overrides };
+}
+
+async function getPlanForProject(projectId) {
+  const result = await pool.query(
+    `select u.plan as plan_name
+     from projects p
+     join users u on u.id = p.owner_id
+     where p.id = $1`,
+    [projectId]
+  );
+  const name = normalizePlanName(result.rows[0]?.plan_name || DEFAULT_USER_PLAN);
+  return { name, limits: resolvePlanLimits(name) };
+}
+
+function currentMonthKey(date = new Date()) {
+  return date.toISOString().slice(0, 7);
+}
+
+async function getRuntimeUsageMsByUser(userId, environment) {
+  try {
+    const month = currentMonthKey();
+    const usageRes = await pool.query(
+      `select coalesce(sum(runtime_ms), 0)::bigint as runtime_ms
+       from runtime_usage
+       where user_id = $1 and environment = $2 and month = $3`,
+      [userId, environment, month]
+    );
+    let totalMs = Number(usageRes.rows[0]?.runtime_ms || 0);
+    const liveRes = await pool.query(
+      `select e.live_since
+       from environments e
+       join projects p on p.id = e.project_id
+       where p.owner_id = $1
+         and e.name = $2
+         and e.build_status = 'live'
+         and e.live_since is not null`,
+      [userId, environment]
+    );
+    const now = Date.now();
+    for (const row of liveRes.rows) {
+      const start = new Date(row.live_since).getTime();
+      if (Number.isFinite(start) && now > start) {
+        totalMs += now - start;
+      }
+    }
+    return totalMs;
+  } catch (err) {
+    const msg = String(err?.message || '');
+    if (msg.includes('runtime_usage') || msg.includes('live_since')) return 0;
+    throw err;
+  }
+}
+
+function isPrivateIpv4(address) {
+  if (!address) return false;
+  if (address.startsWith('10.')) return true;
+  if (address.startsWith('192.168.')) return true;
+  const match = address.match(/^172\.(\d+)\./);
+  if (!match) return false;
+  const octet = Number(match[1]);
+  return octet >= 16 && octet <= 31;
+}
+
+function getLocalLanIp() {
+  const nets = os.networkInterfaces();
+  let fallback = null;
+  for (const addrs of Object.values(nets)) {
+    for (const addr of addrs || []) {
+      if (addr.family !== 'IPv4' || addr.internal) continue;
+      if (isPrivateIpv4(addr.address)) {
+        return addr.address;
+      }
+      if (!fallback) fallback = addr.address;
+    }
+  }
+  return fallback;
+}
+
+const LOCAL_LAN_IP = getLocalLanIp();
+
+async function resolveShell() {
+  const candidates = [
+    process.env.VIBES_SHELL,
+    process.env.SHELL,
+    '/bin/sh',
+    '/usr/bin/sh',
+    '/usr/local/bin/sh',
+    '/bin/busybox',
+    '/usr/local/bin/busybox'
+  ].filter(Boolean);
+  for (const candidate of candidates) {
+    try {
+      await fs.access(candidate);
+      const args = candidate.includes('busybox') ? ['sh', '-lc'] : ['-lc'];
+      return { shell: candidate, args };
+    } catch {
+      // Try next candidate.
+    }
+  }
+  return { shell: 'sh', args: ['-lc'] };
+}
+
+async function runCommandStreaming(command, env) {
+  const { shell, args } = await resolveShell();
+  return new Promise((resolve, reject) => {
+    const child = spawn(shell, [...args, command], { env });
+    let stdout = '';
+    let stderr = '';
+
+    child.stdout.on('data', (data) => {
+      const text = data.toString();
+      stdout += text;
+      process.stdout.write(text);
+    });
+    child.stderr.on('data', (data) => {
+      const text = data.toString();
+      stderr += text;
+      process.stderr.write(text);
+    });
+    child.on('error', (err) => {
+      reject(err);
+    });
+    child.on('close', (code) => {
+      if (code && code !== 0) {
+        const err = new Error(`Command exited with code ${code}`);
+        err.stdout = stdout;
+        err.stderr = stderr;
+        reject(err);
+        return;
+      }
+      resolve({ stdout, stderr });
+    });
+  });
+}
+
+const connection = {
+  host: process.env.REDIS_HOST || '127.0.0.1',
+  port: Number(process.env.REDIS_PORT || 6379)
+};
+
+const AUTHOR_NAME = process.env.GIT_AUTHOR_NAME || 'Vibes AI';
+const AUTHOR_EMAIL = process.env.GIT_AUTHOR_EMAIL || 'ai@vibes.local';
+const STARTER_REPO_URL = process.env.STARTER_REPO_URL;
+const STARTER_REPO_REF = process.env.STARTER_REPO_REF || 'main';
+const GIT_TOKEN = process.env.GIT_TOKEN || '';
+const SOCKET_URL = process.env.SERVER_SOCKET_URL || 'http://localhost:8000';
+const CUSTOMER_DB_HOST = process.env.CUSTOMER_DB_HOST || 'localhost';
+const CUSTOMER_DB_PORT = Number(process.env.CUSTOMER_DB_PORT || 5432);
+const CUSTOMER_DB_USER = process.env.CUSTOMER_DB_USER || 'app_user';
+const CUSTOMER_DB_PASSWORD = process.env.CUSTOMER_DB_PASSWORD || '';
+const CUSTOMER_DB_SSLMODE = process.env.CUSTOMER_DB_SSLMODE || 'disable';
+const CUSTOMER_DB_SSLROOTCERT = process.env.CUSTOMER_DB_SSLROOTCERT || '';
+const DEV_DEPLOY_COMMAND = process.env.DEV_DEPLOY_COMMAND;
+const TEST_DEPLOY_COMMAND = process.env.TEST_DEPLOY_COMMAND;
+const PROD_DEPLOY_COMMAND = process.env.PROD_DEPLOY_COMMAND;
+const PLATFORM_ENV = process.env.PLATFORM_ENV || 'local';
+const DEV_DELETE_COMMAND = process.env.DEV_DELETE_COMMAND;
+const TEST_DELETE_COMMAND = process.env.TEST_DELETE_COMMAND;
+const PROD_DELETE_COMMAND = process.env.PROD_DELETE_COMMAND;
+const VIBES_WORKDIR_ROOT = process.env.VIBES_WORKDIR_ROOT || path.join(os.homedir(), '.vibes');
+const STRICT_DELETE = (process.env.STRICT_DELETE || '').toLowerCase() === 'true';
+const DEMO_MODE = (process.env.DEMO_MODE || '').toLowerCase() === 'true';
+const HEALTHCHECK_DEFAULTS = {
+  path: process.env.HEALTHCHECK_PATH || '/',
+  pathDev: process.env.HEALTHCHECK_PATH_DEV || '',
+  pathTest: process.env.HEALTHCHECK_PATH_TEST || '',
+  pathProd: process.env.HEALTHCHECK_PATH_PROD || '',
+  protocol: process.env.HEALTHCHECK_PROTOCOL || '',
+  protocolDev: process.env.HEALTHCHECK_PROTOCOL_DEV || '',
+  protocolTest: process.env.HEALTHCHECK_PROTOCOL_TEST || '',
+  protocolProd: process.env.HEALTHCHECK_PROTOCOL_PROD || '',
+  timeoutMs: Number(process.env.HEALTHCHECK_TIMEOUT_MS || 60000),
+  intervalMs: Number(process.env.HEALTHCHECK_INTERVAL_MS || 3000)
+};
+const CRASHLOOP_RESTART_THRESHOLD = Number(process.env.CRASHLOOP_RESTART_THRESHOLD || 5);
+const DEV_SCALE_TO_ZERO_AFTER_MS = Number(process.env.DEV_SCALE_TO_ZERO_AFTER_MS || 15 * 60 * 1000);
+const TEST_SCALE_TO_ZERO_AFTER_MS = Number(process.env.TEST_SCALE_TO_ZERO_AFTER_MS || 3 * 60 * 60 * 1000);
+const SCALE_TO_ZERO_INTERVAL_MS = Number(process.env.SCALE_TO_ZERO_INTERVAL_MS || 60000);
+const RUNTIME_QUOTA_INTERVAL_MS = Number(process.env.RUNTIME_QUOTA_INTERVAL_MS || 60000);
+const DEFAULT_USER_PLAN = process.env.DEFAULT_USER_PLAN || 'starter';
+const RUNTIME_QUOTAS = parseRuntimeQuotas(process.env.RUNTIME_QUOTAS || process.env.RUNTIME_QUOTAS_JSON || '');
+const PLAN_LIMITS = parsePlanLimits(process.env.PLAN_LIMITS || process.env.PLAN_LIMITS_JSON || '');
+const PLAN_LIMIT_DEFAULTS = {
+  starter: { builds: 60, db_storage_gb: 2, bandwidth_gb: 15 },
+  builder: { builds: 160, db_storage_gb: 8, bandwidth_gb: 50 },
+  business: { builds: 500, db_storage_gb: 40, bandwidth_gb: 250 },
+  agency: { builds: 2000, db_storage_gb: 200, bandwidth_gb: 1000 }
+};
+const BUILD_RECONCILE_STALE_MS = Number(
+  process.env.BUILD_RECONCILE_STALE_MS || (HEALTHCHECK_DEFAULTS.timeoutMs + 60000)
+);
+const BUILD_RECONCILE_INTERVAL_MS = Number(process.env.BUILD_RECONCILE_INTERVAL_MS || 30000);
+const ALERT_WEBHOOK_URL = process.env.ALERT_WEBHOOK_URL || '';
+const ALERT_SLACK_WEBHOOK_URL = process.env.ALERT_SLACK_WEBHOOK_URL || '';
+const ALERT_COOLDOWN_MS = Number(process.env.ALERT_COOLDOWN_MS || 10 * 60 * 1000);
+const QUEUE_BACKLOG_THRESHOLD = Number(process.env.QUEUE_BACKLOG_THRESHOLD || 5);
+const QUEUE_MONITOR_INTERVAL_MS = Number(process.env.QUEUE_MONITOR_INTERVAL_MS || 60000);
+const ALERT_RETENTION_DAYS = Number(process.env.ALERT_RETENTION_DAYS || 30);
+const ALERT_RETENTION_INTERVAL_MS = Number(process.env.ALERT_RETENTION_INTERVAL_MS || 24 * 60 * 60 * 1000);
+const DEPLOY_WEBHOOK_TIMEOUT_MS = Number(process.env.DEPLOY_WEBHOOK_TIMEOUT_MS || 8000);
+const ALB_LOG_BUCKET = process.env.ALB_LOG_BUCKET || '';
+const ALB_LOG_PREFIX = process.env.ALB_LOG_PREFIX || '';
+const ALB_LOG_REGION = process.env.ALB_LOG_REGION || process.env.AWS_REGION || 'us-east-1';
+const ALB_LOG_LOOKBACK_HOURS = Number(process.env.ALB_LOG_LOOKBACK_HOURS || 72);
+const ALB_LOG_MAX_FILES = Number(process.env.ALB_LOG_MAX_FILES || 500);
+const ALB_LOG_INGEST_INTERVAL_MS = Number(process.env.ALB_LOG_INGEST_INTERVAL_MS || 10 * 60 * 1000);
+const BANDWIDTH_RECONCILE_INTERVAL_MS = Number(
+  process.env.BANDWIDTH_RECONCILE_INTERVAL_MS || ALB_LOG_INGEST_INTERVAL_MS
+);
+
+export const taskQueue = new Queue('tasks', { connection });
+const alertLastSentAt = new Map();
+
+function alertKey(type, scope) {
+  return `${type}:${scope || 'global'}`;
+}
+
+function shouldSendAlert(type, scope) {
+  const key = alertKey(type, scope);
+  const lastSent = alertLastSentAt.get(key) || 0;
+  if (Date.now() - lastSent < ALERT_COOLDOWN_MS) return false;
+  alertLastSentAt.set(key, Date.now());
+  return true;
+}
+
+function truncateText(text, limit = 3500) {
+  if (!text) return '';
+  const value = String(text);
+  if (value.length <= limit) return value;
+  return `${value.slice(0, limit)}…`;
+}
+
+async function postWebhook(url, payload) {
+  if (!url) return;
+  try {
+    await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+  } catch (err) {
+    console.warn('Alert webhook failed', err?.message || err);
+  }
+}
+
+async function recordAdminAlert(type, message, data, level = 'warning') {
+  try {
+    await pool.query(
+      `insert into admin_alerts (type, level, message, data)
+       values ($1, $2, $3, $4)`,
+      [type, level, message, data || {}]
+    );
+  } catch (err) {
+    const msg = String(err?.message || '');
+    if (!msg.includes('admin_alerts')) {
+      console.warn('Failed to record admin alert', err?.message || err);
+    }
+  }
+}
+
+function alertLevelFor(type) {
+  if (type === 'healthcheck_failed') return 'error';
+  if (type === 'queue_backlog') return 'warning';
+  return 'warning';
+}
+
+function normalizeAlertData(data) {
+  const safe = { ...(data || {}) };
+  if (!safe.summary && safe.detail) safe.summary = safe.detail;
+  return safe;
+}
+
+async function sendAlert(type, message, data = {}, scope = '') {
+  const hasWebhook = ALERT_WEBHOOK_URL || ALERT_SLACK_WEBHOOK_URL;
+  if (!shouldSendAlert(type, scope)) return;
+  const level = alertLevelFor(type);
+  const payloadData = normalizeAlertData(data);
+  if (hasWebhook) {
+    const payload = {
+      type,
+      message,
+      level,
+      timestamp: new Date().toISOString(),
+      data: payloadData
+    };
+    if (ALERT_WEBHOOK_URL) {
+      await postWebhook(ALERT_WEBHOOK_URL, payload);
+    }
+    if (ALERT_SLACK_WEBHOOK_URL) {
+      const slackText = [
+        `*Vibes ${level === 'error' ? 'Error' : 'Alert'}:* ${message}`,
+        payloadData?.project_id ? `Project: ${payloadData.project_id}` : '',
+        payloadData?.environment ? `Env: ${payloadData.environment}` : '',
+        payloadData?.host ? `Host: ${payloadData.host}` : '',
+        payloadData?.commit ? `Commit: ${payloadData.commit}` : '',
+        payloadData?.summary ? `Details: ${payloadData.summary}` : ''
+      ]
+        .filter(Boolean)
+        .join('\n');
+      await postWebhook(ALERT_SLACK_WEBHOOK_URL, { text: slackText });
+    }
+  }
+  await recordAdminAlert(type, message, payloadData, level);
+}
+
+async function postJsonWithTimeout(url, payload, timeoutMs = DEPLOY_WEBHOOK_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: controller.signal
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function sendDeployWebhook(projectId, environment, status, commitHash, buildId, detail = '') {
+  try {
+    const projectRes = await pool.query(
+      'select name, short_id, project_slug, deploy_webhook_url from projects where id = $1',
+      [projectId]
+    );
+    const project = projectRes.rows[0];
+    const url = project?.deploy_webhook_url || '';
+    if (!url) return;
+    const payload = {
+      type: status === 'live' ? 'deploy_success' : 'deploy_failed',
+      status,
+      project_id: projectId,
+      environment,
+      commit: commitHash || '',
+      build_id: buildId,
+      host: hostFor(project, environment),
+      timestamp: new Date().toISOString(),
+      detail: truncateText(detail || '', 3500)
+    };
+    await postJsonWithTimeout(url, payload);
+  } catch (err) {
+    console.warn('Deploy webhook failed', err?.message || err);
+  }
+}
+
+async function syncDemoModeSetting() {
+  try {
+    await pool.query(
+      `insert into settings (key, value)
+       values ($1, $2)
+       on conflict (key) do update set value = excluded.value, updated_at = now()`,
+      ['demo_mode', DEMO_MODE ? 'true' : 'false']
+    );
+  } catch (err) {
+    console.error('Failed to sync demo mode setting', err);
+  }
+}
+
+async function getDemoOpenAiKey(projectId) {
+  if (!DEMO_MODE) return '';
+  const result = await pool.query(
+    `select u.openai_api_key
+     from users u
+     join projects p on p.owner_id = u.id
+     where p.id = $1`,
+    [projectId]
+  );
+  return result.rows[0]?.openai_api_key || '';
+}
+
+(async () => {
+  await syncDemoModeSetting();
+})();
+
+function dbNameFor(shortId, environment) {
+  const safe = `${shortId}-${environment}`.toLowerCase().replace(/[^a-z0-9_]/g, '_');
+  return `vibes_${safe}`;
+}
+
+function dbUrlFor(dbName) {
+  if (CUSTOMER_DB_SSLMODE !== 'disable' && !CUSTOMER_DB_SSLROOTCERT) {
+    throw new Error('CUSTOMER_DB_SSLROOTCERT is required when CUSTOMER_DB_SSLMODE is not disable');
+  }
+  const auth = `${encodeURIComponent(CUSTOMER_DB_USER)}:${encodeURIComponent(CUSTOMER_DB_PASSWORD)}`;
+  const params = new URLSearchParams();
+  params.set('sslmode', CUSTOMER_DB_SSLMODE);
+  if (CUSTOMER_DB_SSLROOTCERT) params.set('sslrootcert', CUSTOMER_DB_SSLROOTCERT);
+  return `postgresql://${auth}@${CUSTOMER_DB_HOST}:${CUSTOMER_DB_PORT}/${dbName}?${params.toString()}`;
+}
+
+function dbUrlMatchesConfig(dbUrl) {
+  if (!dbUrl) return false;
+  try {
+    const url = new URL(dbUrl);
+    if (CUSTOMER_DB_HOST && url.hostname !== CUSTOMER_DB_HOST) return false;
+    if (CUSTOMER_DB_PORT && Number(url.port || 5432) !== Number(CUSTOMER_DB_PORT)) return false;
+    if (CUSTOMER_DB_USER && decodeURIComponent(url.username) !== CUSTOMER_DB_USER) return false;
+    if (CUSTOMER_DB_PASSWORD && decodeURIComponent(url.password) !== CUSTOMER_DB_PASSWORD) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function ensureDatabase(dbName) {
+  const exists = await adminPool.query('select 1 from pg_database where datname = $1', [dbName]);
+  if (exists.rowCount > 0) return;
+  await adminPool.query(`create database ${dbName}`);
+}
+
+async function dropDatabase(dbName) {
+  await adminPool.query(
+    `select pg_terminate_backend(pid)
+     from pg_stat_activity
+     where datname = $1 and pid <> pg_backend_pid()`,
+    [dbName]
+  );
+  await adminPool.query(`drop database if exists ${dbName}`);
+}
+
+async function resetDatabase(dbName) {
+  await adminPool.query(
+    `select pg_terminate_backend(pid)
+     from pg_stat_activity
+     where datname = $1 and pid <> pg_backend_pid()`,
+    [dbName]
+  );
+  await adminPool.query(`drop database if exists ${dbName}`);
+  await adminPool.query(`create database ${dbName}`);
+}
+
+function healthcheckPathForEnv(environment) {
+  if (environment === 'development' && HEALTHCHECK_DEFAULTS.pathDev) return HEALTHCHECK_DEFAULTS.pathDev;
+  if (environment === 'testing' && HEALTHCHECK_DEFAULTS.pathTest) return HEALTHCHECK_DEFAULTS.pathTest;
+  if (environment === 'production' && HEALTHCHECK_DEFAULTS.pathProd) return HEALTHCHECK_DEFAULTS.pathProd;
+  return HEALTHCHECK_DEFAULTS.path;
+}
+
+function isLocalPlatform() {
+  return PLATFORM_ENV === 'local';
+}
+
+function healthcheckProtocolForEnv(environment) {
+  if (isLocalPlatform()) return 'http';
+  if (environment === 'development' && HEALTHCHECK_DEFAULTS.protocolDev) return HEALTHCHECK_DEFAULTS.protocolDev;
+  if (environment === 'testing' && HEALTHCHECK_DEFAULTS.protocolTest) return HEALTHCHECK_DEFAULTS.protocolTest;
+  if (environment === 'production' && HEALTHCHECK_DEFAULTS.protocolProd) return HEALTHCHECK_DEFAULTS.protocolProd;
+  return HEALTHCHECK_DEFAULTS.protocol || 'https';
+}
+
+function healthcheckProtocolForHost(environment, host) {
+  if (host.endsWith('.svc.cluster.local')) return 'http';
+  return healthcheckProtocolForEnv(environment);
+}
+
+function healthcheckUrl(environment, host) {
+  const protocol = healthcheckProtocolForHost(environment, host);
+  const path = healthcheckPathForEnv(environment);
+  return `${protocol}://${host}${path}`;
+}
+
+function healthcheckDelayForElapsed(elapsedMs) {
+  const base = Math.max(500, Number(HEALTHCHECK_DEFAULTS.intervalMs || 3000));
+  const stage1 = base * 15; // ~45s when base=3s
+  const stage2 = base * 40; // ~120s when base=3s
+  if (elapsedMs < stage1) return base * 2;
+  if (elapsedMs < stage2) return base;
+  return base * 5;
+}
+
+async function detectCrashLoop(projectId, environment) {
+  if (isLocalPlatform()) return null;
+  const namespace = `vibes-${environment}`;
+  const appName = `vibes-app-${projectId}`;
+  try {
+    const { stdout } = await exec('sh', ['-lc', `kubectl -n ${namespace} get pods -l app=${appName} -o json`]);
+    const data = JSON.parse(stdout || '{}');
+    const pods = Array.isArray(data.items) ? data.items : [];
+    for (const pod of pods) {
+      const statuses = pod.status?.containerStatuses || [];
+      for (const status of statuses) {
+        const reason = status.state?.waiting?.reason || '';
+        const restartCount = Number(status.restartCount || 0);
+        if (reason === 'CrashLoopBackOff' && restartCount >= CRASHLOOP_RESTART_THRESHOLD) {
+          return {
+            podName: pod.metadata?.name || '',
+            restartCount,
+            reason
+          };
+        }
+      }
+    }
+  } catch {
+    // Ignore crashloop detection errors to avoid blocking deploys.
+  }
+  return null;
+}
+
+async function checkHealthOnce(projectId, environment, host, appPort) {
+  const url = healthcheckUrl(environment, host);
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+    const res = await fetch(url, { signal: controller.signal });
+    clearTimeout(timeout);
+    if (res.status >= 200 && res.status < 400) return true;
+  } catch { }
+  if (isLocalPlatform()) {
+    const container = `vibes-app-${projectId}-${environment}`;
+    const path = healthcheckPathForEnv(environment);
+    const cmd = `podman exec ${container} sh -lc \"code=\\$(curl -s -o /dev/null -w '%{http_code}' http://localhost:${appPort}${path}); [ \\\"\\$code\\\" -ge 200 ] && [ \\\"\\$code\\\" -lt 400 ]\"`;
+    try {
+      await exec('sh', ['-lc', cmd]);
+      return true;
+    } catch { }
+  }
+  return false;
+}
+
+async function waitForHealth(projectId, environment, host, appPort) {
+  const timeoutMs = HEALTHCHECK_DEFAULTS.timeoutMs;
+  const url = healthcheckUrl(environment, host);
+  const start = Date.now();
+  const deadline = start + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      console.log(`Checking health for ${url}...`);
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 5000);
+      const res = await fetch(url, { signal: controller.signal });
+      clearTimeout(timeout);
+      if (res.status >= 200 && res.status < 400) return { ok: true };
+    } catch { }
+    if (isLocalPlatform()) {
+      const container = `vibes-app-${projectId}-${environment}`;
+      const path = healthcheckPathForEnv(environment);
+      const cmd = `podman exec ${container} sh -lc \"code=\\$(curl -s -o /dev/null -w '%{http_code}' http://localhost:${appPort}${path}); [ \\\"\\$code\\\" -ge 200 ] && [ \\\"\\$code\\\" -lt 400 ]\"`;
+      try {
+        await exec('sh', ['-lc', cmd]);
+        return { ok: true };
+      } catch { }
+    } else {
+      const crashloop = await detectCrashLoop(projectId, environment);
+      if (crashloop) return { ok: false, crashloop };
+    }
+    const elapsed = Date.now() - start;
+    const delay = Math.min(healthcheckDelayForElapsed(elapsed), Math.max(0, deadline - Date.now()));
+    if (delay > 0) {
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+  return { ok: false };
+}
+
+function deployCommandForEnv(environment) {
+  if (isLocalPlatform()) return DEV_DEPLOY_COMMAND;
+  if (environment === 'development' && DEV_DEPLOY_COMMAND) return DEV_DEPLOY_COMMAND;
+  if (environment === 'testing' && TEST_DEPLOY_COMMAND) return TEST_DEPLOY_COMMAND;
+  if (environment === 'production' && PROD_DEPLOY_COMMAND) return PROD_DEPLOY_COMMAND;
+  return PROD_DEPLOY_COMMAND || DEV_DEPLOY_COMMAND || null;
+}
+
+function deleteCommandForEnv(environment) {
+  if (environment === 'development') return DEV_DELETE_COMMAND;
+  if (environment === 'testing') return TEST_DELETE_COMMAND;
+  if (environment === 'production') return PROD_DELETE_COMMAND;
+  return null;
+}
+
+function scaleToZeroThresholdMs(environment) {
+  if (environment === 'development') return DEV_SCALE_TO_ZERO_AFTER_MS;
+  if (environment === 'testing') return TEST_SCALE_TO_ZERO_AFTER_MS;
+  return 0;
+}
+
+async function hasActiveTasks(projectId, environment) {
+  const result = await pool.query(
+    `select 1
+     from tasks
+     where project_id = $1
+       and environment = $2
+       and status in ('queued', 'running')
+     limit 1`,
+    [projectId, environment]
+  );
+  return result.rowCount > 0;
+}
+
+async function scaleDeploymentToZero(projectId, environment) {
+  if (isLocalPlatform()) {
+    if (environment !== 'development') return 'skipped';
+    const container = `vibes-app-${projectId}-${environment}`;
+    try {
+      await exec('sh', ['-lc', `podman stop ${container} >/dev/null 2>&1 || true`]);
+      return 'scaled';
+    } catch (err) {
+      console.warn(`Scale to zero failed for ${container}`, err?.message || err);
+      return 'failed';
+    }
+  }
+  const namespace = `vibes-${environment}`;
+  const appName = `vibes-app-${projectId}`;
+  const cmd = `kubectl -n ${namespace} scale deployment ${appName} --replicas=0`;
+  try {
+    await exec('sh', ['-lc', cmd]);
+    return 'scaled';
+  } catch (err) {
+    const msg = `${err?.stderr || ''}\n${err?.message || ''}`.toLowerCase();
+    if (msg.includes('notfound') || msg.includes('not found')) {
+      console.warn(`Scale to zero: deployment ${appName} not found in ${namespace}`);
+      return 'missing';
+    }
+    console.warn(`Scale to zero failed for ${appName}`, err?.message || err);
+    return 'failed';
+  }
+}
+
+async function clearPendingDeployJobs(projectId, environment) {
+  try {
+    const jobs = await taskQueue.getJobs(['waiting', 'delayed']);
+    for (const job of jobs) {
+      if (job.name !== 'deploy-commit') continue;
+      if (job.data?.projectId !== projectId) continue;
+      if (job.data?.environment !== environment) continue;
+      try {
+        await job.remove();
+      } catch {}
+    }
+  } catch (err) {
+    console.warn('Failed to clear pending deploy jobs', err?.message || err);
+  }
+}
+
+async function stopEnvironment(projectId, environment) {
+  await clearPendingDeployJobs(projectId, environment);
+  await scaleDeploymentToZero(projectId, environment);
+  let refCommit = null;
+  try {
+    const envRes = await pool.query(
+      'select deployed_commit from environments where project_id = $1 and name = $2',
+      [projectId, environment]
+    );
+    refCommit = envRes.rows[0]?.deployed_commit || null;
+  } catch {}
+  await updateBuildStatus(projectId, environment, 'offline', refCommit);
+}
+
+async function fetchPodLogs(projectId, environment, lines = 10) {
+  const tail = Math.max(1, Math.min(Number(lines) || 10, 200));
+  if (isLocalPlatform()) {
+    if (environment !== 'development') return '';
+    const container = `vibes-app-${projectId}-${environment}`;
+    try {
+      const { stdout, stderr } = await exec('sh', ['-lc', `podman logs --tail=${tail} ${container}`]);
+      return `${stdout || ''}${stderr || ''}`.trim();
+    } catch (err) {
+      console.warn(`Podman logs failed for ${container}`, err?.message || err);
+      return '';
+    }
+  }
+  const namespace = `vibes-${environment}`;
+  const appName = `vibes-app-${projectId}`;
+  try {
+    const { stdout } = await exec('sh', [
+      '-lc',
+      `kubectl -n ${namespace} get pods -l app=${appName} -o json`
+    ]);
+    const data = JSON.parse(stdout || '{}');
+    const pods = Array.isArray(data.items) ? data.items : [];
+    if (!pods.length) return '';
+    pods.sort((a, b) => {
+      const aTime = new Date(a.status?.startTime || a.metadata?.creationTimestamp || 0).getTime();
+      const bTime = new Date(b.status?.startTime || b.metadata?.creationTimestamp || 0).getTime();
+      return bTime - aTime;
+    });
+    const podName = pods[0]?.metadata?.name;
+    if (!podName) return '';
+    const { stdout: logOut, stderr: logErr } = await exec('sh', [
+      '-lc',
+      `kubectl -n ${namespace} logs ${podName} --tail=${tail}`
+    ]);
+    return `${logOut || ''}${logErr || ''}`.trim();
+  } catch (err) {
+    console.warn(`kubectl logs failed for ${appName}`, err?.message || err);
+    return '';
+  }
+}
+
+async function buildHealthcheckError(projectId, environment, host) {
+  const podLogs = await fetchPodLogs(projectId, environment, 200);
+  const detail = podLogs
+    ? `Pod logs (last 200 lines):\n${podLogs}`
+    : 'Pod logs unavailable.';
+  const err = new Error(`Health check failed for ${host}`);
+  err.code = 'healthcheck_failed';
+  err.detail = detail;
+  err.podLogs = podLogs;
+  err.host = host;
+  err.environment = environment;
+  err.projectId = projectId;
+  return err;
+}
+
+async function resumeDeployment(projectId, environment, envPath) {
+  if (isLocalPlatform()) return false;
+  const namespace = `vibes-${environment}`;
+  const appName = `vibes-app-${projectId}`;
+  const rdsCaPath = process.env.RDS_CA_PATH || '/etc/ssl/certs/rds-ca.pem';
+  try {
+    await exec('sh', ['-lc', `kubectl create namespace ${namespace} --dry-run=client -o yaml | kubectl apply -f -`]);
+    try {
+      await exec('sh', ['-lc', `kubectl -n ${namespace} get deployment ${appName} >/dev/null 2>&1`]);
+    } catch {
+      return false;
+    }
+    await exec('sh', ['-lc', `kubectl -n ${namespace} delete secret ${appName}-env --ignore-not-found`]);
+    await exec('sh', ['-lc', `kubectl -n ${namespace} create secret generic ${appName}-env --from-env-file=${envPath}`]);
+    if (await fileExists(rdsCaPath)) {
+      await exec('sh', [
+        '-lc',
+        `kubectl -n ${namespace} create secret generic rds-ca-bundle --from-file=rds-ca.pem=${rdsCaPath} --dry-run=client -o yaml | kubectl apply -f -`
+      ]);
+    }
+    await exec('sh', ['-lc', `kubectl -n ${namespace} scale deployment ${appName} --replicas=1`]);
+    return true;
+  } catch (err) {
+    console.warn(`Resume deployment failed for ${appName} in ${namespace}`, err?.message || err);
+    return false;
+  }
+}
+
+async function shouldFastResume(projectId, environment, commitHash) {
+  if (environment !== 'development') return false;
+  if (!commitHash) return false;
+  if (isLocalPlatform()) return false;
+  const envRes = await pool.query(
+    'select deployed_commit, build_status from environments where project_id = $1 and name = $2',
+    [projectId, environment]
+  );
+  if (envRes.rowCount === 0) return false;
+  const row = envRes.rows[0];
+  if (row.build_status !== 'offline') return false;
+  if (!row.deployed_commit || row.deployed_commit !== commitHash) return false;
+  return true;
+}
+
+async function fastResumeEnvironment(projectId, environment, commitHash) {
+  console.log(`Fast resume project ${projectId} environment ${environment}...`);
+  const settingsRes = await pool.query(
+    `select key, value from settings
+     where key in (
+       'healthcheck_path',
+       'healthcheck_path_dev',
+       'healthcheck_path_test',
+       'healthcheck_path_prod',
+       'healthcheck_protocol',
+       'healthcheck_protocol_dev',
+       'healthcheck_protocol_test',
+       'healthcheck_protocol_prod',
+       'healthcheck_timeout_ms',
+       'healthcheck_interval_ms'
+     )`
+  );
+  const settings = {};
+  for (const row of settingsRes.rows) settings[row.key] = row.value;
+  if (settings.healthcheck_path) HEALTHCHECK_DEFAULTS.path = settings.healthcheck_path;
+  if (settings.healthcheck_path_dev) HEALTHCHECK_DEFAULTS.pathDev = settings.healthcheck_path_dev;
+  if (settings.healthcheck_path_test) HEALTHCHECK_DEFAULTS.pathTest = settings.healthcheck_path_test;
+  if (settings.healthcheck_path_prod) HEALTHCHECK_DEFAULTS.pathProd = settings.healthcheck_path_prod;
+  if (settings.healthcheck_protocol) HEALTHCHECK_DEFAULTS.protocol = settings.healthcheck_protocol;
+  if (settings.healthcheck_protocol_dev) HEALTHCHECK_DEFAULTS.protocolDev = settings.healthcheck_protocol_dev;
+  if (settings.healthcheck_protocol_test) HEALTHCHECK_DEFAULTS.protocolTest = settings.healthcheck_protocol_test;
+  if (settings.healthcheck_protocol_prod) HEALTHCHECK_DEFAULTS.protocolProd = settings.healthcheck_protocol_prod;
+  if (settings.healthcheck_timeout_ms) HEALTHCHECK_DEFAULTS.timeoutMs = Number(settings.healthcheck_timeout_ms);
+  if (settings.healthcheck_interval_ms) HEALTHCHECK_DEFAULTS.intervalMs = Number(settings.healthcheck_interval_ms);
+
+  const envRes = await pool.query(
+    'select env_vars, db_url, db_name from environments where project_id = $1 and name = $2',
+    [projectId, environment]
+  );
+  const projectRes = await pool.query(
+    'select name, short_id, project_slug from projects where id = $1',
+    [projectId]
+  );
+  const project = projectRes.rows[0];
+  if (!project?.short_id) throw new Error('Project not found');
+  const envVars = envRes.rows[0]?.env_vars || {};
+  let dbUrl = envRes.rows[0]?.db_url || null;
+  const dbName = envRes.rows[0]?.db_name || dbNameFor(project.short_id, environment);
+  if (!dbUrl || !dbUrlMatchesConfig(dbUrl)) {
+    await ensureDatabase(dbName);
+    dbUrl = dbUrlFor(dbName);
+    await pool.query(
+      `insert into environments (project_id, name, db_name, db_url)
+       values ($1, $2, $3, $4)
+       on conflict (project_id, name)
+       do update set db_name = excluded.db_name, db_url = excluded.db_url`,
+      [projectId, environment, dbName, dbUrl]
+    );
+  }
+
+  const { envPath, tempDir: envTemp } = await writeEnvFile(envVars, dbUrl);
+  try {
+    const resumed = await resumeDeployment(projectId, environment, envPath);
+    if (!resumed) return null;
+  } finally {
+    await fs.rm(envTemp, { recursive: true, force: true });
+  }
+
+  const host = hostFor(project, environment);
+  const appName = `vibes-app-${projectId}`;
+  const namespace = `vibes-${environment}`;
+  const internalHost = `${appName}.${namespace}.svc.cluster.local`;
+  const healthHost =
+    PLATFORM_ENV === 'local' || environment === 'production' ? host : internalHost;
+  const appPort = Number(envVars.PORT || process.env.PORT || 3000);
+  const health = await waitForHealth(projectId, environment, healthHost, appPort);
+  if (!health.ok) {
+    const err = await buildHealthcheckError(projectId, environment, host);
+    if (health.crashloop) {
+      const detail = `CrashLoopBackOff detected (${health.crashloop.restartCount} restarts) on pod ${health.crashloop.podName || 'unknown'}.`;
+      err.detail = `${detail}\n\n${err.detail || ''}`.trim();
+    }
+    throw err;
+  }
+  return `Fast resume: scaled ${appName} to 1 (commit ${commitHash})`;
+}
+
+function hostProjectName(name) {
+  const cleaned = (name || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return cleaned || 'app';
+}
+
+function hostFor(project, environment) {
+  const domain = process.env.APP_DOMAIN || process.env.DOMAIN || 'localhost:8000';
+  const slug = project?.project_slug || hostProjectName(project?.name);
+  const suffix = project?.short_id ? `-${project.short_id}` : '';
+  // Use a single-label subdomain so it matches *.vibesplatform.ai wildcard certs.
+  return environment === 'production'
+    ? `${slug}${suffix}.${domain}`
+    : `${slug}-${environment}${suffix}.${domain}`;
+}
+
+function albLogsEnabled() {
+  return Boolean(ALB_LOG_BUCKET && ALB_LOG_PREFIX);
+}
+
+function normalizedAlbPrefix() {
+  const raw = String(ALB_LOG_PREFIX || '').replace(/^\/+/, '').replace(/\/+$/, '');
+  return raw ? `${raw}/` : '';
+}
+
+function buildAlbPrefixes(lookbackHours) {
+  const basePrefix = normalizedAlbPrefix();
+  const prefixes = new Set();
+  const now = new Date();
+  const start = new Date(now.getTime() - lookbackHours * 60 * 60 * 1000);
+  const cursor = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth(), start.getUTCDate()));
+  while (cursor <= now) {
+    const yyyy = cursor.getUTCFullYear();
+    const mm = String(cursor.getUTCMonth() + 1).padStart(2, '0');
+    const dd = String(cursor.getUTCDate()).padStart(2, '0');
+    prefixes.add(`${basePrefix}${yyyy}/${mm}/${dd}/`);
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
+  }
+  return Array.from(prefixes);
+}
+
+async function listAlbLogObjects(prefix) {
+  const cmd =
+    `aws s3api list-objects-v2 --bucket ${ALB_LOG_BUCKET}` +
+    ` --prefix '${prefix}' --region ${ALB_LOG_REGION}` +
+    ` --query 'Contents[].{Key:Key,LastModified:LastModified}' --output json`;
+  try {
+    const { stdout } = await exec('sh', ['-lc', cmd]);
+    const items = JSON.parse(stdout || '[]');
+    if (!Array.isArray(items)) return [];
+    return items
+      .filter((item) => item && item.Key)
+      .map((item) => ({
+        key: String(item.Key),
+        lastModified: item.LastModified ? new Date(item.LastModified).getTime() : 0
+      }));
+  } catch (err) {
+    console.warn('Failed to list ALB logs', err?.message || err);
+    return [];
+  }
+}
+
+async function listAlbLogKeys() {
+  if (!albLogsEnabled()) return [];
+  const prefixes = buildAlbPrefixes(ALB_LOG_LOOKBACK_HOURS);
+  const startMs = Date.now() - ALB_LOG_LOOKBACK_HOURS * 60 * 60 * 1000;
+  const items = [];
+  for (const prefix of prefixes) {
+    const entries = await listAlbLogObjects(prefix);
+    for (const entry of entries) {
+      if (!entry.key) continue;
+      if (entry.lastModified && entry.lastModified < startMs) continue;
+      items.push(entry);
+    }
+  }
+  items.sort((a, b) => (a.lastModified || 0) - (b.lastModified || 0));
+  const keys = items.map((item) => item.key);
+  if (keys.length <= ALB_LOG_MAX_FILES) return keys;
+  return keys.slice(keys.length - ALB_LOG_MAX_FILES);
+}
+
+async function filterUnprocessedAlbKeys(keys) {
+  if (!keys.length) return [];
+  try {
+    const existing = new Set();
+    const chunkSize = 500;
+    for (let i = 0; i < keys.length; i += chunkSize) {
+      const chunk = keys.slice(i, i + chunkSize);
+      const result = await pool.query(
+        'select s3_key from bandwidth_log_ingest where s3_key = any($1)',
+        [chunk]
+      );
+      for (const row of result.rows) existing.add(row.s3_key);
+    }
+    return keys.filter((key) => !existing.has(key));
+  } catch (err) {
+    const msg = String(err?.message || '');
+    if (msg.includes('bandwidth_log_ingest')) {
+      console.warn('bandwidth_log_ingest table missing; skipping ALB ingest');
+      return [];
+    }
+    throw err;
+  }
+}
+
+function splitAlbLogLine(line) {
+  const fields = [];
+  let current = '';
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i += 1) {
+    const ch = line[i];
+    if (ch === '"') {
+      inQuotes = !inQuotes;
+      continue;
+    }
+    if (ch === ' ' && !inQuotes) {
+      fields.push(current);
+      current = '';
+      continue;
+    }
+    current += ch;
+  }
+  if (current.length) fields.push(current);
+  return fields;
+}
+
+function extractHostFromRequest(request, domainField) {
+  if (domainField && domainField !== '-') {
+    domainField = String(domainField).trim();
+  }
+  if (!request || request === '-') return domainField || '';
+  const parts = String(request).split(' ');
+  const urlPart = parts[1];
+  if (!urlPart) return domainField || '';
+  if (urlPart.startsWith('http://') || urlPart.startsWith('https://')) {
+    try {
+      const url = new URL(urlPart);
+      return url.hostname || url.host || '';
+    } catch {
+      return domainField || '';
+    }
+  }
+  return domainField || '';
+}
+
+function monthKeyFromTimestamp(timestamp) {
+  const parsed = Date.parse(timestamp || '');
+  if (!Number.isFinite(parsed)) return currentMonthKey();
+  return new Date(parsed).toISOString().slice(0, 7);
+}
+
+async function loadProjectHostMap() {
+  const result = await pool.query('select id, name, short_id, project_slug from projects');
+  const map = new Map();
+  for (const row of result.rows) {
+    for (const env of ['development', 'testing', 'production']) {
+      const host = hostFor(row, env).toLowerCase();
+      map.set(host, { projectId: row.id, environment: env });
+      if (host.includes(':')) {
+        map.set(host.split(':')[0], { projectId: row.id, environment: env });
+      }
+    }
+  }
+  return map;
+}
+
+async function parseAlbLogObject(key, hostMap) {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'vibes-alb-'));
+  const filePath = path.join(tmpDir, path.basename(key));
+  try {
+    await exec('sh', ['-lc', `aws s3 cp "s3://${ALB_LOG_BUCKET}/${key}" "${filePath}" --region ${ALB_LOG_REGION}`]);
+    let stream = fsSync.createReadStream(filePath);
+    if (key.endsWith('.gz')) {
+      stream = stream.pipe(zlib.createGunzip());
+    }
+    const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+    const usage = new Map();
+    for await (const line of rl) {
+      if (!line) continue;
+      const fields = splitAlbLogLine(line);
+      if (fields.length < 13) continue;
+      const sentRaw = fields[11];
+      const sentBytes = Number(sentRaw);
+      const request = fields[12];
+      const domainField = fields[18];
+      const host = extractHostFromRequest(request, domainField).toLowerCase();
+      if (!host) continue;
+      const match = hostMap.get(host) || hostMap.get(host.split(':')[0]);
+      if (!match) continue;
+      const month = monthKeyFromTimestamp(fields[1]);
+      const bytes = Number.isFinite(sentBytes) ? Math.max(0, sentBytes) : 0;
+      if (!bytes) continue;
+      const keyId = `${match.projectId}:${month}`;
+      usage.set(keyId, (usage.get(keyId) || 0) + bytes);
+    }
+    return usage;
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+}
+
+async function markAlbLogProcessed(key) {
+  try {
+    await pool.query(
+      `insert into bandwidth_log_ingest (s3_key)
+       values ($1)
+       on conflict (s3_key) do nothing`,
+      [key]
+    );
+  } catch (err) {
+    const msg = String(err?.message || '');
+    if (msg.includes('bandwidth_log_ingest')) return;
+    throw err;
+  }
+}
+
+async function flushBandwidthUsage(usageMap) {
+  for (const [key, bytes] of usageMap.entries()) {
+    const [projectId, month] = key.split(':');
+    if (!projectId || !month) continue;
+    await pool.query(
+      `insert into bandwidth_usage (project_id, month, bytes_out)
+       values ($1, $2, $3)
+       on conflict (project_id, month)
+       do update set bytes_out = bandwidth_usage.bytes_out + excluded.bytes_out,
+                     updated_at = now()`,
+      [projectId, month, Math.floor(bytes)]
+    );
+  }
+}
+
+let albIngestRunning = false;
+
+async function ingestAlbLogs() {
+  if (albIngestRunning) return;
+  if (!albLogsEnabled()) return;
+  albIngestRunning = true;
+  try {
+    const keys = await listAlbLogKeys();
+    const unprocessed = await filterUnprocessedAlbKeys(keys);
+    if (unprocessed.length === 0) return;
+    const hostMap = await loadProjectHostMap();
+    const usageTotals = new Map();
+    for (const key of unprocessed) {
+      try {
+        const usage = await parseAlbLogObject(key, hostMap);
+        for (const [usageKey, bytes] of usage.entries()) {
+          usageTotals.set(usageKey, (usageTotals.get(usageKey) || 0) + bytes);
+        }
+        await markAlbLogProcessed(key);
+      } catch (err) {
+        console.warn('Failed to ingest ALB log', key, err?.message || err);
+      }
+    }
+    if (usageTotals.size > 0) {
+      await flushBandwidthUsage(usageTotals);
+    }
+  } finally {
+    albIngestRunning = false;
+  }
+}
+
+let bandwidthReconcileRunning = false;
+
+async function reconcileBandwidthLimits() {
+  if (bandwidthReconcileRunning) return;
+  bandwidthReconcileRunning = true;
+  try {
+    await ingestAlbLogs();
+    const month = currentMonthKey();
+    const usageRes = await pool.query(
+      `select b.project_id, b.bytes_out, u.plan as user_plan
+       from bandwidth_usage b
+       join projects p on p.id = b.project_id
+       join users u on u.id = p.owner_id
+       where b.month = $1`,
+      [month]
+    );
+    if (usageRes.rowCount === 0) return;
+    const overLimitProjects = new Set();
+    for (const row of usageRes.rows) {
+      const planName = normalizePlanName(row.user_plan || DEFAULT_USER_PLAN);
+      const limitGb = Number(resolvePlanLimits(planName)?.bandwidth_gb || 0);
+      if (!limitGb) continue;
+      const usedBytes = Number(row.bytes_out || 0);
+      if (usedBytes >= limitGb * 1024 * 1024 * 1024) {
+        overLimitProjects.add(row.project_id);
+      }
+    }
+    if (overLimitProjects.size === 0) return;
+    const envRes = await pool.query(
+      `select project_id, name, deployed_commit
+       from environments
+       where build_status = 'live'
+         and project_id = any($1)`,
+      [Array.from(overLimitProjects)]
+    );
+    for (const row of envRes.rows) {
+      const outcome = await scaleDeploymentToZero(row.project_id, row.name);
+      if (outcome === 'failed') continue;
+      await updateBuildStatus(row.project_id, row.name, 'offline', row.deployed_commit || null);
+    }
+  } catch (err) {
+    console.error('Bandwidth reconcile failed', err);
+  } finally {
+    bandwidthReconcileRunning = false;
+  }
+}
+
+async function writeEnvFile(envVars, dbUrl) {
+  const baseDir = process.env.VIBES_TMP_DIR || '/var/tmp';
+  await fs.mkdir(baseDir, { recursive: true });
+  const tempDir = await fs.mkdtemp(path.join(baseDir, 'vibes-env-'));
+  const envPath = path.join(tempDir, 'app.env');
+  const lines = [];
+  if (dbUrl) lines.push(`DATABASE_URL=${dbUrl}`);
+  for (const [key, value] of Object.entries(envVars || {})) {
+    if (key === 'DATABASE_URL') continue;
+    lines.push(`${key}=${value}`);
+  }
+  const contents = lines.join('\n');
+  await fs.writeFile(envPath, contents);
+  return { envPath, tempDir };
+}
+
+async function writeSnapshot(projectId) {
+  const projectRes = await pool.query('select snapshot_blob from projects where id = $1', [projectId]);
+  const blob = projectRes.rows[0]?.snapshot_blob;
+  if (!blob) throw new Error('Project snapshot missing');
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'vibes-snapshot-'));
+  const snapshotPath = path.join(tempDir, 'snapshot.tar.gz');
+  await fs.writeFile(snapshotPath, blob);
+  return { snapshotPath, tempDir };
+}
+
+async function deployEnvironment(projectId, environment, commitHash) {
+  console.log(`Deploying project ${projectId} environment ${environment}...`);
+  const command = deployCommandForEnv(environment);
+  if (!command) return;
+  const settingsRes = await pool.query(
+    `select key, value from settings
+     where key in (
+       'healthcheck_path',
+       'healthcheck_path_dev',
+       'healthcheck_path_test',
+       'healthcheck_path_prod',
+       'healthcheck_protocol',
+       'healthcheck_protocol_dev',
+       'healthcheck_protocol_test',
+       'healthcheck_protocol_prod',
+       'healthcheck_timeout_ms',
+       'healthcheck_interval_ms'
+     )`
+  );
+  const settings = {};
+  for (const row of settingsRes.rows) settings[row.key] = row.value;
+  if (settings.healthcheck_path) HEALTHCHECK_DEFAULTS.path = settings.healthcheck_path;
+  if (settings.healthcheck_path_dev) HEALTHCHECK_DEFAULTS.pathDev = settings.healthcheck_path_dev;
+  if (settings.healthcheck_path_test) HEALTHCHECK_DEFAULTS.pathTest = settings.healthcheck_path_test;
+  if (settings.healthcheck_path_prod) HEALTHCHECK_DEFAULTS.pathProd = settings.healthcheck_path_prod;
+  if (settings.healthcheck_protocol) HEALTHCHECK_DEFAULTS.protocol = settings.healthcheck_protocol;
+  if (settings.healthcheck_protocol_dev) HEALTHCHECK_DEFAULTS.protocolDev = settings.healthcheck_protocol_dev;
+  if (settings.healthcheck_protocol_test) HEALTHCHECK_DEFAULTS.protocolTest = settings.healthcheck_protocol_test;
+  if (settings.healthcheck_protocol_prod) HEALTHCHECK_DEFAULTS.protocolProd = settings.healthcheck_protocol_prod;
+  if (settings.healthcheck_timeout_ms) HEALTHCHECK_DEFAULTS.timeoutMs = Number(settings.healthcheck_timeout_ms);
+  if (settings.healthcheck_interval_ms) HEALTHCHECK_DEFAULTS.intervalMs = Number(settings.healthcheck_interval_ms);
+  const envRes = await pool.query(
+    'select env_vars, db_url, db_name from environments where project_id = $1 and name = $2',
+    [projectId, environment]
+  );
+  const projectRes = await pool.query(
+    'select name, short_id, project_slug from projects where id = $1',
+    [projectId]
+  );
+  const project = projectRes.rows[0];
+  const host = hostFor(project, environment);
+  const envVars = envRes.rows[0]?.env_vars || {};
+  let dbUrl = envRes.rows[0]?.db_url || null;
+  if (!project?.short_id) throw new Error('Project not found');
+  const dbName = envRes.rows[0]?.db_name || dbNameFor(project.short_id, environment);
+  const needsRecompute = !dbUrl || !dbUrlMatchesConfig(dbUrl);
+  if (needsRecompute) {
+    await ensureDatabase(dbName);
+    dbUrl = dbUrlFor(dbName);
+    await pool.query(
+      `insert into environments (project_id, name, db_name, db_url)
+       values ($1, $2, $3, $4)
+       on conflict (project_id, name)
+       do update set db_name = excluded.db_name, db_url = excluded.db_url`,
+      [projectId, environment, dbName, dbUrl]
+    );
+  }
+  const { envPath, tempDir: envTemp } = await writeEnvFile(envVars, dbUrl);
+  try {
+    await fs.access(envPath);
+    console.log(`Env file ready at ${envPath}`);
+  } catch (err) {
+    throw new Error(`Env file missing before deploy: ${envPath} (${err?.message || err})`);
+  }
+  const appName = `vibes-app-${projectId}`;
+  const namespace = `vibes-${environment}`;
+  const internalHost = `${appName}.${namespace}.svc.cluster.local`;
+  const healthHost =
+    PLATFORM_ENV === 'local' || environment === 'production' ? host : internalHost;
+  const { repoPath, tempDir: repoTemp } = await loadRepoFromSnapshot(projectId);
+  if (commitHash) {
+    await runGit(['checkout', commitHash], repoPath);
+  }
+  const { archivePath: snapshotPath, archiveDir } = await createSnapshotArchive(repoPath, 'deploy-snapshot');
+  let snapshotHash = '';
+  let deployTag = commitHash || '';
+  if (!deployTag) {
+    snapshotHash = (await hashFile(snapshotPath)).slice(0, 12);
+    deployTag = snapshotHash;
+  }
+  const env = {
+    ...process.env,
+    PROJECT_ID: projectId,
+    PROJECT_SHORT_ID: project?.short_id || '',
+    ENVIRONMENT: environment,
+    COMMIT_HASH: commitHash || '',
+    DEPLOY_TAG: deployTag,
+    APP_NAME: appName,
+    NAMESPACE: namespace,
+    ENV_FILE: envPath,
+    SNAPSHOT_PATH: snapshotPath,
+    APP_HOST: host,
+    DATABASE_URL: dbUrl || '',
+    ...(PLATFORM_ENV === 'local' && LOCAL_LAN_IP ? { APP_LAN_IP: LOCAL_LAN_IP } : {})
+  };
+  let output = '';
+  try {
+    console.log(`Deploy command: ${command}`);
+    console.log('Deploy env:', {
+      PROJECT_ID: env.PROJECT_ID,
+      ENVIRONMENT: env.ENVIRONMENT,
+      COMMIT_HASH: env.COMMIT_HASH,
+      APP_NAME: env.APP_NAME,
+      NAMESPACE: env.NAMESPACE,
+      ENV_FILE: env.ENV_FILE,
+      SNAPSHOT_PATH: env.SNAPSHOT_PATH,
+      DEPLOY_TAG: env.DEPLOY_TAG,
+      APP_HOST: env.APP_HOST,
+      AWS_REGION: env.AWS_REGION,
+      AWS_ACCOUNT_ID: env.AWS_ACCOUNT_ID,
+      ECR_REPO: env.ECR_REPO,
+      ACM_CERT_ARN: env.ACM_CERT_ARN,
+      DOMAIN: env.DOMAIN
+    });
+    const probePaths = ['/usr/bin/aws', '/usr/bin/python3', '/usr/bin/node', '/bin/sh', '/bin/ls'];
+    const probeResults = {};
+    for (const probePath of probePaths) {
+      try {
+        await fs.access(probePath);
+        probeResults[probePath] = 'present';
+      } catch {
+        probeResults[probePath] = 'missing';
+      }
+    }
+    console.log('Runtime path probe:', {
+      cwd: process.cwd(),
+      path: process.env.PATH,
+      probes: probeResults
+    });
+    try {
+      const { stdout, stderr } = await runCommandStreaming(command, env);
+      output = `${stdout || ''}${stderr || ''}`;
+    } catch (err) {
+      const errStdout = err?.stdout || '';
+      const errStderr = err?.stderr || '';
+      const errMsg = err?.message || String(err);
+      console.error(`Deploy exec failed: ${errMsg}`);
+      if (errStdout) console.log(`Deploy stdout (error):\n${errStdout}`);
+      if (errStderr) console.warn(`Deploy stderr (error):\n${errStderr}`);
+      output = `${errStdout}${errStderr}`.trim();
+      throw err;
+    }
+  } finally {
+    await fs.rm(archiveDir, { recursive: true, force: true });
+    await fs.rm(envTemp, { recursive: true, force: true });
+    await fs.rm(repoTemp, { recursive: true, force: true });
+  }
+  const appPort = Number(envVars.PORT || process.env.PORT || 3000);
+  const health = await waitForHealth(projectId, environment, healthHost, appPort);
+  if (!health.ok) {
+    const err = await buildHealthcheckError(projectId, environment, host);
+    if (health.crashloop) {
+      const detail = `CrashLoopBackOff detected (${health.crashloop.restartCount} restarts) on pod ${health.crashloop.podName || 'unknown'}.`;
+      err.detail = `${detail}\n\n${err.detail || ''}`.trim();
+    }
+    throw err;
+  }
+  return output;
+}
+
+async function cleanupDevRuntime(projectId, shortId, environment) {
+  const confDir = path.join(VIBES_WORKDIR_ROOT, 'nginx', 'conf.d');
+  const workdir = path.join(VIBES_WORKDIR_ROOT, `deploy-${projectId}-${environment}`);
+  await fs.rm(path.join(confDir, `${projectId}-${environment}.conf`), { force: true });
+  await fs.rm(path.join(confDir, `${shortId}-${environment}.conf`), { force: true });
+  await fs.rm(workdir, { recursive: true, force: true });
+  const container = `vibes-app-${projectId}-${environment}`;
+  await exec('sh', ['-lc', `podman rm -f ${container} >/dev/null 2>&1 || true`]);
+  await exec('sh', ['-lc', 'podman exec vibes-nginx nginx -s reload >/dev/null 2>&1 || true']);
+}
+
+async function processDeleteProject(projectId) {
+  const projectRes = await pool.query(
+    'select id, name, short_id, project_slug from projects where id = $1',
+    [projectId]
+  );
+  if (projectRes.rowCount === 0) return;
+  const project = projectRes.rows[0];
+  const envRes = await pool.query(
+    'select name, db_name from environments where project_id = $1',
+    [projectId]
+  );
+  const envs = envRes.rows.length
+    ? envRes.rows
+    : ['development', 'testing', 'production'].map((name) => ({ name, db_name: null }));
+  const cleanupErrors = [];
+  for (const env of envs) {
+    const dbName = env.db_name || dbNameFor(project.short_id, env.name);
+    try {
+      await dropDatabase(dbName);
+    } catch { }
+    const host = hostFor(project, env.name);
+    const cmd = deleteCommandForEnv(env.name);
+    if (cmd) {
+      const envVars = {
+        ...process.env,
+        PROJECT_ID: projectId,
+        PROJECT_SHORT_ID: project.short_id,
+        ENVIRONMENT: env.name,
+        APP_HOST: host
+      };
+      try {
+        await exec('sh', ['-lc', cmd], { env: envVars });
+      } catch (err) {
+        const msg = err?.message || '';
+        const stderr = err?.stderr || '';
+        const notFound = msg.includes('command not found') || stderr.includes('command not found');
+        if (notFound && !STRICT_DELETE) {
+          continue;
+        }
+        cleanupErrors.push(`env ${env.name}: ${msg || stderr || 'cleanup failed'}`);
+      }
+    } else if (env.name === 'development') {
+      await cleanupDevRuntime(projectId, project.short_id, env.name);
+    }
+  }
+  await pool.query('delete from projects where id = $1', [projectId]);
+  emitProjectEvent(projectId, 'projectDeleted', { projectId });
+  if (cleanupErrors.length) {
+    const message = `Delete project ${projectId} completed with warnings:\n${cleanupErrors.join('\n')}`;
+    if (STRICT_DELETE) throw new Error(message);
+    console.warn(message);
+  }
+}
+
+const socket = socketIoClient(SOCKET_URL, {
+  transports: ['websocket'],
+  reconnection: true
+});
+
+function emitProjectEvent(projectId, event, payload) {
+  if (!projectId) return;
+  socket.emit('projectEvent', { projectId, event, payload });
+}
+
+async function runGit(args, cwd) {
+  await exec('git', args, { cwd });
+}
+
+async function gitOutput(args, cwd) {
+  const { stdout } = await exec('git', args, { cwd });
+  return stdout.trim();
+}
+
+async function ensureRepo(repoPath) {
+  try {
+    await fs.access(path.join(repoPath, '.git'));
+    return;
+  } catch {
+    await runGit(['init'], repoPath);
+    await runGit(['config', 'user.name', AUTHOR_NAME], repoPath);
+    await runGit(['config', 'user.email', AUTHOR_EMAIL], repoPath);
+    await runGit(['add', '.'], repoPath);
+    await runGit(['commit', '-m', 'init'], repoPath);
+  }
+}
+
+async function loadRepoFromSnapshot(projectId) {
+  const projectRes = await pool.query('select snapshot_blob from projects where id = $1', [projectId]);
+  const blob = projectRes.rows[0]?.snapshot_blob;
+  if (!blob) throw new Error('Project snapshot missing');
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'vibes-'));
+  const snapshotPath = path.join(tempDir, 'snapshot.tar.gz');
+  await fs.writeFile(snapshotPath, blob);
+  await tar.x({ file: snapshotPath, cwd: tempDir, gzip: true });
+  await fs.rm(snapshotPath, { force: true });
+  const repoPath = await detectRepoRoot(tempDir);
+  await stripSnapshotArtifacts(repoPath);
+  try {
+    await exec('sh', ['-lc', `chmod -R u+rwX "${repoPath}"`]);
+  } catch { }
+  await ensureRepo(repoPath);
+  return { repoPath, tempDir };
+}
+
+async function cloneStarterRepo(destDir) {
+  if (!STARTER_REPO_URL) throw new Error('STARTER_REPO_URL not set');
+  let repoUrl = STARTER_REPO_URL;
+  if (GIT_TOKEN && repoUrl.startsWith('https://')) {
+    const prefix = 'https://';
+    repoUrl = `${prefix}${GIT_TOKEN}@${repoUrl.slice(prefix.length)}`;
+  }
+  await exec('git', ['clone', '--depth', '1', '--branch', STARTER_REPO_REF, repoUrl, destDir]);
+  await runGit(['config', 'user.name', AUTHOR_NAME], destDir);
+  await runGit(['config', 'user.email', AUTHOR_EMAIL], destDir);
+}
+
+async function detectRepoRoot(extractDir) {
+  try {
+    await fs.access(path.join(extractDir, '.git'));
+    return extractDir;
+  } catch {
+    const entries = await fs.readdir(extractDir, { withFileTypes: true });
+    const dirs = entries.filter((e) => e.isDirectory()).map((e) => e.name);
+    if (dirs.length === 1) {
+      const candidate = path.join(extractDir, dirs[0]);
+      try {
+        await fs.access(path.join(candidate, '.git'));
+        return candidate;
+      } catch {
+        return candidate;
+      }
+    }
+  }
+  return extractDir;
+}
+
+// {"type":"thread.started","thread_id":"019c96a1-43f8-7fb1-958d-16dadbf76247"} 
+// {"type":"turn.started"} 
+// {"type":"item.started","item":{"id":"item_0","type":"command_execution","command":"/bin/zsh -lc ls","aggregated_output":"","exit_code":null,"status":"in_progress"}} 
+// {"type":"item.completed","item":{"id":"item_0","type":"command_execution","command":"/bin/zsh -lc ls","aggregated_output":"package-lock.json\npackage.json\npublic\nserver.js\nsnapshot-updated.tar.gz\nsnapshot.tar.gz\nviews\n","exit_code":0,"status":"completed"}}
+
+function sanitizeCodexSummary(raw) {
+   if (!raw) {
+    return '';
+  }
+  let lastItemNumber = -1;
+  return raw
+    .split("\n")
+    .filter(line => line.trim() !== "").map(JSON.parse).map(obj => {
+      if (!obj.item) {
+        return '';
+      }
+      if(obj.item.type == 'agent_message'){
+         return `${obj.item.text}`;
+      }
+      /*
+      const stepNumber = obj.item.id.split("_")[1];
+      if (stepNumber !== lastItemNumber) {
+            lastItemNumber++;
+        return '';
+      }
+      let filesChanged = '';
+      if(obj.item.type =='file_change'){
+        const files = obj.item.changes.map(change => {
+          return change.path.split('/T/').split('/').slice(1).join('/');
+        })
+        filesChanged = `File changes: ${files.join(', ')}`;
+      }
+      if(obj.item.type == 'agent_message'){
+        filesChanged = `Agent message: ${obj.item.text}`;
+      }
+      const statement = `${stepNumber}) ${obj.item.type?.split('.').join(' ')}: ${filesChanged? filesChanged : ''}${obj.item.command ? obj.item.command?.split('_').join(' ') : ''}
+      ${obj.item.exit_code ? `exit code: ${obj.item.exit_code}` : ''}  ${`status: ${obj.item.status}`}`;
+      console.log(statement);
+      return statement*/
+
+    }).filter(i => i).join("\n");
+
+ 
+
+
+}
+
+function extractCodexThreadId(raw) {
+  if (!raw) return '';
+  const lines = raw.split('\n');
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const obj = JSON.parse(trimmed);
+      if (obj?.type === 'thread.started' && obj.thread_id) return obj.thread_id;
+      if (obj?.thread_id && typeof obj.thread_id === 'string') return obj.thread_id;
+    } catch {}
+  }
+  return '';
+}
+
+async function runCodex(prompt, cwd, threadId = '', apiKey = '') {
+  const trimmedKey = (apiKey || '').trim();
+  if (!trimmedKey) {
+    await ensureCodexAuth();
+  }
+  const wrappedPrompt = [
+    'You are modifying this repository directly.',
+    `Current branch: ai-task (do not change this)`,
+    'Task:',
+    prompt,
+    '',
+    'Rules:',
+    '- Make the minimal high-quality code changes needed.',
+    '- Keep existing architecture and style.',
+    '- Update related tests/docs if required.',
+    '- Do not print markdown fences.',
+    '- Make the file edits directly in the working tree.',
+    '',
+    'At the end, provide a concise summary of changes and key files touched.'
+  ].join('\n');
+  const responseFilePath = path.join(cwd, '.codex-last-message.txt');
+  const template = process.env.CODEX_COMMAND_TEMPLATE;
+  const resumeTemplate = process.env.CODEX_COMMAND_TEMPLATE_RESUME;
+  console.log('Codex config:', {
+    hasTemplate: Boolean(template),
+    hasResumeTemplate: Boolean(resumeTemplate),
+    codexCommand: process.env.CODEX_COMMAND || '',
+    codexArgs: process.env.CODEX_ARGS || ''
+  });
+  if (template) {
+    const env = {
+      ...process.env,
+      ...(trimmedKey ? { OPENAI_API_KEY: trimmedKey } : {}),
+      CODEX_PROMPT: wrappedPrompt,
+      CODEX_RESPONSE_FILE: responseFilePath,
+      CODEX_THREAD_ID: threadId
+    };
+
+    try {
+      const commandTemplate = threadId && resumeTemplate ? resumeTemplate : template;
+
+      const { stdout, stderr } = await exec('sh', ['-lc', commandTemplate], { cwd, env });
+      const stdoutText = stdout || '';
+      let summaryRaw = stdoutText;
+      const summary = sanitizeCodexSummary(summaryRaw);
+      console.log('Codex stdout:', summary);
+      return {
+        output: `${summary}${stderr}`,
+        threadId: extractCodexThreadId(stdoutText || summaryRaw)
+      };
+    } catch (error) {
+      // exec throws if exit code is non-zero; handle error.stdout/stderr here
+      const errStdout = error?.stdout || '';
+      const errStderr = error?.stderr || '';
+      const errMessage = error?.message || '';
+      console.log('Codex error stderr:', errStderr || errMessage);
+      return { output: `${errStdout}${errStderr || errMessage}`, threadId: '' };
+    }
+  }
+  console.log('Running Codex with command/args...');
+  const command = process.env.CODEX_COMMAND || 'codex';
+  const args = (process.env.CODEX_ARGS || '').split(' ').filter(Boolean);
+  const promptFlag = process.env.CODEX_PROMPT_FLAG || '--prompt';
+  const resumeSubcommand = process.env.CODEX_RESUME_SUBCOMMAND || 'resume';
+  const execArgs = threadId
+    ? [resumeSubcommand, threadId, ...args, promptFlag, wrappedPrompt]
+    : [...args, promptFlag, wrappedPrompt];
+  const env = trimmedKey ? { ...process.env, OPENAI_API_KEY: trimmedKey } : undefined;
+  const { stdout, stderr } = await exec(command, execArgs, { cwd, env });
+  return { output: `${stdout || ''}${stderr || ''}`, threadId: extractCodexThreadId(stdout || '') };
+}
+
+async function ensureCodexAuth() {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) return;
+  const authPath = path.join(process.env.HOME || '/root', '.codex', 'auth.json');
+  try {
+    await fs.access(authPath);
+    return;
+  } catch {}
+  try {
+    // Avoid logging the API key; feed it via stdin.
+    await exec('sh', ['-lc', 'printenv OPENAI_API_KEY | codex login --with-api-key']);
+  } catch (error) {
+    const errStderr = error?.stderr || '';
+    const errMessage = error?.message || '';
+    console.log('Codex login failed:', errStderr || errMessage);
+  }
+}
+
+async function createBuild(projectId, environment, status, refCommit) {
+  const result = await pool.query(
+    `insert into builds (project_id, environment, status, ref_commit)
+     values ($1, $2, $3, $4)
+     returning id`,
+    [projectId, environment, status, refCommit || null]
+  );
+  return result.rows[0].id;
+}
+
+async function finalizeBuild(buildId, status, log, refCommit) {
+  await pool.query(
+    `update builds set status = $1, build_log = $2, ref_commit = $3, updated_at = now()
+     where id = $4`,
+    [status, log || null, refCommit || null, buildId]
+  );
+}
+
+function monthStartUtc(monthKey) {
+  const match = String(monthKey || '').match(/^(\d{4})-(\d{2})$/);
+  if (!match) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  if (!Number.isFinite(year) || !Number.isFinite(month)) return null;
+  if (month < 1 || month > 12) return null;
+  return new Date(Date.UTC(year, month - 1, 1));
+}
+
+function nextMonthStartUtc(monthKey) {
+  const start = monthStartUtc(monthKey);
+  if (!start) return null;
+  return new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth() + 1, 1));
+}
+
+function bytesToGb(bytes) {
+  const num = Number(bytes || 0);
+  if (!Number.isFinite(num)) return 0;
+  return Math.round((num / 1024 / 1024 / 1024) * 100) / 100;
+}
+
+function monthKeyFromMs(ms) {
+  return new Date(ms).toISOString().slice(0, 7);
+}
+
+function nextMonthStartMs(ms) {
+  const date = new Date(ms);
+  return Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1, 1, 0, 0, 0, 0);
+}
+
+async function addRuntimeUsage(ownerId, projectId, environment, month, runtimeMs) {
+  if (!ownerId || !projectId || !environment) return;
+  if (!runtimeMs || Number.isNaN(runtimeMs) || runtimeMs <= 0) return;
+  await pool.query(
+    `insert into runtime_usage (user_id, project_id, environment, month, runtime_ms)
+     values ($1, $2, $3, $4, $5)
+     on conflict (user_id, project_id, environment, month)
+     do update set runtime_ms = runtime_usage.runtime_ms + excluded.runtime_ms,
+                   updated_at = now()`,
+    [ownerId, projectId, environment, month, Math.floor(runtimeMs)]
+  );
+}
+
+async function recordRuntimeUsage(ownerId, projectId, environment, startMs, endMs) {
+  if (!ownerId || !projectId || !environment) return;
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) return;
+  if (endMs <= startMs) return;
+  let cursor = startMs;
+  while (cursor < endMs) {
+    const monthEnd = nextMonthStartMs(cursor);
+    const segmentEnd = Math.min(endMs, monthEnd);
+    const segmentMs = segmentEnd - cursor;
+    if (segmentMs > 0) {
+      await addRuntimeUsage(ownerId, projectId, environment, monthKeyFromMs(cursor), segmentMs);
+    }
+    cursor = segmentEnd;
+  }
+}
+
+async function getProjectBuildCount(projectId, monthKey) {
+  const start = monthStartUtc(monthKey);
+  const end = nextMonthStartUtc(monthKey);
+  if (!start || !end) return 0;
+  const result = await pool.query(
+    `select count(*)::int as count
+     from builds
+     where project_id = $1
+       and created_at >= $2
+       and created_at < $3`,
+    [projectId, start, end]
+  );
+  return Number(result.rows[0]?.count || 0);
+}
+
+async function ensureBuildLimitForProject(projectId, plan) {
+  const limit = Number(plan?.limits?.builds || 0);
+  if (!limit) return;
+  const month = currentMonthKey();
+  const count = await getProjectBuildCount(projectId, month);
+  if (count >= limit) {
+    const err = new Error('Build limit reached for this project.');
+    err.code = 'plan_build_limit';
+    err.plan = plan?.name || DEFAULT_USER_PLAN;
+    err.limit = limit;
+    err.count = count;
+    err.month = month;
+    throw err;
+  }
+}
+
+async function getDatabaseSizeBytes(dbName) {
+  if (!dbName) return 0;
+  try {
+    const result = await adminPool.query('select pg_database_size($1)::bigint as size_bytes', [dbName]);
+    return Number(result.rows[0]?.size_bytes || 0);
+  } catch (err) {
+    const msg = String(err?.message || '');
+    if (msg.includes('does not exist')) return 0;
+    throw err;
+  }
+}
+
+async function ensureDbStorageLimitForProject(projectId, environment, plan) {
+  const limitGb = Number(plan?.limits?.db_storage_gb || 0);
+  if (!limitGb) return;
+  const envRes = await pool.query(
+    'select db_name from environments where project_id = $1 and name = $2',
+    [projectId, environment]
+  );
+  let dbName = envRes.rows[0]?.db_name || null;
+  if (!dbName) {
+    const projectRes = await pool.query('select short_id from projects where id = $1', [projectId]);
+    const shortId = projectRes.rows[0]?.short_id;
+    if (shortId) dbName = dbNameFor(shortId, environment);
+  }
+  if (!dbName) return;
+  let sizeBytes = 0;
+  try {
+    sizeBytes = await getDatabaseSizeBytes(dbName);
+  } catch (err) {
+    console.warn('DB size check failed', err?.message || err);
+    return;
+  }
+  if (sizeBytes >= limitGb * 1024 * 1024 * 1024) {
+    const err = new Error('Database storage limit reached for this project.');
+    err.code = 'plan_db_storage_limit';
+    err.plan = plan?.name || DEFAULT_USER_PLAN;
+    err.environment = environment;
+    err.limit_gb = limitGb;
+    err.used_gb = bytesToGb(sizeBytes);
+    throw err;
+  }
+}
+
+async function getBandwidthUsageBytes(projectId, monthKey) {
+  try {
+    const result = await pool.query(
+      `select bytes_out::bigint as bytes_out
+       from bandwidth_usage
+       where project_id = $1 and month = $2`,
+      [projectId, monthKey]
+    );
+    return Number(result.rows[0]?.bytes_out || 0);
+  } catch (err) {
+    const msg = String(err?.message || '');
+    if (msg.includes('bandwidth_usage')) return 0;
+    throw err;
+  }
+}
+
+async function ensureBandwidthLimitForProject(projectId, plan) {
+  const limitGb = Number(plan?.limits?.bandwidth_gb || 0);
+  if (!limitGb) return;
+  const month = currentMonthKey();
+  const usedBytes = await getBandwidthUsageBytes(projectId, month);
+  if (usedBytes >= limitGb * 1024 * 1024 * 1024) {
+    const err = new Error('Bandwidth limit reached for this project.');
+    err.code = 'plan_bandwidth_limit';
+    err.plan = plan?.name || DEFAULT_USER_PLAN;
+    err.limit_gb = limitGb;
+    err.used_gb = bytesToGb(usedBytes);
+    err.month = month;
+    throw err;
+  }
+}
+
+async function enforcePlanUsageLimits(projectId, environment) {
+  const plan = await getPlanForProject(projectId);
+  await ensureBuildLimitForProject(projectId, plan);
+  await ensureDbStorageLimitForProject(projectId, environment, plan);
+  await ensureBandwidthLimitForProject(projectId, plan);
+}
+
+async function updateBuildStatus(projectId, environment, status, refCommit) {
+  const now = new Date();
+  let ownerId = null;
+  let previousStatus = null;
+  let previousLiveSince = null;
+  try {
+    const projectRes = await pool.query('select owner_id from projects where id = $1', [projectId]);
+    ownerId = projectRes.rows[0]?.owner_id || null;
+    const envRes = await pool.query(
+      'select build_status, live_since from environments where project_id = $1 and name = $2',
+      [projectId, environment]
+    );
+    if (envRes.rowCount > 0) {
+      previousStatus = envRes.rows[0].build_status || null;
+      previousLiveSince = envRes.rows[0].live_since
+        ? new Date(envRes.rows[0].live_since).getTime()
+        : null;
+    }
+  } catch (err) {
+    console.error('Failed to load runtime usage metadata', err);
+  }
+  if (previousStatus === 'live' && Number.isFinite(previousLiveSince) && ownerId) {
+    try {
+      await recordRuntimeUsage(ownerId, projectId, environment, previousLiveSince, now.getTime());
+    } catch (err) {
+      console.error('Failed to update runtime usage', err);
+    }
+  }
+  const nextLiveSince = status === 'live' ? now : null;
+  try {
+    await pool.query(
+      `insert into environments (project_id, name, build_status, deployed_commit, live_since)
+       values ($1, $2, $3, $4, $5)
+       on conflict (project_id, name)
+       do update set build_status = excluded.build_status,
+                     deployed_commit = excluded.deployed_commit,
+                     live_since = excluded.live_since,
+                     updated_at = now()`,
+      [projectId, environment, status, refCommit || null, nextLiveSince]
+    );
+  } catch (err) {
+    const msg = String(err?.message || '');
+    if (msg.includes('live_since')) {
+      await pool.query(
+        `insert into environments (project_id, name, build_status, deployed_commit)
+         values ($1, $2, $3, $4)
+         on conflict (project_id, name)
+         do update set build_status = excluded.build_status,
+                       deployed_commit = excluded.deployed_commit,
+                       updated_at = now()`,
+        [projectId, environment, status, refCommit || null]
+      );
+    } else {
+      throw err;
+    }
+  }
+  emitProjectEvent(projectId, 'buildUpdated', {
+    environment,
+    status,
+    refCommit: refCommit || null,
+    updatedAt: new Date().toISOString()
+  });
+}
+
+let reconcileRunning = false;
+
+async function reconcileStuckBuilds() {
+  if (reconcileRunning) return;
+  reconcileRunning = true;
+  try {
+    const staleSeconds = Math.max(60, Math.round(BUILD_RECONCILE_STALE_MS / 1000));
+    const result = await pool.query(
+      `select b.id, b.project_id, b.environment, b.ref_commit, b.updated_at, p.name, p.short_id, p.project_slug
+       from builds b
+       join projects p on p.id = b.project_id
+       where b.status = 'building'
+         and b.updated_at < now() - $1::interval
+       order by b.updated_at asc
+       limit 10`,
+      [`${staleSeconds} seconds`]
+    );
+    for (const row of result.rows) {
+      const envRes = await pool.query(
+        'select env_vars from environments where project_id = $1 and name = $2',
+        [row.project_id, row.environment]
+      );
+      const envVars = envRes.rows[0]?.env_vars || {};
+      const host = hostFor({ name: row.name, short_id: row.short_id, project_slug: row.project_slug }, row.environment);
+      const appPort = Number(envVars.PORT || process.env.PORT || 3000);
+      const healthy = await checkHealthOnce(row.project_id, row.environment, host, appPort);
+      if (healthy) {
+        await finalizeBuild(row.id, 'live', 'Reconciled via health check', row.ref_commit);
+        await updateBuildStatus(row.project_id, row.environment, 'live', row.ref_commit);
+      } else {
+        await finalizeBuild(row.id, 'failed', 'Health check failed during reconcile', row.ref_commit);
+        await updateBuildStatus(row.project_id, row.environment, 'failed', row.ref_commit);
+      }
+    }
+  } catch (err) {
+    console.error('Reconcile builds failed', err);
+  } finally {
+    reconcileRunning = false;
+  }
+}
+
+let scaleToZeroRunning = false;
+
+async function reconcileScaleToZero() {
+  if (scaleToZeroRunning) return;
+  const devThreshold = scaleToZeroThresholdMs('development');
+  const testThreshold = scaleToZeroThresholdMs('testing');
+  if (devThreshold <= 0 && testThreshold <= 0) return;
+  scaleToZeroRunning = true;
+  try {
+    const result = await pool.query(
+      `select e.project_id, e.name, e.deployed_commit, e.updated_at, e.live_since,
+              p.name as project_name, p.short_id, p.project_slug
+       from environments e
+       join projects p on p.id = e.project_id
+       where e.build_status = 'live'
+         and e.name in ('development', 'testing')`
+    );
+    const now = Date.now();
+    for (const row of result.rows) {
+      const threshold = scaleToZeroThresholdMs(row.name);
+      if (threshold <= 0) continue;
+      const liveSince = row.live_since ? new Date(row.live_since).getTime() : 0;
+      const updatedAt = row.updated_at ? new Date(row.updated_at).getTime() : 0;
+      const referenceAt = liveSince || updatedAt;
+      if (!referenceAt || Number.isNaN(referenceAt)) continue;
+      if (now - referenceAt < threshold) continue;
+      if (await hasActiveTasks(row.project_id, row.name)) continue;
+
+      const outcome = await scaleDeploymentToZero(row.project_id, row.name);
+      if (outcome === 'failed') continue;
+      await updateBuildStatus(
+        row.project_id,
+        row.name,
+        'offline',
+        row.deployed_commit || null
+      );
+    }
+  } catch (err) {
+    console.error('Scale to zero reconcile failed', err);
+  } finally {
+    scaleToZeroRunning = false;
+  }
+}
+
+let runtimeQuotaRunning = false;
+
+function quotaEnvironments() {
+  const envs = new Set();
+  for (const plan of Object.values(RUNTIME_QUOTAS || {})) {
+    if (!plan || typeof plan !== 'object') continue;
+    for (const [env, hours] of Object.entries(plan)) {
+      const value = Number(hours);
+      if (value && value > 0) envs.add(String(env || '').toLowerCase());
+    }
+  }
+  return Array.from(envs);
+}
+
+async function reconcileRuntimeQuotas() {
+  if (runtimeQuotaRunning) return;
+  const envs = quotaEnvironments();
+  if (envs.length === 0) return;
+  runtimeQuotaRunning = true;
+  try {
+    const result = await pool.query(
+      `select e.project_id, e.name, e.deployed_commit,
+              p.owner_id, p.short_id, p.project_slug, p.name as project_name,
+              u.plan as user_plan
+       from environments e
+       join projects p on p.id = e.project_id
+       join users u on u.id = p.owner_id
+       where e.build_status = 'live'
+         and e.name = any($1)`,
+      [envs]
+    );
+    if (result.rowCount === 0) return;
+    const groups = new Map();
+    for (const row of result.rows) {
+      const userId = row.owner_id;
+      const env = String(row.name || '').toLowerCase();
+      const key = `${userId}:${env}`;
+      if (!groups.has(key)) {
+        groups.set(key, {
+          userId,
+          environment: env,
+          planName: row.user_plan || DEFAULT_USER_PLAN,
+          rows: []
+        });
+      }
+      groups.get(key).rows.push(row);
+    }
+    for (const group of groups.values()) {
+      const quotaMs = runtimeQuotaMs(group.planName, group.environment);
+      if (!quotaMs) continue;
+      const usedMs = await getRuntimeUsageMsByUser(group.userId, group.environment);
+      if (usedMs < quotaMs) continue;
+      console.log(
+        `Runtime quota exceeded for user ${group.userId} env ${group.environment}: ${usedMs}ms >= ${quotaMs}ms`
+      );
+      const usedHours = Math.round((usedMs / 36e5) * 10) / 10;
+      const limitHours = Math.round((quotaMs / 36e5) * 10) / 10;
+      for (const row of group.rows) {
+        const outcome = await scaleDeploymentToZero(row.project_id, group.environment);
+        if (outcome === 'failed') continue;
+        await updateBuildStatus(row.project_id, group.environment, 'offline', row.deployed_commit || null);
+        emitProjectEvent(row.project_id, 'runtimeQuotaExceeded', {
+          projectId: row.project_id,
+          environment: group.environment,
+          plan: group.planName,
+          used_hours: usedHours,
+          limit_hours: limitHours
+        });
+      }
+    }
+  } catch (err) {
+    console.error('Runtime quota reconcile failed', err);
+  } finally {
+    runtimeQuotaRunning = false;
+  }
+}
+
+async function processTask(taskId) {
+  console.log(`Processing task ${taskId}...`);
+  const taskRes = await pool.query('select * from tasks where id = $1', [taskId]);
+  if (taskRes.rowCount === 0) return;
+  const task = taskRes.rows[0];
+  const projectRes = await pool.query('select * from projects where id = $1', [task.project_id]);
+  if (projectRes.rowCount === 0) return;
+  const project = projectRes.rows[0];
+
+  if (!project.snapshot_blob) {
+    throw new Error('Project snapshot missing');
+  }
+
+  await pool.query('update tasks set status = $1 where id = $2', ['running', taskId]);
+  emitProjectEvent(task.project_id, 'taskUpdated', { id: taskId, status: 'running' });
+  
+
+  const { repoPath, tempDir } = await loadRepoFromSnapshot(task.project_id);
+  await runGit(['checkout', '-B', 'ai-task'], repoPath);
+
+  let codexOutput = '';
+  try {
+    const demoApiKey = await getDemoOpenAiKey(task.project_id);
+    const { output, threadId } = await runCodex(
+      task.prompt,
+      repoPath,
+      project.codex_thread_id || '',
+      demoApiKey
+    );
+    codexOutput = output;
+    if (threadId && threadId !== project.codex_thread_id) {
+      await pool.query('update projects set codex_thread_id = $1 where id = $2', [threadId, task.project_id]);
+    }
+  } catch (err) {
+    codexOutput = `Codex failed: ${err.message}`;
+    console.error(`Codex failed for task ${taskId}:`, err);
+  }
+  console.log(`Task ${taskId} codex output:`, codexOutput);
+  const status = await gitOutput(['status', '--porcelain'], repoPath);
+  let commitHash = null;
+  if (status) {
+    await runGit(['add', '-A'], repoPath);
+    await runGit(['commit', '-m', `AI task ${taskId}`], repoPath);
+    commitHash = await gitOutput(['rev-parse', 'HEAD'], repoPath);
+  }
+  console.log(`Task ${taskId} commit hash:`, commitHash);
+  await runGit(['checkout', '-B', 'main'], repoPath);
+  const updatedSnapshot = await createSnapshotBlob(repoPath, 'snapshot-updated');
+  await pool.query('update projects set snapshot_blob = $1 where id = $2', [updatedSnapshot, task.project_id]);
+
+  await pool.query(
+    `update tasks set status = $1, codex_output = $2, commit_hash = $3, completed_at = now()
+     where id = $4`,
+    ['completed', codexOutput, commitHash, taskId]
+  );
+  console.log(`Task ${taskId} completed with commit ${commitHash}`);
+  emitProjectEvent(task.project_id, 'taskUpdated', {
+    id: taskId,
+    status: 'completed',
+    commit_hash: commitHash,
+    codex_output: codexOutput
+  });
+  
+
+  try {
+    const buildId = await createBuild(task.project_id, task.environment, 'building', null);
+    await updateBuildStatus(task.project_id, task.environment, 'building', null);
+    const log = await deployEnvironment(task.project_id, task.environment, commitHash);
+    await finalizeBuild(buildId, 'live', log, commitHash);
+    await updateBuildStatus(task.project_id, task.environment, 'live', commitHash);
+  } catch (err) {
+    await finalizeBuild(buildId, 'failed', err.message, commitHash);
+    await updateBuildStatus(task.project_id, task.environment, 'failed', commitHash);
+    throw err;
+  }
+}
+
+async function processSaveSession(sessionId) {
+  const sessionRes = await pool.query('select * from sessions where id = $1', [sessionId]);
+  if (sessionRes.rowCount === 0) return;
+  const session = sessionRes.rows[0];
+
+  const { repoPath, tempDir } = await loadRepoFromSnapshot(session.project_id);
+  await runGit(['checkout', 'main'], repoPath);
+  await runGit(['merge', '--no-ff', 'ai-task', '-m', session.message], repoPath);
+  const mergeHash = await gitOutput(['rev-parse', 'HEAD'], repoPath);
+  await runGit(['checkout', 'ai-task'], repoPath);
+  await runGit(['reset', '--hard', 'main'], repoPath);
+
+  const updatedSnapshot = await createSnapshotBlob(repoPath, 'snapshot-updated');
+  await pool.query('update projects set snapshot_blob = $1 where id = $2', [updatedSnapshot, session.project_id]);
+  await pool.query('update sessions set merge_commit = $1 where id = $2', [mergeHash, sessionId]);
+  await pool.query(
+    `update tasks
+     set session_id = $1
+     where project_id = $2 and session_id is null and status = 'completed' and created_at <= $3`,
+    [sessionId, session.project_id, session.created_at]
+  );
+}
+
+async function processDeleteLatestTask(projectId) {
+  const taskRes = await pool.query(
+    `select * from tasks
+     where project_id = $1
+     order by created_at desc
+     limit 1`,
+    [projectId]
+  );
+  if (taskRes.rowCount === 0) throw new Error('No task to delete');
+  const task = taskRes.rows[0];
+
+  if (task.status !== 'completed' || !task.commit_hash) {
+    await pool.query('delete from tasks where id = $1', [task.id]);
+    emitProjectEvent(projectId, 'taskDeleted', { id: task.id });
+    return;
+  }
+  const { repoPath, tempDir } = await loadRepoFromSnapshot(projectId);
+
+  if (!task.session_id) {
+    if (task.commit_hash) {
+      await runGit(['checkout', 'ai-task'], repoPath);
+      await runGit(['reset', '--hard', `${task.commit_hash}^`], repoPath);
+      await runGit(['checkout', 'main'], repoPath);
+    }
+  } else {
+    if (task.commit_hash) {
+      await runGit(['checkout', 'main'], repoPath);
+      await runGit(['revert', '--no-edit', task.commit_hash], repoPath);
+      await runGit(['checkout', '-B', 'ai-task'], repoPath);
+      await runGit(['reset', '--hard', 'main'], repoPath);
+    }
+  }
+
+  const updatedSnapshot = await createSnapshotBlob(repoPath, 'snapshot-updated');
+  await pool.query('update projects set snapshot_blob = $1 where id = $2', [updatedSnapshot, projectId]);
+  await pool.query('delete from tasks where id = $1', [task.id]);
+  emitProjectEvent(projectId, 'taskDeleted', { id: task.id });
+
+  // Redeploy dev only if the deleted task was currently deployed
+  const envRes = await pool.query(
+    `select deployed_commit from environments
+     where project_id = $1 and name = 'development'`,
+    [projectId]
+  );
+  const deployed = envRes.rows[0]?.deployed_commit || null;
+  if (deployed && task.commit_hash && deployed === task.commit_hash) {
+    console.log(`Deleted deployed commit ${task.commit_hash}, redeploying previous for project ${projectId}`);
+    const remainingRes = await pool.query(
+      `select commit_hash from tasks
+       where project_id = $1 and environment = 'development' and status = 'completed'
+       order by created_at desc
+       limit 1`,
+      [projectId]
+    );
+    let targetCommit = remainingRes.rows[0]?.commit_hash || null;
+    if (!targetCommit) {
+      try {
+        targetCommit = await gitOutput(['rev-parse', 'main'], repoPath);
+      } catch { }
+    }
+    if (targetCommit) {
+      await processDeployCommit(projectId, 'development', targetCommit);
+    }
+  } else {
+    console.log(`Deleted commit ${task.commit_hash} not deployed; skipping redeploy for project ${projectId}`);
+  }
+}
+
+async function processEmptyDb(projectId, environment) {
+  const buildId = await createBuild(projectId, environment, 'building', null);
+  await updateBuildStatus(projectId, environment, 'building', null);
+  const envRes = await pool.query(
+    'select db_name from environments where project_id = $1 and name = $2',
+    [projectId, environment]
+  );
+  const projectRes = await pool.query('select short_id from projects where id = $1', [projectId]);
+  const shortId = projectRes.rows[0]?.short_id;
+  if (!shortId) {
+    await updateBuildStatus(projectId, environment, 'failed', null);
+    throw new Error('Project not found');
+  }
+  const dbName = envRes.rows[0]?.db_name || dbNameFor(shortId, environment);
+  try {
+    await resetDatabase(dbName);
+    await finalizeBuild(buildId, 'live', `Database reset for ${dbName}`, null);
+    await updateBuildStatus(projectId, environment, 'live', null);
+  } catch (err) {
+    await finalizeBuild(buildId, 'failed', err.message, null);
+    await updateBuildStatus(projectId, environment, 'failed', null);
+    throw err;
+  }
+}
+
+async function processDeployCommit(projectId, environment, commitHash) {
+  await enforcePlanUsageLimits(projectId, environment);
+  const buildId = await createBuild(projectId, environment, 'building', commitHash || null);
+  await updateBuildStatus(projectId, environment, 'building', commitHash || null);
+  try {
+    let log = null;
+    if (await shouldFastResume(projectId, environment, commitHash || null)) {
+      log = await fastResumeEnvironment(projectId, environment, commitHash || null);
+    }
+    if (!log) {
+      log = await deployEnvironment(projectId, environment, commitHash || null);
+    }
+    await finalizeBuild(buildId, 'live', log, commitHash || null);
+    await updateBuildStatus(projectId, environment, 'live', commitHash || null);
+    await sendDeployWebhook(projectId, environment, 'live', commitHash || null, buildId, '');
+  } catch (err) {
+    if (err?.code === 'healthcheck_failed') {
+      const summary = truncateText(err.detail || err.message || '');
+      await sendAlert(
+        'healthcheck_failed',
+        `Health check failed`,
+        {
+          project_id: projectId,
+          environment,
+          host: err.host,
+          commit: commitHash || '',
+          summary
+        },
+        `${projectId}:${environment}`
+      );
+      await scaleDeploymentToZero(projectId, environment);
+    }
+    const buildLog =
+      err?.code === 'healthcheck_failed'
+        ? `${err.message}\n\n${err.detail || ''}`.trim()
+        : (err?.message || 'Deploy failed');
+    await sendDeployWebhook(projectId, environment, 'failed', commitHash || null, buildId, buildLog);
+    await finalizeBuild(buildId, 'failed', buildLog, commitHash || null);
+    await updateBuildStatus(projectId, environment, 'failed', commitHash || null);
+    throw err;
+  }
+}
+
+const worker = new Worker(
+  'tasks',
+  async (job) => {
+    try {
+      if (job.name === 'init-project') {
+        const { projectId } = job.data;
+        const projectRes = await pool.query('select short_id from projects where id = $1', [projectId]);
+        const shortId = projectRes.rows[0]?.short_id;
+        if (!shortId) throw new Error('Project not found');
+        await pool.query('update projects set snapshot_status = $1 where id = $2', ['building', projectId]);
+        emitProjectEvent(projectId, 'projectUpdated', { snapshotStatus: 'building' });
+        const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'vibes-'));
+        const repoDir = path.join(tempDir, 'repo');
+        await cloneStarterRepo(repoDir);
+        await runGit(['checkout', '-B', 'main'], repoDir);
+        const updatedSnapshot = await createSnapshotBlob(repoDir, 'snapshot');
+        await pool.query(
+          `update projects set snapshot_blob = $1, snapshot_status = $2 where id = $3`,
+          [updatedSnapshot, 'ready', projectId]
+        );
+        emitProjectEvent(projectId, 'projectUpdated', { snapshotStatus: 'ready' });
+        const envs = ['development', 'testing', 'production'];
+        for (const env of envs) {
+          const dbName = dbNameFor(shortId, env);
+          await ensureDatabase(dbName);
+          const dbUrl = dbUrlFor(dbName);
+          await pool.query(
+            `insert into environments (project_id, name, build_status, db_name, db_url)
+             values ($1, $2, 'offline', $3, $4)
+             on conflict (project_id, name)
+             do update set db_name = excluded.db_name, db_url = excluded.db_url`,
+            [projectId, env, dbName, dbUrl]
+          );
+        }
+        // Default app port for starter templates (can be overridden by user env vars).
+        await pool.query(
+          `update environments
+           set env_vars = env_vars || jsonb_build_object('PORT', '3000')
+           where project_id = $1
+             and (env_vars ? 'PORT') is false`,
+          [projectId]
+        );
+        await processDeployCommit(projectId, 'development', null);
+        return;
+      }
+      if (job.name === 'empty-db') {
+        await processEmptyDb(job.data.projectId, job.data.environment);
+        return;
+      }
+      if (job.name === 'save-session') {
+        await processSaveSession(job.data.sessionId);
+        return;
+      }
+      if (job.name === 'delete-latest-task') {
+        await processDeleteLatestTask(job.data.projectId);
+        return;
+      }
+      if (job.name === 'delete-project') {
+        await processDeleteProject(job.data.projectId);
+        return;
+      }
+      if (job.name === 'stop-environment') {
+        await stopEnvironment(job.data.projectId, job.data.environment);
+        return;
+      }
+      if (job.name === 'deploy-commit') {
+        await processDeployCommit(job.data.projectId, job.data.environment, job.data.commitHash);
+        return;
+      }
+      await processTask(job.data.taskId);
+    } catch (err) {
+      if (job.name === 'init-project') {
+        await pool.query('update projects set snapshot_status = $1 where id = $2', ['failed', job.data.projectId]);
+        emitProjectEvent(job.data.projectId, 'projectUpdated', { snapshotStatus: 'failed' });
+      } else {
+        // Codex do this: Do not set task to failed if task status is completed, as the error may have occurred during deploy after successful codex changes; instead just log the error in codex_output
+        const taskRes = await pool.query('select project_id, status, codex_output from tasks where id = $1', [job.data.taskId]);
+        const taskRow = taskRes.rows[0];
+        if (taskRow?.status === 'completed') {
+          const nextOutput = taskRow.codex_output
+            ? `${taskRow.codex_output}\n\nDeploy error: ${err.message}`
+            : `Deploy error: ${err.message}`;
+          await pool.query('update tasks set codex_output = $1 where id = $2', [nextOutput, job.data.taskId]);
+          emitProjectEvent(taskRow.project_id, 'taskUpdated', {
+            id: job.data.taskId,
+            codex_output: nextOutput,
+            error: err.message
+          });
+        } else {
+          await pool.query(
+            'update tasks set status = $1, codex_output = $2, completed_at = now() where id = $3',
+            ['failed', err.message, job.data.taskId]
+          );
+          emitProjectEvent(taskRow?.project_id, 'taskUpdated', {
+            id: job.data.taskId,
+            status: 'failed',
+            error: err.message
+          });
+        }
+      }
+      throw err;
+    }
+  },
+  { connection }
+);
+
+worker.on('failed', (job, err) => {
+  console.error('Job failed', job?.id, err);
+});
+
+// setInterval(() => {
+//   reconcileStuckBuilds();
+// }, BUILD_RECONCILE_INTERVAL_MS);
+
+if (SCALE_TO_ZERO_INTERVAL_MS > 0) {
+  setInterval(() => {
+    reconcileScaleToZero();
+  }, SCALE_TO_ZERO_INTERVAL_MS);
+}
+
+if (RUNTIME_QUOTA_INTERVAL_MS > 0) {
+  setInterval(() => {
+    reconcileRuntimeQuotas();
+  }, RUNTIME_QUOTA_INTERVAL_MS);
+}
+
+if (BANDWIDTH_RECONCILE_INTERVAL_MS > 0) {
+  setInterval(() => {
+    reconcileBandwidthLimits();
+  }, BANDWIDTH_RECONCILE_INTERVAL_MS);
+}
+
+async function monitorQueueBacklog() {
+  try {
+    const [waiting, delayed, active] = await Promise.all([
+      taskQueue.getWaitingCount(),
+      taskQueue.getDelayedCount(),
+      taskQueue.getActiveCount()
+    ]);
+    const backlog = waiting + delayed;
+    if (backlog >= QUEUE_BACKLOG_THRESHOLD) {
+      await sendAlert(
+        'queue_backlog',
+        `Task queue backlog: ${backlog}`,
+        { waiting, delayed, active, threshold: QUEUE_BACKLOG_THRESHOLD },
+        'queue'
+      );
+    }
+  } catch (err) {
+    console.warn('Queue backlog monitor failed', err?.message || err);
+  }
+}
+
+if (QUEUE_MONITOR_INTERVAL_MS > 0) {
+  setInterval(() => {
+    monitorQueueBacklog();
+  }, QUEUE_MONITOR_INTERVAL_MS);
+}
+
+async function purgeOldAlerts() {
+  if (!ALERT_RETENTION_DAYS || ALERT_RETENTION_DAYS <= 0) return;
+  try {
+    await pool.query(
+      `delete from admin_alerts
+       where created_at < now() - $1::interval`,
+      [`${Math.floor(ALERT_RETENTION_DAYS)} days`]
+    );
+  } catch (err) {
+    const msg = String(err?.message || '');
+    if (!msg.includes('admin_alerts')) {
+      console.warn('Alert retention cleanup failed', err?.message || err);
+    }
+  }
+}
+
+if (ALERT_RETENTION_INTERVAL_MS > 0) {
+  setInterval(() => {
+    purgeOldAlerts();
+  }, ALERT_RETENTION_INTERVAL_MS);
+}

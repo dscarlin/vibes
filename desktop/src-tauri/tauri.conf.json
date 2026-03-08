@@ -1,0 +1,43 @@
+{
+  "productName": "Vibes Desktop",
+  "version": "0.1.0",
+  "identifier": "ai.vibes.desktop",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:8082"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "Vibes Desktop",
+        "width": 1280,
+        "height": 800,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ]
+  },
+  "plugins": {},
+  "bundle": {
+    "active": true,
+    "targets": [
+      "app",
+      "dmg",
+      "msi"
+    ],
+    "icon": [
+      "icons/icon.png"
+    ],
+    "macOS": {
+      "entitlements": "entitlements.plist",
+      "signingIdentity": null,
+      "providerShortName": null
+    },
+    "windows": {
+      "certificateThumbprint": null,
+      "digestAlgorithm": "sha256",
+      "timestampUrl": "http://timestamp.digicert.com"
+    }
+  }
+}

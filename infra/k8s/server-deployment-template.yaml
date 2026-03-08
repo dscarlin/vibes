@@ -1,0 +1,33 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vibes-server
+  namespace: vibes-platform
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vibes-server
+  template:
+    metadata:
+      labels:
+        app: vibes-server
+    spec:
+      serviceAccountName: vibes-server-sa
+      containers:
+        - name: server
+          image: ${SERVER_IMAGE}
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - secretRef:
+                name: vibes-server-env
+          volumeMounts:
+            - name: rds-ca
+              mountPath: /etc/ssl/certs/rds-ca.pem
+              subPath: rds-ca.pem
+              readOnly: true
+      volumes:
+        - name: rds-ca
+          secret:
+            secretName: rds-ca-bundle
