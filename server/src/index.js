@@ -308,6 +308,17 @@ function rateLimit({ keyPrefix, windowMs, max }) {
   };
 }
 
+const authRateLimit = rateLimit({
+  keyPrefix: 'auth',
+  windowMs: RATE_LIMIT_AUTH_WINDOW_MS,
+  max: RATE_LIMIT_AUTH_MAX
+});
+const publicRateLimit = rateLimit({
+  keyPrefix: 'public',
+  windowMs: RATE_LIMIT_PUBLIC_WINDOW_MS,
+  max: RATE_LIMIT_PUBLIC_MAX
+});
+
 async function getRuntimeUsageMs(userId, environment) {
   try {
     const month = currentMonthKey();
@@ -646,11 +657,11 @@ function nodeGroupLabel(node) {
   );
 }
 
-app.get('/health', (req, res) => {
+app.get('/health', publicRateLimit, (req, res) => {
   res.json({ ok: true });
 });
 
-app.get('/downloads/desktop', async (req, res) => {
+app.get('/downloads/desktop', publicRateLimit, async (req, res) => {
   try {
     const platform = String(req.query.platform || 'mac');
     const filePath = await resolveDesktopDownload(platform);
@@ -667,8 +678,8 @@ app.get('/downloads/desktop', async (req, res) => {
   }
 });
 
-app.use('/admin/static', express.static(ADMIN_UI_DIR));
-app.get(['/admin', '/admin/'], (req, res) => {
+app.use('/admin/static', publicRateLimit, express.static(ADMIN_UI_DIR));
+app.get(['/admin', '/admin/'], publicRateLimit, (req, res) => {
   res.sendFile(path.join(ADMIN_UI_DIR, 'index.html'));
 });
 
@@ -747,12 +758,6 @@ app.put('/settings/demo-openai-key', requireAuth, async (req, res) => {
   const nextKey = String(req.body?.openaiApiKey || '').trim();
   await query('update users set openai_api_key = $1 where id = $2', [nextKey || null, req.user.id]);
   res.json({ ok: true });
-});
-
-const authRateLimit = rateLimit({
-  keyPrefix: 'auth',
-  windowMs: RATE_LIMIT_AUTH_WINDOW_MS,
-  max: RATE_LIMIT_AUTH_MAX
 });
 
 app.post('/auth/register', authRateLimit, async (req, res) => {
@@ -1816,6 +1821,55 @@ app.post('/projects/:projectId/deploy', requireAuth, async (req, res) => {
   res.json({ ok: true });
 });
 
+app.post('/projects/:projectId/builds/cancel', requireAuth, async (req, res) => {
+  const env = normalizeEnv(req.body?.environment || req.query.environment);
+  if (!env) return res.status(400).json({ error: 'invalid environment' });
+  const ok = await ensureProjectOwner(req.params.projectId, req.user.userId);
+  if (!ok) return res.status(404).json({ error: 'project not found' });
+  if (!(await ensurePlanEnvAllowed(req, res, env))) return;
+  const buildRes = await query(
+    `select id
+     from builds
+     where project_id = $1
+       and environment = $2
+       and status = 'building'
+     order by created_at desc
+     limit 1`,
+    [req.params.projectId, env]
+  );
+  let buildId = null;
+  if (buildRes.rowCount > 0) {
+    buildId = buildRes.rows[0].id;
+    await query(
+      `update builds
+       set cancel_requested = true,
+           build_log = coalesce(build_log, '') || $1,
+           updated_at = now()
+       where id = $2`,
+      ['\n\n[system] Cancel requested by user.\n', buildId]
+    );
+  }
+  try {
+    const jobs = await taskQueue.getJobs(['waiting', 'delayed']);
+    const removed = await Promise.all(
+      jobs
+        .filter(
+          (job) =>
+            job.name === 'deploy-commit' &&
+            job.data?.projectId === req.params.projectId &&
+            job.data?.environment === env
+        )
+        .map((job) => job.remove())
+    );
+    if (!buildId && removed.length === 0) {
+      return res.json({ ok: true, status: 'noop' });
+    }
+  } catch (err) {
+    console.warn('Failed to remove queued deploy jobs', err?.message || err);
+  }
+  res.json({ ok: true, buildId });
+});
+
 app.post('/projects/:projectId/stop', requireAuth, async (req, res) => {
   const env = normalizeEnv(req.body?.environment || req.query.environment);
   if (!env) return res.status(400).json({ error: 'invalid environment' });
@@ -1917,6 +1971,55 @@ function logCommandForEnv() {
   return process.env.PROD_LOG_COMMAND;
 }
 
+function summarizePodStatus(pod) {
+  const lines = [];
+  const name = pod?.metadata?.name || 'unknown';
+  const phase = pod?.status?.phase || 'unknown';
+  const reason = pod?.status?.reason;
+  const message = pod?.status?.message;
+  lines.push(`Pod ${name}: ${phase}${reason ? ` (${reason})` : ''}`);
+  if (message) lines.push(message);
+  const statuses = [
+    ...(pod?.status?.initContainerStatuses || []),
+    ...(pod?.status?.containerStatuses || [])
+  ];
+  for (const status of statuses) {
+    const cname = status?.name || 'container';
+    const restartCount = Number(status?.restartCount || 0);
+    if (status?.state?.waiting) {
+      const waitReason = status.state.waiting.reason || 'waiting';
+      const waitMsg = status.state.waiting.message || '';
+      lines.push(`- ${cname}: waiting (${waitReason})${restartCount ? `, restarts ${restartCount}` : ''}`);
+      if (waitMsg) lines.push(`  ${waitMsg}`);
+      continue;
+    }
+    if (status?.state?.terminated) {
+      const termReason = status.state.terminated.reason || 'terminated';
+      const exitCode = status.state.terminated.exitCode;
+      lines.push(`- ${cname}: terminated (${termReason}) exit ${exitCode}`);
+      continue;
+    }
+    if (status?.state?.running) {
+      const ready = status?.ready ? 'ready' : 'not ready';
+      lines.push(`- ${cname}: running (${ready})${restartCount ? `, restarts ${restartCount}` : ''}`);
+      continue;
+    }
+  }
+  return lines.join('\n');
+}
+
+async function getPodStatusSummary(namespace, appName) {
+  try {
+    const { stdout } = await exec('sh', ['-lc', `kubectl -n ${namespace} get pods -l app=${appName} -o json`]);
+    const data = JSON.parse(stdout || '{}');
+    const pods = Array.isArray(data.items) ? data.items : [];
+    if (!pods.length) return 'No pods found for this app yet.';
+    return pods.map((pod) => summarizePodStatus(pod)).join('\n\n');
+  } catch (err) {
+    return `Unable to load pod status: ${err?.message || 'unknown error'}`;
+  }
+}
+
 app.get('/projects/:projectId/runtime-logs', requireAuth, async (req, res) => {
   const env = normalizeEnv(req.query.environment);
   if (!env) return res.status(400).json({ error: 'invalid environment' });
@@ -1943,7 +2046,15 @@ app.get('/projects/:projectId/runtime-logs', requireAuth, async (req, res) => {
     const { stdout, stderr } = await exec('sh', ['-lc', cmd], { env: envVars });
     res.json({ logs: `${stdout || ''}${stderr || ''}` });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    const errOutput = `${err?.stdout || ''}${err?.stderr || ''}`.trim();
+    const statusSummary = await getPodStatusSummary(envVars.NAMESPACE, envVars.APP_NAME);
+    const details = [
+      errOutput ? errOutput : `Log command failed: ${err?.message || 'unknown error'}`,
+      statusSummary ? `Pod status:\n${statusSummary}` : ''
+    ]
+      .filter(Boolean)
+      .join('\n\n');
+    res.json({ logs: details, error: err?.message || 'log_failed' });
   }
 });
 

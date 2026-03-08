@@ -16,11 +16,34 @@ const SNAPSHOT_ARTIFACTS = new Set([
   'snapshot-updated.tar.gz',
   'deploy-snapshot.tar.gz'
 ]);
+const SNAPSHOT_EXCLUDE_DIRS = new Set([
+  'node_modules',
+  'dist',
+  'build',
+  '.next',
+  '.nuxt',
+  '.output',
+  'out',
+  '.svelte-kit',
+  '.astro',
+  '.cache',
+  '.turbo',
+  '.parcel-cache',
+  'coverage'
+]);
 
 function isSnapshotArtifact(entryPath) {
   if (!entryPath) return false;
   const normalized = entryPath.replace(/^\.\//, '');
   return SNAPSHOT_ARTIFACTS.has(normalized);
+}
+
+function isExcludedPath(entryPath) {
+  if (!entryPath) return false;
+  const normalized = entryPath.replace(/^\.\//, '');
+  if (isSnapshotArtifact(normalized)) return true;
+  const parts = normalized.split('/');
+  return parts.some((part) => SNAPSHOT_EXCLUDE_DIRS.has(part));
 }
 
 async function runGit(args, cwd) {
@@ -113,7 +136,7 @@ export async function archiveRepo(repoPath) {
       gzip: true,
       file: outPath,
       cwd: repoPath,
-      filter: (entryPath) => !isSnapshotArtifact(entryPath)
+      filter: (entryPath) => !isExcludedPath(entryPath)
     },
     ['.']
   );

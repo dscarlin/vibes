@@ -398,6 +398,32 @@ function exportAuditCsv(rows) {
   URL.revokeObjectURL(url);
 }
 
+function formatLocalTimestamp(value) {
+  if (!value) return '—';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  return date.toLocaleString(undefined, { timeZoneName: 'short' });
+}
+
+function formatAuditMeta(value) {
+  if (!value) return value;
+  if (Array.isArray(value)) return value.map(formatAuditMeta);
+  if (typeof value === 'object') {
+    const next = {};
+    for (const [key, val] of Object.entries(value)) {
+      next[key] = formatAuditMeta(val);
+    }
+    return next;
+  }
+  if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(value)) {
+    const date = new Date(value);
+    if (!Number.isNaN(date.getTime())) {
+      return date.toLocaleString(undefined, { timeZoneName: 'short' });
+    }
+  }
+  return value;
+}
+
 function renderAuditLog(rows) {
   auditLog.innerHTML = '';
   const logContainer = document.createElement('div');
@@ -412,8 +438,9 @@ function renderAuditLog(rows) {
     filtered.forEach((row) => {
       const item = document.createElement('div');
       item.className = 'log-item';
-      const meta = row.meta ? JSON.stringify(row.meta) : '';
-      item.textContent = `[${row.created_at}] ${row.action} ${meta}`;
+      const meta = row.meta ? JSON.stringify(formatAuditMeta(row.meta)) : '';
+      const createdAt = formatLocalTimestamp(row.created_at);
+      item.textContent = `[${createdAt}] ${row.action} ${meta}`;
       logContainer.appendChild(item);
     });
   }
@@ -433,8 +460,8 @@ function renderAlerts(rows) {
   rows.forEach((alert) => {
     const item = document.createElement('div');
     item.className = 'alert-item';
-    const createdAt = alert.created_at ? new Date(alert.created_at).toLocaleString() : '—';
-    const ackText = alert.acknowledged_at ? `Acked ${new Date(alert.acknowledged_at).toLocaleString()}` : 'Unacknowledged';
+    const createdAt = formatLocalTimestamp(alert.created_at);
+    const ackText = alert.acknowledged_at ? `Acked ${formatLocalTimestamp(alert.acknowledged_at)}` : 'Unacknowledged';
     const data = alert.data || {};
     const meta = [
       data.environment ? `Env: ${data.environment}` : '',

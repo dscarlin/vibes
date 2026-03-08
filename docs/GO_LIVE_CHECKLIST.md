@@ -20,9 +20,9 @@ Notes (2026-03-07): All `vibes-development` deployments were scaled to 0. Custom
 8. Observability: **Verified access to worker/server logs; worker logs show RBAC issue on scale-to-zero**
 9. Billing enforcement: **Reviewed: plan gates enforced; manual plan changes only; no auto-stop on plan downgrade**
 10. Desktop signing: **Deferred**
-11. Data integrity checks: **Not done**
-12. Security essentials: **Partially done (needs IAM review)**
-13. Support workflows: **Not done**
+11. Data integrity checks: **Checked; found 2 envs where `deployed_commit` != latest live build commit (Blabber, Recipe_Website_Simple_Elegance‑V1.0). Also found legacy live builds with null `ref_commit` (11 rows). Needs reconciliation/backfill.**
+12. Security essentials: **In progress (worker IRSA tightened: removed ECR PowerUser, scoped Route53 changes to hosted zone, ECR token limited; public rate limits added to /health, /downloads/desktop, /admin; still need credential rotation)**
+13. Support workflows: **Done (docs/SUPPORT_WORKFLOWS.md)**
 
 ### Post-Launch
 11. Autoscaling policies: **Not done**

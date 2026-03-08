@@ -183,8 +183,18 @@ fi
 AWS_BIN="$(command -v aws 2>/dev/null || true)"
 if [ -n "$AWS_BIN" ]; then
   # Ensure repo exists
-  "$AWS_BIN" ecr describe-repositories --repository-names "$ECR_REPO" --region "$AWS_REGION" >/dev/null 2>&1 || \
-    "$AWS_BIN" ecr create-repository --repository-name "$ECR_REPO" --region "$AWS_REGION" >/dev/null
+  if ! "$AWS_BIN" ecr describe-repositories --repository-names "$ECR_REPO" --region "$AWS_REGION" >/dev/null 2>&1; then
+    set +e
+    CREATE_ERR="$("$AWS_BIN" ecr create-repository --repository-name "$ECR_REPO" --region "$AWS_REGION" 2>&1)"
+    CREATE_STATUS=$?
+    set -e
+    if [ $CREATE_STATUS -ne 0 ]; then
+      echo "$CREATE_ERR" | grep -q 'RepositoryAlreadyExistsException' && true || {
+        echo "$CREATE_ERR" >&2
+        exit $CREATE_STATUS
+      }
+    fi
+  fi
 fi
 
 if [ ! -f "$WORKDIR/Dockerfile" ]; then

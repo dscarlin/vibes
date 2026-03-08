@@ -28,11 +28,34 @@ const SNAPSHOT_ARTIFACTS = new Set([
   'snapshot-updated.tar.gz',
   'deploy-snapshot.tar.gz'
 ]);
+const SNAPSHOT_EXCLUDE_DIRS = new Set([
+  'node_modules',
+  'dist',
+  'build',
+  '.next',
+  '.nuxt',
+  '.output',
+  'out',
+  '.svelte-kit',
+  '.astro',
+  '.cache',
+  '.turbo',
+  '.parcel-cache',
+  'coverage'
+]);
 
 function isSnapshotArtifact(entryPath) {
   if (!entryPath) return false;
   const normalized = entryPath.replace(/^\.\//, '');
   return SNAPSHOT_ARTIFACTS.has(normalized);
+}
+
+function isExcludedSnapshotPath(entryPath) {
+  if (!entryPath) return false;
+  const normalized = entryPath.replace(/^\.\//, '');
+  if (isSnapshotArtifact(normalized)) return true;
+  const parts = normalized.split('/');
+  return parts.some((part) => SNAPSHOT_EXCLUDE_DIRS.has(part));
 }
 
 async function stripSnapshotArtifacts(repoPath) {
@@ -52,7 +75,7 @@ async function createSnapshotArchive(repoPath, namePrefix) {
       gzip: true,
       file: archivePath,
       cwd: repoPath,
-      filter: (entryPath) => !isSnapshotArtifact(entryPath)
+      filter: (entryPath) => !isExcludedSnapshotPath(entryPath)
     },
     ['.']
   );
@@ -223,35 +246,109 @@ async function resolveShell() {
   return { shell: 'sh', args: ['-lc'] };
 }
 
-async function runCommandStreaming(command, env) {
+async function runCommandStreaming(command, env, options = {}) {
   const { shell, args } = await resolveShell();
+  const buildId = options.buildId || null;
   return new Promise((resolve, reject) => {
     const child = spawn(shell, [...args, command], { env });
     let stdout = '';
     let stderr = '';
+    let buffer = '';
+    let flushTimer = null;
+    let cancelTimer = null;
+    let cancelRequested = false;
+
+    const flush = async (force = false) => {
+      if (!buildId) return;
+      if (!force && !buffer) return;
+      const chunk = buffer;
+      buffer = '';
+      if (chunk) {
+        await appendBuildLog(buildId, chunk);
+      }
+    };
+
+    const scheduleFlush = () => {
+      if (!buildId || flushTimer) return;
+      flushTimer = setTimeout(() => {
+        flushTimer = null;
+        flush().catch((err) => {
+          console.warn('Failed to flush build log', err?.message || err);
+        });
+      }, BUILD_LOG_FLUSH_INTERVAL_MS);
+    };
+
+    const requestCancel = async () => {
+      if (cancelRequested) return;
+      cancelRequested = true;
+      buffer += '\n\n[system] Build cancelled by user.\n';
+      await flush(true);
+      try {
+        child.kill('SIGTERM');
+      } catch { }
+      setTimeout(() => {
+        try {
+          child.kill('SIGKILL');
+        } catch { }
+      }, 5000);
+    };
+
+    if (buildId) {
+      activeBuilds.set(buildId, { child, cancel: requestCancel });
+      cancelTimer = setInterval(async () => {
+        if (cancelRequested) return;
+        if (await isCancelRequested(buildId)) {
+          await requestCancel();
+        }
+      }, BUILD_CANCEL_POLL_INTERVAL_MS);
+    }
 
     child.stdout.on('data', (data) => {
       const text = data.toString();
       stdout += text;
+      if (buildId) {
+        buffer += text;
+        scheduleFlush();
+      }
       process.stdout.write(text);
     });
     child.stderr.on('data', (data) => {
       const text = data.toString();
       stderr += text;
+      if (buildId) {
+        buffer += text;
+        scheduleFlush();
+      }
       process.stderr.write(text);
     });
     child.on('error', (err) => {
+      if (flushTimer) clearTimeout(flushTimer);
+      if (cancelTimer) clearInterval(cancelTimer);
+      if (buildId) activeBuilds.delete(buildId);
       reject(err);
     });
     child.on('close', (code) => {
-      if (code && code !== 0) {
-        const err = new Error(`Command exited with code ${code}`);
-        err.stdout = stdout;
-        err.stderr = stderr;
-        reject(err);
-        return;
-      }
-      resolve({ stdout, stderr });
+      (async () => {
+        if (flushTimer) clearTimeout(flushTimer);
+        if (cancelTimer) clearInterval(cancelTimer);
+        if (buildId) activeBuilds.delete(buildId);
+        await flush(true);
+        if (cancelRequested) {
+          const err = buildCancelError();
+          err.stdout = stdout;
+          err.stderr = stderr;
+          throw err;
+        }
+        if (code && code !== 0) {
+          const err = new Error(`Command exited with code ${code}`);
+          err.stdout = stdout;
+          err.stderr = stderr;
+          throw err;
+        }
+        return { stdout, stderr };
+      })()
+        .then(resolve)
+        .catch(reject);
     });
   });
 }
@@ -295,6 +392,7 @@ const HEALTHCHECK_DEFAULTS = {
   timeoutMs: Number(process.env.HEALTHCHECK_TIMEOUT_MS || 60000),
   intervalMs: Number(process.env.HEALTHCHECK_INTERVAL_MS || 3000)
 };
+const HEALTHCHECK_LOG_LINES = Math.max(50, Math.min(Number(process.env.HEALTHCHECK_LOG_LINES || 1200), 2000));
 const CRASHLOOP_RESTART_THRESHOLD = Number(process.env.CRASHLOOP_RESTART_THRESHOLD || 5);
 const DEV_SCALE_TO_ZERO_AFTER_MS = Number(process.env.DEV_SCALE_TO_ZERO_AFTER_MS || 15 * 60 * 1000);
 const TEST_SCALE_TO_ZERO_AFTER_MS = Number(process.env.TEST_SCALE_TO_ZERO_AFTER_MS || 3 * 60 * 60 * 1000);
@@ -321,6 +419,9 @@ const QUEUE_MONITOR_INTERVAL_MS = Number(process.env.QUEUE_MONITOR_INTERVAL_MS |
 const ALERT_RETENTION_DAYS = Number(process.env.ALERT_RETENTION_DAYS || 30);
 const ALERT_RETENTION_INTERVAL_MS = Number(process.env.ALERT_RETENTION_INTERVAL_MS || 24 * 60 * 60 * 1000);
 const DEPLOY_WEBHOOK_TIMEOUT_MS = Number(process.env.DEPLOY_WEBHOOK_TIMEOUT_MS || 8000);
+const HEALTHCHECK_FAST_FAIL_WINDOW_MS = Number(process.env.HEALTHCHECK_FAST_FAIL_WINDOW_MS || 60000);
+const HEALTHCHECK_FAST_FAIL_RESTARTS = Number(process.env.HEALTHCHECK_FAST_FAIL_RESTARTS || 1);
+const HEALTHCHECK_FAST_FAIL_POLL_MS = Number(process.env.HEALTHCHECK_FAST_FAIL_POLL_MS || 60000);
 const ALB_LOG_BUCKET = process.env.ALB_LOG_BUCKET || '';
 const ALB_LOG_PREFIX = process.env.ALB_LOG_PREFIX || '';
 const ALB_LOG_REGION = process.env.ALB_LOG_REGION || process.env.AWS_REGION || 'us-east-1';
@@ -330,9 +431,13 @@ const ALB_LOG_INGEST_INTERVAL_MS = Number(process.env.ALB_LOG_INGEST_INTERVAL_MS
 const BANDWIDTH_RECONCILE_INTERVAL_MS = Number(
   process.env.BANDWIDTH_RECONCILE_INTERVAL_MS || ALB_LOG_INGEST_INTERVAL_MS
 );
+const BUILD_LOG_FLUSH_INTERVAL_MS = Number(process.env.BUILD_LOG_FLUSH_INTERVAL_MS || 1500);
+const BUILD_LOG_MAX_BYTES = Number(process.env.BUILD_LOG_MAX_BYTES || 2_000_000);
+const BUILD_CANCEL_POLL_INTERVAL_MS = Number(process.env.BUILD_CANCEL_POLL_INTERVAL_MS || 2000);
 
 export const taskQueue = new Queue('tasks', { connection });
 const alertLastSentAt = new Map();
+const activeBuilds = new Map();
 
 function alertKey(type, scope) {
   return `${type}:${scope || 'global'}`;
@@ -351,6 +456,81 @@ function truncateText(text, limit = 3500) {
   const value = String(text);
   if (value.length <= limit) return value;
   return `${value.slice(0, limit)}…`;
+}
+
+function buildCancelError() {
+  const err = new Error('Build cancelled by user');
+  err.code = 'build_cancelled';
+  return err;
+}
+
+function buildLogFromError(err) {
+  const output = `${err?.stdout || ''}${err?.stderr || ''}`.trim();
+  return output || err?.message || 'Deploy failed';
+}
+
+async function isCancelRequested(buildId) {
+  if (!buildId) return false;
+  try {
+    const res = await pool.query('select cancel_requested from builds where id = $1', [buildId]);
+    return Boolean(res.rows[0]?.cancel_requested);
+  } catch (err) {
+    console.warn('Failed to check cancel status', err?.message || err);
+    return false;
+  }
+}
+
+async function appendBuildLog(buildId, chunk) {
+  if (!buildId || !chunk) return;
+  const payload = String(chunk);
+  if (!payload) return;
+  try {
+    await pool.query(
+      `update builds
+       set build_log = case
+         when build_log is null then $1
+         when length(build_log) + length($1) > $2 then right(build_log || $1, $2)
+         else build_log || $1
+       end,
+       updated_at = now()
+       where id = $3`,
+      [payload, BUILD_LOG_MAX_BYTES, buildId]
+    );
+  } catch (err) {
+    console.warn('Failed to append build log', err?.message || err);
+  }
+}
+
+async function requestBuildCancel(buildId) {
+  if (!buildId) return false;
+  try {
+    await pool.query(
+      `update builds
+       set cancel_requested = true,
+           build_log = coalesce(build_log, '') || $1,
+           updated_at = now()
+       where id = $2`,
+      ['\n\n[system] Cancel requested by user.\n', buildId]
+    );
+  } catch (err) {
+    console.warn('Failed to set cancel flag', err?.message || err);
+  }
+  const active = activeBuilds.get(buildId);
+  if (active?.cancel) {
+    try {
+      await active.cancel();
+    } catch (err) {
+      console.warn('Failed to cancel active build process', err?.message || err);
+    }
+  }
+  return true;
+}
+
+async function ensureBuildNotCancelled(buildId) {
+  if (!buildId) return;
+  if (await isCancelRequested(buildId)) {
+    throw buildCancelError();
+  }
 }
 
 async function postWebhook(url, payload) {
@@ -620,6 +800,116 @@ async function detectCrashLoop(projectId, environment) {
   return null;
 }
 
+function describeContainerState(status, podName) {
+  const name = status?.name || 'container';
+  const waiting = status?.state?.waiting;
+  const terminated = status?.state?.terminated;
+  const lastTerminated = status?.lastState?.terminated;
+  const restartCount = Number(status?.restartCount || 0);
+  if (waiting?.reason) {
+    const reason = waiting.reason;
+    const message = waiting.message || '';
+    return {
+      reason,
+      message: `Pod ${podName} ${name} is waiting (${reason}).`,
+      detail: message,
+      restartCount
+    };
+  }
+  if (terminated) {
+    const reason = terminated.reason || 'Terminated';
+    const exitCode = Number(terminated.exitCode ?? -1);
+    const message = terminated.message || '';
+    return {
+      reason,
+      message: `Pod ${podName} ${name} terminated (${reason}) with exit code ${exitCode}.`,
+      detail: message,
+      exitCode,
+      restartCount
+    };
+  }
+  if (lastTerminated) {
+    const reason = lastTerminated.reason || 'Terminated';
+    const exitCode = Number(lastTerminated.exitCode ?? -1);
+    const message = lastTerminated.message || '';
+    return {
+      reason,
+      message: `Pod ${podName} ${name} last terminated (${reason}) with exit code ${exitCode}.`,
+      detail: message,
+      exitCode,
+      restartCount
+    };
+  }
+  return null;
+}
+
+async function detectFastFail(projectId, environment) {
+  if (isLocalPlatform()) return null;
+  const namespace = `vibes-${environment}`;
+  const appName = `vibes-app-${projectId}`;
+  try {
+    const { stdout } = await exec('sh', ['-lc', `kubectl -n ${namespace} get pods -l app=${appName} -o json`]);
+    const data = JSON.parse(stdout || '{}');
+    const pods = Array.isArray(data.items) ? data.items : [];
+    for (const pod of pods) {
+      const podName = pod.metadata?.name || 'unknown';
+      const phase = pod.status?.phase || '';
+      const podReason = pod.status?.reason || '';
+      const podMessage = pod.status?.message || '';
+      if (phase === 'Failed') {
+        return {
+          reason: podReason || 'PodFailed',
+          message: `Pod ${podName} failed.`,
+          detail: podMessage
+        };
+      }
+      const statuses = [
+        ...(pod.status?.initContainerStatuses || []),
+        ...(pod.status?.containerStatuses || [])
+      ];
+      for (const status of statuses) {
+        const info = describeContainerState(status, podName);
+        if (!info) continue;
+        const reason = info.reason || '';
+        const restartCount = Number(info.restartCount || 0);
+        const fatalWaiting = new Set([
+          'ImagePullBackOff',
+          'ErrImagePull',
+          'CreateContainerConfigError',
+          'InvalidImageName',
+          'ErrImageNeverPull',
+          'RunContainerError'
+        ]);
+        const fatalTerminated = new Set(['Error', 'OOMKilled', 'ContainerCannotRun', 'StartError']);
+        if (reason === 'CrashLoopBackOff' && restartCount >= HEALTHCHECK_FAST_FAIL_RESTARTS) {
+          return {
+            reason,
+            message: info.message,
+            detail: info.detail
+          };
+        }
+        if (fatalWaiting.has(reason)) {
+          return {
+            reason,
+            message: info.message,
+            detail: info.detail
+          };
+        }
+        if (fatalTerminated.has(reason) || (info.exitCode != null && info.exitCode !== 0)) {
+          return {
+            reason,
+            message: info.message,
+            detail: info.detail
+          };
+        }
+      }
+    }
+  } catch (err) {
+    // Ignore fast-fail detection errors to avoid blocking deploys.
+  }
+  return null;
+}
+
 async function checkHealthOnce(projectId, environment, host, appPort) {
   const url = healthcheckUrl(environment, host);
   try {
@@ -641,12 +931,20 @@ async function checkHealthOnce(projectId, environment, host, appPort) {
   return false;
 }
 
-async function waitForHealth(projectId, environment, host, appPort) {
+async function waitForHealth(projectId, environment, host, appPort, buildId = null) {
   const timeoutMs = HEALTHCHECK_DEFAULTS.timeoutMs;
   const url = healthcheckUrl(environment, host);
   const start = Date.now();
   const deadline = start + timeoutMs;
+  let nextFastFailAt = start;
   while (Date.now() < deadline) {
+    await ensureBuildNotCancelled(buildId);
+    const elapsed = Date.now() - start;
+    if (elapsed <= HEALTHCHECK_FAST_FAIL_WINDOW_MS && Date.now() >= nextFastFailAt) {
+      nextFastFailAt = Date.now() + HEALTHCHECK_FAST_FAIL_POLL_MS;
+      const fastFail = await detectFastFail(projectId, environment);
+      if (fastFail) return { ok: false, fastFail };
+    }
     try {
       console.log(`Checking health for ${url}...`);
       const controller = new AbortController();
@@ -667,7 +965,6 @@ async function waitForHealth(projectId, environment, host, appPort) {
       const crashloop = await detectCrashLoop(projectId, environment);
       if (crashloop) return { ok: false, crashloop };
     }
-    const elapsed = Date.now() - start;
     const delay = Math.min(healthcheckDelayForElapsed(elapsed), Math.max(0, deadline - Date.now()));
     if (delay > 0) {
       await new Promise((r) => setTimeout(r, delay));
@@ -770,12 +1067,12 @@ async function stopEnvironment(projectId, environment) {
 }
 
 async function fetchPodLogs(projectId, environment, lines = 10) {
-  const tail = Math.max(1, Math.min(Number(lines) || 10, 200));
+  const tail = Math.max(1, Math.min(Number(lines) || 10, 2000));
   if (isLocalPlatform()) {
     if (environment !== 'development') return '';
     const container = `vibes-app-${projectId}-${environment}`;
     try {
-      const { stdout, stderr } = await exec('sh', ['-lc', `podman logs --tail=${tail} ${container}`]);
+      const { stdout, stderr } = await exec('sh', ['-lc', `podman logs --timestamps --tail=${tail} ${container}`]);
       return `${stdout || ''}${stderr || ''}`.trim();
     } catch (err) {
       console.warn(`Podman logs failed for ${container}`, err?.message || err);
@@ -801,9 +1098,20 @@ async function fetchPodLogs(projectId, environment, lines = 10) {
     if (!podName) return '';
     const { stdout: logOut, stderr: logErr } = await exec('sh', [
       '-lc',
-      `kubectl -n ${namespace} logs ${podName} --tail=${tail}`
+      `kubectl -n ${namespace} logs ${podName} --tail=${tail} --timestamps`
     ]);
-    return `${logOut || ''}${logErr || ''}`.trim();
+    let combined = `${logOut || ''}${logErr || ''}`.trim();
+    try {
+      const { stdout: prevOut, stderr: prevErr } = await exec('sh', [
+        '-lc',
+        `kubectl -n ${namespace} logs ${podName} --previous --tail=${tail} --timestamps`
+      ]);
+      const previous = `${prevOut || ''}${prevErr || ''}`.trim();
+      if (previous) {
+        combined = [combined, '--- previous ---', previous].filter(Boolean).join('\n');
+      }
+    } catch {}
+    return combined;
   } catch (err) {
     console.warn(`kubectl logs failed for ${appName}`, err?.message || err);
     return '';
@@ -811,9 +1119,9 @@ async function fetchPodLogs(projectId, environment, lines = 10) {
 }
 
 async function buildHealthcheckError(projectId, environment, host) {
-  const podLogs = await fetchPodLogs(projectId, environment, 200);
+  const podLogs = await fetchPodLogs(projectId, environment, HEALTHCHECK_LOG_LINES);
   const detail = podLogs
-    ? `Pod logs (last 200 lines):\n${podLogs}`
+    ? `Pod logs (last ${HEALTHCHECK_LOG_LINES} lines, latest + previous if available):\n${podLogs}`
     : 'Pod logs unavailable.';
   const err = new Error(`Health check failed for ${host}`);
   err.code = 'healthcheck_failed';
@@ -868,7 +1176,7 @@ async function shouldFastResume(projectId, environment, commitHash) {
   return true;
 }
 
-async function fastResumeEnvironment(projectId, environment, commitHash) {
+async function fastResumeEnvironment(projectId, environment, commitHash, buildId = null) {
   console.log(`Fast resume project ${projectId} environment ${environment}...`);
   const settingsRes = await pool.query(
     `select key, value from settings
@@ -938,8 +1246,17 @@ async function fastResumeEnvironment(projectId, environment, commitHash) {
   const healthHost =
     PLATFORM_ENV === 'local' || environment === 'production' ? host : internalHost;
   const appPort = Number(envVars.PORT || process.env.PORT || 3000);
-  const health = await waitForHealth(projectId, environment, healthHost, appPort);
+  await ensureBuildNotCancelled(buildId);
+  const health = await waitForHealth(projectId, environment, healthHost, appPort, buildId);
   if (!health.ok) {
+    if (health.fastFail) {
+      const detail = [health.fastFail.message, health.fastFail.detail].filter(Boolean).join('\n');
+      const err = new Error(`Deploy failed early: ${health.fastFail.reason || 'pod_error'}`);
+      err.code = 'deploy_failed_fast';
+      err.detail = detail;
+      err.host = host;
+      throw err;
+    }
     const err = await buildHealthcheckError(projectId, environment, host);
     if (health.crashloop) {
       const detail = `CrashLoopBackOff detected (${health.crashloop.restartCount} restarts) on pod ${health.crashloop.podName || 'unknown'}.`;
@@ -1289,7 +1606,7 @@ async function writeSnapshot(projectId) {
   return { snapshotPath, tempDir };
 }
 
-async function deployEnvironment(projectId, environment, commitHash) {
+async function deployEnvironment(projectId, environment, commitHash, buildId = null) {
   console.log(`Deploying project ${projectId} environment ${environment}...`);
   const command = deployCommandForEnv(environment);
   if (!command) return;
@@ -1419,7 +1736,8 @@ async function deployEnvironment(projectId, environment, commitHash) {
       probes: probeResults
     });
     try {
-      const { stdout, stderr } = await runCommandStreaming(command, env);
+      await ensureBuildNotCancelled(buildId);
+      const { stdout, stderr } = await runCommandStreaming(command, env, { buildId });
       output = `${stdout || ''}${stderr || ''}`;
     } catch (err) {
       const errStdout = err?.stdout || '';
@@ -1437,7 +1755,7 @@ async function deployEnvironment(projectId, environment, commitHash) {
     await fs.rm(repoTemp, { recursive: true, force: true });
   }
   const appPort = Number(envVars.PORT || process.env.PORT || 3000);
-  const health = await waitForHealth(projectId, environment, healthHost, appPort);
+  const health = await waitForHealth(projectId, environment, healthHost, appPort, buildId);
   if (!health.ok) {
     const err = await buildHealthcheckError(projectId, environment, host);
     if (health.crashloop) {
@@ -1759,10 +2077,15 @@ async function createBuild(projectId, environment, status, refCommit) {
 }
 
 async function finalizeBuild(buildId, status, log, refCommit) {
+  const nextLog = log ? String(log) : null;
+  const safeLog =
+    nextLog && nextLog.length > BUILD_LOG_MAX_BYTES
+      ? nextLog.slice(-BUILD_LOG_MAX_BYTES)
+      : nextLog;
   await pool.query(
-    `update builds set status = $1, build_log = $2, ref_commit = $3, updated_at = now()
+    `update builds set status = $1, build_log = coalesce($2, build_log), ref_commit = $3, updated_at = now()
      where id = $4`,
-    [status, log || null, refCommit || null, buildId]
+    [status, safeLog || null, refCommit || null, buildId]
   );
 }
 
@@ -1945,11 +2268,12 @@ async function updateBuildStatus(projectId, environment, status, refCommit) {
   let ownerId = null;
   let previousStatus = null;
   let previousLiveSince = null;
+  let previousDeployedCommit = null;
   try {
     const projectRes = await pool.query('select owner_id from projects where id = $1', [projectId]);
     ownerId = projectRes.rows[0]?.owner_id || null;
     const envRes = await pool.query(
-      'select build_status, live_since from environments where project_id = $1 and name = $2',
+      'select build_status, live_since, deployed_commit from environments where project_id = $1 and name = $2',
       [projectId, environment]
     );
     if (envRes.rowCount > 0) {
@@ -1957,6 +2281,7 @@ async function updateBuildStatus(projectId, environment, status, refCommit) {
       previousLiveSince = envRes.rows[0].live_since
         ? new Date(envRes.rows[0].live_since).getTime()
         : null;
+      previousDeployedCommit = envRes.rows[0].deployed_commit || null;
     }
   } catch (err) {
     console.error('Failed to load runtime usage metadata', err);
@@ -1969,6 +2294,8 @@ async function updateBuildStatus(projectId, environment, status, refCommit) {
     }
   }
   const nextLiveSince = status === 'live' ? now : null;
+  const nextDeployedCommit =
+    status === 'live' && refCommit ? refCommit : previousDeployedCommit;
   try {
     await pool.query(
       `insert into environments (project_id, name, build_status, deployed_commit, live_since)
@@ -1978,7 +2305,7 @@ async function updateBuildStatus(projectId, environment, status, refCommit) {
                      deployed_commit = excluded.deployed_commit,
                      live_since = excluded.live_since,
                      updated_at = now()`,
-      [projectId, environment, status, refCommit || null, nextLiveSince]
+      [projectId, environment, status, nextDeployedCommit, nextLiveSince]
     );
   } catch (err) {
     const msg = String(err?.message || '');
@@ -1990,7 +2317,7 @@ async function updateBuildStatus(projectId, environment, status, refCommit) {
          do update set build_status = excluded.build_status,
                        deployed_commit = excluded.deployed_commit,
                        updated_at = now()`,
-        [projectId, environment, status, refCommit || null]
+        [projectId, environment, status, nextDeployedCommit]
       );
     } else {
       throw err;
@@ -2230,15 +2557,37 @@ async function processTask(taskId) {
   });
   
 
+  let buildId = null;
   try {
-    const buildId = await createBuild(task.project_id, task.environment, 'building', null);
+    buildId = await createBuild(task.project_id, task.environment, 'building', null);
     await updateBuildStatus(task.project_id, task.environment, 'building', null);
-    const log = await deployEnvironment(task.project_id, task.environment, commitHash);
+    const log = await deployEnvironment(task.project_id, task.environment, commitHash, buildId);
     await finalizeBuild(buildId, 'live', log, commitHash);
     await updateBuildStatus(task.project_id, task.environment, 'live', commitHash);
   } catch (err) {
-    await finalizeBuild(buildId, 'failed', err.message, commitHash);
-    await updateBuildStatus(task.project_id, task.environment, 'failed', commitHash);
+    const cancelled = err?.code === 'build_cancelled';
+    const shouldScaleDown = ['healthcheck_failed', 'deploy_failed_fast', 'build_cancelled'].includes(err?.code);
+    if (cancelled && buildId) {
+      await appendBuildLog(buildId, '\n\n[system] Build cancelled by user.\n');
+    }
+    if (err?.code === 'healthcheck_failed' || err?.code === 'deploy_failed_fast') {
+      const detail = `${err.message || 'Deploy failed'}\n\n${err.detail || ''}`.trim();
+      if (buildId) {
+        await appendBuildLog(buildId, `\n\n[system] ${detail}\n`);
+      }
+    }
+    const buildLog = cancelled
+      ? null
+      : (err?.code === 'healthcheck_failed' || err?.code === 'deploy_failed_fast')
+          ? `${err.message || 'Deploy failed'}\n\n${err.detail || ''}`.trim()
+          : buildLogFromError(err);
+    if (buildId) {
+      await finalizeBuild(buildId, cancelled ? 'cancelled' : 'failed', buildLog, commitHash);
+    }
+    await updateBuildStatus(task.project_id, task.environment, cancelled ? 'cancelled' : 'failed', commitHash);
+    if (shouldScaleDown) {
+      await scaleDeploymentToZero(task.project_id, task.environment);
+    }
     throw err;
   }
 }
@@ -2364,17 +2713,25 @@ async function processDeployCommit(projectId, environment, commitHash) {
   const buildId = await createBuild(projectId, environment, 'building', commitHash || null);
   await updateBuildStatus(projectId, environment, 'building', commitHash || null);
   try {
+    await ensureBuildNotCancelled(buildId);
     let log = null;
     if (await shouldFastResume(projectId, environment, commitHash || null)) {
-      log = await fastResumeEnvironment(projectId, environment, commitHash || null);
+      log = await fastResumeEnvironment(projectId, environment, commitHash || null, buildId);
     }
     if (!log) {
-      log = await deployEnvironment(projectId, environment, commitHash || null);
+      log = await deployEnvironment(projectId, environment, commitHash || null, buildId);
     }
     await finalizeBuild(buildId, 'live', log, commitHash || null);
     await updateBuildStatus(projectId, environment, 'live', commitHash || null);
     await sendDeployWebhook(projectId, environment, 'live', commitHash || null, buildId, '');
   } catch (err) {
+    if (err?.code === 'build_cancelled') {
+      await appendBuildLog(buildId, '\n\n[system] Build cancelled by user.\n');
+      await finalizeBuild(buildId, 'cancelled', null, commitHash || null);
+      await updateBuildStatus(projectId, environment, 'cancelled', commitHash || null);
+      await scaleDeploymentToZero(projectId, environment);
+      return;
+    }
     if (err?.code === 'healthcheck_failed') {
       const summary = truncateText(err.detail || err.message || '');
       await sendAlert(
@@ -2392,11 +2749,17 @@ async function processDeployCommit(projectId, environment, commitHash) {
       await scaleDeploymentToZero(projectId, environment);
     }
     const buildLog =
-      err?.code === 'healthcheck_failed'
+      err?.code === 'healthcheck_failed' || err?.code === 'deploy_failed_fast'
         ? `${err.message}\n\n${err.detail || ''}`.trim()
-        : (err?.message || 'Deploy failed');
+        : buildLogFromError(err);
+    if (err?.code === 'healthcheck_failed') {
+      await appendBuildLog(buildId, `\n\n[system] ${buildLog}\n`);
+    }
+    if (err?.code === 'deploy_failed_fast') {
+      await appendBuildLog(buildId, `\n\n[system] ${buildLog}\n`);
+    }
     await sendDeployWebhook(projectId, environment, 'failed', commitHash || null, buildId, buildLog);
-    await finalizeBuild(buildId, 'failed', buildLog, commitHash || null);
+    await finalizeBuild(buildId, 'failed', err?.code === 'healthcheck_failed' ? null : buildLog, commitHash || null);
     await updateBuildStatus(projectId, environment, 'failed', commitHash || null);
     throw err;
   }

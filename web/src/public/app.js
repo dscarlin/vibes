@@ -183,6 +183,7 @@ let confirmResolver = null;
 let promptResolver = null;
 let localRunTailTimer = null;
 let localRunWaitTimer = null;
+let buildLogPoller = null;
 
 function scheduleHeaderProgressRefresh(delay = 3100) {
   if (headerProgressTimer) {
@@ -967,6 +968,46 @@ function stopRuntimeUsagePolling() {
   runtimeUsageTimer = null;
 }
 
+function updateBuildLogPanel(build) {
+  if (!build) return;
+  const logText = build.build_log || 'No build log available.';
+  const pre = document.querySelector('.build-log pre[data-build-log]');
+  if (!pre) return;
+  if (pre.textContent === logText) return;
+  pre.textContent = logText;
+}
+
+function shouldPollBuildLog() {
+  const status = state.buildStatus[state.environment];
+  return status === 'building' || status === 'canceling';
+}
+
+function startBuildLogPolling() {
+  if (buildLogPoller || !state.projectId) return;
+  buildLogPoller = setInterval(async () => {
+    if (!state.projectId) return;
+    if (!shouldPollBuildLog()) {
+      stopBuildLogPolling();
+      return;
+    }
+    await loadLatestBuild(state.projectId, state.environment, { silent: true });
+  }, 3000);
+}
+
+function stopBuildLogPolling() {
+  if (!buildLogPoller) return;
+  clearInterval(buildLogPoller);
+  buildLogPoller = null;
+}
+
+function ensureBuildLogPolling() {
+  if (shouldPollBuildLog()) {
+    startBuildLogPolling();
+  } else {
+    stopBuildLogPolling();
+  }
+}
+
 async function loadTasks(projectId) {
   const tasks = await api(`/projects/${projectId}/tasks`);
   setState({ tasks });
@@ -977,16 +1018,32 @@ async function loadSessions(projectId) {
   setState({ sessions });
 }
 
-async function loadLatestBuild(projectId, environment) {
+async function loadLatestBuild(projectId, environment, options = {}) {
   const build = await api(`/projects/${projectId}/builds/latest?environment=${environment}`);
+  const prevStatus = state.buildStatus[environment];
   state.latestBuild[environment] = build;
   if (build?.status) {
     state.buildStatus[environment] = build.status;
+  }
+  const nextStatus = state.buildStatus[environment];
+  const statusChanged = prevStatus !== nextStatus;
+  const canSilentUpdate =
+    options.silent &&
+    environment === state.environment &&
+    !statusChanged &&
+    (nextStatus === 'building' || nextStatus === 'canceling');
+  if (canSilentUpdate) {
+    updateBuildLogPanel(build);
+    ensureBuildLogPolling();
+    return;
   }
   setState({
     latestBuild: { ...state.latestBuild },
     buildStatus: { ...state.buildStatus }
   });
+  if (environment === state.environment) {
+    ensureBuildLogPolling();
+  }
 }
 
 async function loadFailedBuildLog(projectId, environment, { force = false, lines } = {}) {
@@ -1042,7 +1099,7 @@ async function loadLastSuccessBuilds(projectId) {
 async function fetchRuntimeLogs(id, lines) {
   if (!id) return;
   const current = state.taskLogs[id] || {};
-  const nextLines = Math.max(1, Math.min(Number(lines || current.lines || 200), 2000));
+  const nextLines = Math.max(1, Math.min(Number(lines || current.lines || 400), 2000));
   state.taskLogs[id] = { ...current, loading: true, error: '', lines: nextLines };
   setState({ taskLogs: { ...state.taskLogs } });
   try {
@@ -1225,8 +1282,8 @@ function settingsShortcutLabel() {
 function badgeClass(status) {
   if (!status) return 'badge';
   if (status === 'live') return 'badge live';
-  if (status === 'building' || status === 'running' || status === 'queued') return 'badge building';
-  if (status === 'failed') return 'badge failed';
+  if (status === 'building' || status === 'running' || status === 'queued' || status === 'canceling') return 'badge building';
+  if (status === 'failed' || status === 'cancelled') return 'badge failed';
   return 'badge';
 }
 
@@ -1376,7 +1433,7 @@ function connectSocket(projectId) {
       if (payload.updatedAt) {
         state.updatedAt[env] = payload.updatedAt;
       }
-      if (payload.status === 'live' || payload.status === 'failed') {
+      if (payload.status === 'live' || payload.status === 'failed' || payload.status === 'cancelled') {
         state.pendingDeployCommit[env] = '';
       }
       if (payload.status === 'offline') {
@@ -1400,7 +1457,7 @@ function connectSocket(projectId) {
           }
         }
       }
-      if (prevStatus === 'building' && (payload.status === 'live' || payload.status === 'failed')) {
+      if (prevStatus === 'building' && (payload.status === 'live' || payload.status === 'failed' || payload.status === 'cancelled')) {
         state.progressVisibleUntil[env] = Date.now() + 3000;
         scheduleHeaderProgressRefresh();
       }
@@ -1412,12 +1469,18 @@ function connectSocket(projectId) {
           setTaskStatus('Your application is ready to view at the link to the left', { autoHide: true });
           setState({ activeTaskId: null });
         }
+        if (payload.status === 'cancelled') {
+          setTaskStatus('Build cancelled', { autoHide: true });
+        }
       }
-      if (env === state.environment && (payload.status === 'failed' || payload.status === 'live')) {
+      if (env === state.environment && (payload.status === 'failed' || payload.status === 'live' || payload.status === 'cancelled' || payload.status === 'building')) {
         loadLatestBuild(state.projectId, env);
       }
       if (payload.status === 'live') {
         loadLastSuccessBuilds(state.projectId);
+      }
+      if (env === state.environment) {
+        ensureBuildLogPolling();
       }
       const nextRuntimeNotice = { ...(state.runtimeQuotaNotice || {}) };
       const projectNotices = { ...(nextRuntimeNotice[state.projectId] || {}) };
@@ -1473,6 +1536,7 @@ class AppShell extends HTMLElement {
       clearInterval(this._ticker);
       this._ticker = null;
     }
+    stopBuildLogPolling();
   }
 
   refreshRelativeTimes() {
@@ -1638,6 +1702,8 @@ class AppShell extends HTMLElement {
       if (status === 'live') return 'Live';
       if (status === 'building') return 'Building';
       if (status === 'failed') return 'Failed';
+      if (status === 'canceling') return 'Canceling';
+      if (status === 'cancelled') return 'Cancelled';
       return 'Offline';
     };
     return state.nerdLevel === 'beginner' ? '' : `
@@ -2094,7 +2160,8 @@ class AppShell extends HTMLElement {
 
   renderSubmit(project) {
     const latest = state.latestBuild[state.environment];
-    const showBuildLog = latest && latest.status === 'failed';
+    const showBuildLog = latest && ['failed', 'building', 'cancelled'].includes(latest.status);
+    const buildLogTitle = latest?.status === 'building' ? 'Live Build Log' : 'Latest Build Log';
     const failedLog = state.failedBuildLog[state.environment];
     const failedLogVisible = state.failedBuildLogVisible[state.environment];
     const failedLogLoading = state.failedBuildLogLoading[state.environment];
@@ -2102,6 +2169,7 @@ class AppShell extends HTMLElement {
     const failedLogTruncated = Boolean(failedLog?.truncated);
     const hasFailedLog = Boolean(failedLog?.build_log || failedLogError);
     const isBeginner = state.nerdLevel === 'beginner';
+    const canCancelBuild = ['building', 'canceling'].includes(state.buildStatus[state.environment]);
     return `
       <div class="card">
         <div class="section-title">
@@ -2127,6 +2195,7 @@ class AppShell extends HTMLElement {
         <textarea id="taskPrompt" placeholder="A good title for the feature or fix you want to make...\n\nDescribe exactly what you want to see, what you expect \nto happen when you click somewhere etc...\n\nWatch your ideas come to life!\nIn moments you will be viewing the updates${isBeginner ? '.' : '\nand reading a summary of what we have done!'}">${state.taskPromptDraft || ''}</textarea>
         <div class="row m-top-sm">
           <button id="submitTask">Submit</button>
+          ${canCancelBuild ? '<button class="ghost" id="cancelBuild">Stop build</button>' : ''}
         </div>
         ${!showBuildLog && hasFailedLog ? `
           <div class="notice m-top-sm">
@@ -2143,8 +2212,8 @@ class AppShell extends HTMLElement {
         ` : ''}
         ${showBuildLog ? `
           <details class="build-log" open>
-            <summary>Latest Build Log</summary>
-            <pre>${latest.build_log || 'No build log available.'}</pre>
+            <summary>${buildLogTitle}</summary>
+            <pre data-build-log="true">${latest.build_log || 'No build log available.'}</pre>
             <button class="ghost" id="refreshBuildLog">Refresh Log</button>
           </details>
         ` : ''}
@@ -2180,6 +2249,7 @@ class AppShell extends HTMLElement {
         : [];
     const iosActive = state.localRunActive && state.localRunPlatform === 'ios';
     const androidActive = state.localRunActive && state.localRunPlatform === 'android';
+    const isStarterPlan = String(state.user?.plan || '').toLowerCase() === 'starter';
     return `
       <div class="card grid two">
         <div>
@@ -2225,7 +2295,7 @@ class AppShell extends HTMLElement {
             </div>
           `}
         </div>
-        ${DESKTOP_BRIDGE ? `
+        ${DESKTOP_BRIDGE && !isStarterPlan ? `
         <div class="card local-run">
           <h3>Local Run</h3>
           <div class="local-run-note">
@@ -2282,9 +2352,10 @@ class AppShell extends HTMLElement {
 
   renderTask(task, canDelete, sessionId = null) {
     const logState = state.taskLogs[task.id] || { open: false };
+    const logLineCount = logState.lines || 400;
     const detailState = state.taskDetails[task.id] || { open: false };
     const isLive = task.commit_hash && task.commit_hash === state.deployedCommit[state.environment] && state.buildStatus[state.environment] === 'live';
-    const isDeploying = task.commit_hash && task.commit_hash === state.pendingDeployCommit[state.environment] && state.buildStatus[state.environment] === 'building';
+    const isDeploying = task.commit_hash && task.commit_hash === state.pendingDeployCommit[state.environment] && ['building', 'canceling'].includes(state.buildStatus[state.environment]);
     const canViewLogs = isLive || isDeploying;
     const latestBuild = state.latestBuild[state.environment];
     const buildMatchesTask = latestBuild?.ref_commit
@@ -2355,9 +2426,9 @@ class AppShell extends HTMLElement {
            // <div class="log-header">Task Logs</div>
           //  <pre>${task.codex_output || 'No task output yet.'}</pre>
           ` <div class="log-header">
-              <span>${projectName} Application Logs</span>
+              <span>${projectName} Application Logs <span class="meta">Last ${logLineCount} lines</span></span>
               <div class="log-actions">
-                <button class="icon-button fetch-logs" data-id="${task.id}" title="Fetch latest logs" aria-label="Fetch latest logs">Fetch</button>
+                <button class="icon-button fetch-logs" data-id="${task.id}" title="Fetch latest logs (2000 lines)" aria-label="Fetch latest logs (2000 lines)">Fetch</button>
                 <button class="icon-button copy-logs" data-id="${task.id}" title="Copy Application Logs" aria-label="Copy Application Logs">${icon('copy')}</button>
               </div>
             </div>
@@ -2391,9 +2462,10 @@ class AppShell extends HTMLElement {
     const tasksHtml = tasks.map((task) => this.renderTask(task, false, session.id)).join('') || '<p class="notice">No tasks in this session.</p>';
     const label = session.message.length > 40 ? `${session.message.slice(0, 40)}...` : session.message;
     const isLive = session.merge_commit && session.merge_commit === state.deployedCommit[state.environment] && state.buildStatus[state.environment] === 'live';
-    const isDeploying = session.merge_commit && session.merge_commit === state.pendingDeployCommit[state.environment] && state.buildStatus[state.environment] === 'building';
+    const isDeploying = session.merge_commit && session.merge_commit === state.pendingDeployCommit[state.environment] && ['building', 'canceling'].includes(state.buildStatus[state.environment]);
     const canViewLogs = isLive || isDeploying;
     const logState = state.taskLogs[session.id] || { open: false };
+    const logLineCount = logState.lines || 400;
     const detailsState = state.sessionDetails[session.id] || { open: false };
     const latestBuild = state.latestBuild[state.environment];
     const buildMatchesSession = latestBuild?.ref_commit
@@ -2439,9 +2511,9 @@ class AppShell extends HTMLElement {
         ${logState.open ? `
           <div class="log-panel">
             <div class="log-header">
-              <span>${projectName} Application Logs</span>
+              <span>${projectName} Application Logs <span class="meta">Last ${logLineCount} lines</span></span>
               <div class="log-actions">
-                <button class="icon-button fetch-logs" data-id="${session.id}" title="Fetch latest logs" aria-label="Fetch latest logs">Fetch</button>
+                <button class="icon-button fetch-logs" data-id="${session.id}" title="Fetch latest logs (2000 lines)" aria-label="Fetch latest logs (2000 lines)">Fetch</button>
                 <button class="icon-button copy-logs" data-id="${session.id}" title="Copy Application Logs" aria-label="Copy Application Logs">${icon('copy')}</button>
               </div>
             </div>
@@ -3399,6 +3471,25 @@ class AppShell extends HTMLElement {
       }
     });
 
+    this.querySelector('#cancelBuild')?.addEventListener('click', async () => {
+      if (!state.projectId) return;
+      const env = state.environment;
+      setTaskStatus('Canceling build…', { autoHide: true });
+      state.buildStatus[env] = 'canceling';
+      setState({ buildStatus: { ...state.buildStatus } });
+      try {
+        await api(`/projects/${state.projectId}/builds/cancel`, {
+          method: 'POST',
+          body: JSON.stringify({ environment: env })
+        });
+      } catch (err) {
+        showError(err);
+      } finally {
+        await loadLatestBuild(state.projectId, env);
+        ensureBuildLogPolling();
+      }
+    });
+
     this.querySelector('#refreshBuildLog')?.addEventListener('click', async () => {
       if (!state.projectId) return;
       await loadLatestBuild(state.projectId, state.environment);
@@ -3966,7 +4057,7 @@ class AppShell extends HTMLElement {
     this.querySelectorAll('.fetch-logs').forEach((btn) => {
       btn.addEventListener('click', async () => {
         const id = btn.getAttribute('data-id');
-        await fetchRuntimeLogs(id, 600);
+        await fetchRuntimeLogs(id, 2000);
       });
     });
 
