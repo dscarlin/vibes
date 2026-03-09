@@ -18,6 +18,8 @@ APP_NAME="vibes-app-${PROJECT_ID}"
 kubectl -n "$NAMESPACE" delete ingress "$APP_NAME" --ignore-not-found
 kubectl -n "$NAMESPACE" delete service "$APP_NAME" --ignore-not-found
 kubectl -n "$NAMESPACE" delete deployment "$APP_NAME" --ignore-not-found
+kubectl -n "$NAMESPACE" delete pod "$APP_NAME" --ignore-not-found
+kubectl -n "$NAMESPACE" delete pod -l app="$APP_NAME" --ignore-not-found --wait=false >/dev/null 2>&1 || true
 kubectl -n "$NAMESPACE" delete secret "$APP_NAME-env" --ignore-not-found
 
 DELETE_ECR_IMAGES="${DELETE_ECR_IMAGES:-true}"

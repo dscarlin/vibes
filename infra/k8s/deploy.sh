@@ -44,6 +44,11 @@ case "$ENVIRONMENT_KEY" in
   dev) ENVIRONMENT_KEY="development" ;;
   prod) ENVIRONMENT_KEY="production" ;;
 esac
+DEV_RUNTIME_MODE="$(printf '%s' "${DEV_RUNTIME_MODE:-pod}" | tr '[:upper:]' '[:lower:]')"
+USE_DEV_POD_RUNTIME="false"
+if [ "$ENVIRONMENT_KEY" = "development" ] && [ "$DEV_RUNTIME_MODE" != "deployment" ]; then
+  USE_DEV_POD_RUNTIME="true"
+fi
 
 if [ -n "${APP_CPU_REQUEST:-}" ]; then
   CPU_REQUEST="$APP_CPU_REQUEST"
@@ -133,6 +138,7 @@ fi
 echo "deploy.sh resolved: APP_NAME=${APP_NAME} ENV_FILE=${ENV_FILE} SNAPSHOT_PATH=${SNAPSHOT_PATH} APP_HOST=${APP_HOST} NAMESPACE=${NAMESPACE} IMAGE=${IMAGE}"
 CUSTOMER_NODEGROUP_ENABLED="${CUSTOMER_NODEGROUP_ENABLED:-}"
 NODE_PLACEMENT_BLOCK=""
+POD_NODE_PLACEMENT_BLOCK=""
 if [ "$CUSTOMER_NODEGROUP_ENABLED" = "true" ]; then
   CUSTOMER_NODEGROUP_LABEL="${CUSTOMER_NODEGROUP_LABEL:-nodegroup}"
   CUSTOMER_NODEGROUP_VALUE="${CUSTOMER_NODEGROUP_VALUE:-customer}"
@@ -147,6 +153,16 @@ if [ "$CUSTOMER_NODEGROUP_ENABLED" = "true" ]; then
           operator: Equal
           value: ${CUSTOMER_NODEGROUP_TAINT_VALUE}
           effect: NoSchedule
+EOF
+)
+    POD_NODE_PLACEMENT_BLOCK=$(cat <<EOF
+  nodeSelector:
+    ${CUSTOMER_NODEGROUP_LABEL}: ${CUSTOMER_NODEGROUP_VALUE}
+  tolerations:
+    - key: ${CUSTOMER_NODEGROUP_TAINT_KEY}
+      operator: Equal
+      value: ${CUSTOMER_NODEGROUP_TAINT_VALUE}
+      effect: NoSchedule
 EOF
 )
     echo "deploy.sh scheduling: nodeSelector ${CUSTOMER_NODEGROUP_LABEL}=${CUSTOMER_NODEGROUP_VALUE} taint ${CUSTOMER_NODEGROUP_TAINT_KEY}=${CUSTOMER_NODEGROUP_TAINT_VALUE}"
@@ -167,6 +183,44 @@ if [ -z "$APP_PORT" ]; then
 fi
 APP_PORT="${APP_PORT:-3000}"
 echo "deploy.sh app port: ${APP_PORT}"
+
+IMAGE_PULL_POLICY="${APP_IMAGE_PULL_POLICY:-}"
+if [ -z "$IMAGE_PULL_POLICY" ]; then
+  if [ "$ENVIRONMENT_KEY" = "development" ]; then
+    IMAGE_PULL_POLICY="${DEV_IMAGE_PULL_POLICY:-Always}"
+  else
+    IMAGE_PULL_POLICY="IfNotPresent"
+  fi
+fi
+echo "deploy.sh image pull policy: ${IMAGE_PULL_POLICY}"
+
+HEALTHCHECK_PATH_DEFAULT="${HEALTHCHECK_PATH:-/}"
+case "$ENVIRONMENT_KEY" in
+  development) HEALTHCHECK_PATH_DEFAULT="${HEALTHCHECK_PATH_DEV:-$HEALTHCHECK_PATH_DEFAULT}" ;;
+  testing) HEALTHCHECK_PATH_DEFAULT="${HEALTHCHECK_PATH_TEST:-$HEALTHCHECK_PATH_DEFAULT}" ;;
+  production) HEALTHCHECK_PATH_DEFAULT="${HEALTHCHECK_PATH_PROD:-$HEALTHCHECK_PATH_DEFAULT}" ;;
+esac
+
+APP_PROBE_PATH_DEFAULT="${APP_PROBE_PATH:-$HEALTHCHECK_PATH_DEFAULT}"
+case "$ENVIRONMENT_KEY" in
+  development) APP_PROBE_PATH_DEFAULT="${APP_PROBE_PATH_DEV:-$APP_PROBE_PATH_DEFAULT}" ;;
+  testing) APP_PROBE_PATH_DEFAULT="${APP_PROBE_PATH_TEST:-$APP_PROBE_PATH_DEFAULT}" ;;
+  production) APP_PROBE_PATH_DEFAULT="${APP_PROBE_PATH_PROD:-$APP_PROBE_PATH_DEFAULT}" ;;
+esac
+
+READINESS_PROBE_PERIOD_SECONDS="${READINESS_PROBE_PERIOD_SECONDS:-3}"
+READINESS_PROBE_TIMEOUT_SECONDS="${READINESS_PROBE_TIMEOUT_SECONDS:-2}"
+READINESS_PROBE_FAILURE_THRESHOLD="${READINESS_PROBE_FAILURE_THRESHOLD:-2}"
+READINESS_PROBE_SUCCESS_THRESHOLD="${READINESS_PROBE_SUCCESS_THRESHOLD:-1}"
+STARTUP_PROBE_PERIOD_SECONDS="${STARTUP_PROBE_PERIOD_SECONDS:-3}"
+STARTUP_PROBE_TIMEOUT_SECONDS="${STARTUP_PROBE_TIMEOUT_SECONDS:-2}"
+STARTUP_PROBE_FAILURE_THRESHOLD="${STARTUP_PROBE_FAILURE_THRESHOLD:-40}"
+ALB_HEALTHCHECK_INTERVAL_SECONDS="${ALB_HEALTHCHECK_INTERVAL_SECONDS:-5}"
+ALB_HEALTHCHECK_TIMEOUT_SECONDS="${ALB_HEALTHCHECK_TIMEOUT_SECONDS:-4}"
+ALB_HEALTHY_THRESHOLD_COUNT="${ALB_HEALTHY_THRESHOLD_COUNT:-2}"
+ALB_UNHEALTHY_THRESHOLD_COUNT="${ALB_UNHEALTHY_THRESHOLD_COUNT:-2}"
+
+echo "deploy.sh health: probe_path=${APP_PROBE_PATH_DEFAULT} alb_path=${HEALTHCHECK_PATH_DEFAULT} alb_interval=${ALB_HEALTHCHECK_INTERVAL_SECONDS}s alb_healthy=${ALB_HEALTHY_THRESHOLD_COUNT}"
 
 "$KUBECTL" create namespace "$NAMESPACE" --dry-run=client -o yaml | "$KUBECTL" apply -f -
 "$KUBECTL" -n "$NAMESPACE" delete secret "$APP_NAME-env" --ignore-not-found
@@ -202,12 +256,25 @@ if [ ! -f "$WORKDIR/Dockerfile" ]; then
 FROM node:20
 WORKDIR /app
 COPY . .
-RUN if [ -f package-lock.json ]; then npm install; elif [ -f pnpm-lock.yaml ]; then npm i -g pnpm && pnpm i; elif [ -f yarn.lock ]; then yarn install; else npm install; fi
+
+# Base/root dependency install.
+RUN if [ -f package-lock.json ]; then npm ci; elif [ -f pnpm-lock.yaml ]; then npm i -g pnpm && pnpm i; elif [ -f yarn.lock ]; then yarn install; elif [ -f package.json ]; then npm install; fi
+
+# Starter-layout optimization: do expensive setup once at image build, not on every container boot.
+RUN if [ -f scripts/start-all.js ] && [ -f server/package.json ] && [ -f web/package.json ]; then \
+      if [ -f server/package-lock.json ]; then (cd server && npm ci); elif [ -f server/yarn.lock ]; then (cd server && yarn install); else (cd server && npm install); fi && \
+      if [ -f web/package-lock.json ]; then (cd web && npm ci); elif [ -f web/yarn.lock ]; then (cd web && yarn install); else (cd web && npm install); fi && \
+      (cd server && npm run prisma:generate --if-present && npm run build --if-present) && \
+      (cd web && npm run build --if-present); \
+    fi
+
 EXPOSE 3000
-CMD ["sh", "-lc", "${START_COMMAND:-npm start}"]
+CMD ["sh", "-lc", "if [ -n \"${START_COMMAND:-}\" ]; then exec sh -lc \"${START_COMMAND}\"; elif [ -f scripts/start-all.js ] && [ -f server/dist/index.js ]; then exec node server/dist/index.js; elif [ -f scripts/start-all.js ] && [ -f server/index.js ]; then exec node server/index.js; else exec npm start; fi"]
 DOCKER
 fi
 
+BUILD_START_TS="$(date +%s)"
+echo "deploy.sh phase: image build started (${IMAGE})"
 if command -v kaniko >/dev/null 2>&1; then
   DOCKER_CONFIG="/tmp/kaniko/.docker"
   mkdir -p "$DOCKER_CONFIG"
@@ -227,8 +294,88 @@ else
   echo "Neither docker nor kaniko is available" >&2
   exit 1
 fi
+BUILD_END_TS="$(date +%s)"
+echo "deploy.sh phase: image build finished in $((BUILD_END_TS - BUILD_START_TS))s"
 
-"$KUBECTL" -n "$NAMESPACE" apply -f - <<EOF
+APPLY_START_TS="$(date +%s)"
+echo "deploy.sh phase: applying kubernetes resources"
+if [ "$USE_DEV_POD_RUNTIME" = "true" ]; then
+  echo "deploy.sh mode: development single Pod (restartPolicy=Never)"
+  "$KUBECTL" -n "$NAMESPACE" delete deployment "$APP_NAME" --ignore-not-found >/dev/null 2>&1 || true
+  "$KUBECTL" -n "$NAMESPACE" delete pod -l app="$APP_NAME" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  "$KUBECTL" -n "$NAMESPACE" apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${APP_NAME}
+  labels:
+    app: ${APP_NAME}
+spec:
+${POD_NODE_PLACEMENT_BLOCK}
+  restartPolicy: Never
+  containers:
+    - name: app
+      image: ${IMAGE}
+      imagePullPolicy: ${IMAGE_PULL_POLICY}
+      envFrom:
+        - secretRef:
+            name: ${APP_NAME}-env
+      env:
+        - name: PGSSLROOTCERT
+          value: /etc/ssl/certs/rds-ca.pem
+        - name: NODE_EXTRA_CA_CERTS
+          value: /etc/ssl/certs/rds-ca.pem
+      ports:
+        - containerPort: ${APP_PORT}
+      readinessProbe:
+        httpGet:
+          path: ${APP_PROBE_PATH_DEFAULT}
+          port: ${APP_PORT}
+        periodSeconds: ${READINESS_PROBE_PERIOD_SECONDS}
+        timeoutSeconds: ${READINESS_PROBE_TIMEOUT_SECONDS}
+        failureThreshold: ${READINESS_PROBE_FAILURE_THRESHOLD}
+        successThreshold: ${READINESS_PROBE_SUCCESS_THRESHOLD}
+      startupProbe:
+        httpGet:
+          path: ${APP_PROBE_PATH_DEFAULT}
+          port: ${APP_PORT}
+        periodSeconds: ${STARTUP_PROBE_PERIOD_SECONDS}
+        timeoutSeconds: ${STARTUP_PROBE_TIMEOUT_SECONDS}
+        failureThreshold: ${STARTUP_PROBE_FAILURE_THRESHOLD}
+      resources:
+        requests:
+          cpu: ${CPU_REQUEST}
+          memory: ${MEM_REQUEST}
+        limits:
+          cpu: ${CPU_LIMIT}
+          memory: ${MEM_LIMIT}
+      volumeMounts:
+        - name: rds-ca
+          mountPath: /etc/ssl/certs/rds-ca.pem
+          subPath: rds-ca.pem
+          readOnly: true
+  volumes:
+    - name: rds-ca
+      secret:
+        secretName: rds-ca-bundle
+        items:
+          - key: rds-ca.pem
+            path: rds-ca.pem
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${APP_NAME}
+spec:
+  selector:
+    app: ${APP_NAME}
+  ports:
+    - port: 80
+      targetPort: ${APP_PORT}
+EOF
+else
+  "$KUBECTL" -n "$NAMESPACE" delete pod -l app="$APP_NAME" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  "$KUBECTL" -n "$NAMESPACE" apply -f - <<EOF
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -247,7 +394,7 @@ ${NODE_PLACEMENT_BLOCK}
       containers:
         - name: app
           image: ${IMAGE}
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: ${IMAGE_PULL_POLICY}
           envFrom:
             - secretRef:
                 name: ${APP_NAME}-env
@@ -258,6 +405,21 @@ ${NODE_PLACEMENT_BLOCK}
               value: /etc/ssl/certs/rds-ca.pem
           ports:
             - containerPort: ${APP_PORT}
+          readinessProbe:
+            httpGet:
+              path: ${APP_PROBE_PATH_DEFAULT}
+              port: ${APP_PORT}
+            periodSeconds: ${READINESS_PROBE_PERIOD_SECONDS}
+            timeoutSeconds: ${READINESS_PROBE_TIMEOUT_SECONDS}
+            failureThreshold: ${READINESS_PROBE_FAILURE_THRESHOLD}
+            successThreshold: ${READINESS_PROBE_SUCCESS_THRESHOLD}
+          startupProbe:
+            httpGet:
+              path: ${APP_PROBE_PATH_DEFAULT}
+              port: ${APP_PORT}
+            periodSeconds: ${STARTUP_PROBE_PERIOD_SECONDS}
+            timeoutSeconds: ${STARTUP_PROBE_TIMEOUT_SECONDS}
+            failureThreshold: ${STARTUP_PROBE_FAILURE_THRESHOLD}
           resources:
             requests:
               cpu: ${CPU_REQUEST}
@@ -289,16 +451,12 @@ spec:
     - port: 80
       targetPort: ${APP_PORT}
 EOF
+fi
+APPLY_END_TS="$(date +%s)"
+echo "deploy.sh phase: kubernetes resources applied in $((APPLY_END_TS - APPLY_START_TS))s"
 
 ALB_GROUP_NAME="${ALB_GROUP_NAME:-vibes-shared}"
 ALB_GROUP_ORDER="${ALB_GROUP_ORDER:-50}"
-HEALTHCHECK_PATH_DEFAULT="${HEALTHCHECK_PATH:-/}"
-
-case "$ENVIRONMENT_KEY" in
-  development) HEALTHCHECK_PATH_DEFAULT="${HEALTHCHECK_PATH_DEV:-$HEALTHCHECK_PATH_DEFAULT}" ;;
-  testing) HEALTHCHECK_PATH_DEFAULT="${HEALTHCHECK_PATH_TEST:-$HEALTHCHECK_PATH_DEFAULT}" ;;
-  production) HEALTHCHECK_PATH_DEFAULT="${HEALTHCHECK_PATH_PROD:-$HEALTHCHECK_PATH_DEFAULT}" ;;
-esac
 
 if [ -z "${ACM_CERT_ARN:-}" ]; then
   echo "ACM_CERT_ARN required for ingress" >&2
@@ -316,6 +474,10 @@ metadata:
     alb.ingress.kubernetes.io/ssl-redirect: '443'
     alb.ingress.kubernetes.io/target-type: ip
     alb.ingress.kubernetes.io/healthcheck-path: ${HEALTHCHECK_PATH_DEFAULT}
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: '${ALB_HEALTHCHECK_INTERVAL_SECONDS}'
+    alb.ingress.kubernetes.io/healthcheck-timeout-seconds: '${ALB_HEALTHCHECK_TIMEOUT_SECONDS}'
+    alb.ingress.kubernetes.io/healthy-threshold-count: '${ALB_HEALTHY_THRESHOLD_COUNT}'
+    alb.ingress.kubernetes.io/unhealthy-threshold-count: '${ALB_UNHEALTHY_THRESHOLD_COUNT}'
     alb.ingress.kubernetes.io/success-codes: '200-399'
     alb.ingress.kubernetes.io/group.name: ${ALB_GROUP_NAME}
     alb.ingress.kubernetes.io/group.order: '${ALB_GROUP_ORDER}'

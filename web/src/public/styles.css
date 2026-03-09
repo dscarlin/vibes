@@ -1083,6 +1083,45 @@ body.app-dark .notice.quota-notice {
   padding: 12px;
 }
 
+.submit-controls {
+  justify-content: space-between;
+  align-items: center;
+}
+
+.app-log-toggle {
+  margin-left: auto;
+}
+
+.app-log-stream-wrap {
+  margin-top: 10px;
+  border: 1px solid rgba(207, 228, 223, 0.9);
+  border-radius: 12px;
+  padding: 8px 10px 10px;
+  background: #f4fbf9;
+}
+
+.app-log-stream-wrap .log-header {
+  margin: 0 0 8px;
+}
+
+.app-log-stream {
+  margin: 0;
+  max-height: 320px;
+  min-height: 180px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  padding: 10px;
+  border-radius: 10px;
+  border: 1px solid rgba(15, 31, 28, 0.3);
+  background: #0f1f1c;
+  color: #d7f3ee;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.35;
+  cursor: text;
+}
+
 .log-panel pre {
   white-space: pre-wrap;
   background: #f2f8f6;
@@ -1100,6 +1139,17 @@ body.app-dark .log-panel pre {
   background: rgba(9, 14, 23, 0.92);
   border-color: var(--border);
   color: var(--ink);
+}
+
+body.app-dark .app-log-stream-wrap {
+  background: rgba(11, 18, 30, 0.86);
+  border-color: rgba(126, 240, 255, 0.18);
+}
+
+body.app-dark .app-log-stream {
+  background: rgba(8, 12, 20, 0.96);
+  border-color: rgba(126, 240, 255, 0.22);
+  color: #d9ecff;
 }
 
 .log-panel pre.expanded {
@@ -1672,6 +1722,14 @@ body.app-dark .wizard-step.active .step-index {
 @media (max-width: 720px) {
   .wizard-grid {
     grid-template-columns: 1fr;
+  }
+
+  .submit-controls {
+    align-items: flex-start;
+  }
+
+  .app-log-toggle {
+    margin-left: 0;
   }
 }
 

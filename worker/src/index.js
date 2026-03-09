@@ -392,11 +392,31 @@ const HEALTHCHECK_DEFAULTS = {
   timeoutMs: Number(process.env.HEALTHCHECK_TIMEOUT_MS || 60000),
   intervalMs: Number(process.env.HEALTHCHECK_INTERVAL_MS || 3000)
 };
+const DEV_RUNTIME_MODE = String(process.env.DEV_RUNTIME_MODE || 'pod').trim().toLowerCase();
+const DEPLOY_HEALTH_TARGET = String(process.env.DEPLOY_HEALTH_TARGET || 'public').trim().toLowerCase();
+const EXTERNAL_HEALTHCHECK_TIMEOUT_MS = Number(
+  process.env.EXTERNAL_HEALTHCHECK_TIMEOUT_MS || Math.max(HEALTHCHECK_DEFAULTS.timeoutMs, 120000)
+);
+const POD_READINESS_POLL_MS = Math.max(1000, Number(process.env.POD_READINESS_POLL_MS || 2000));
+const EXTERNAL_HEALTHCHECK_POLL_AFTER_READY_MS = Math.max(
+  1000,
+  Number(process.env.EXTERNAL_HEALTHCHECK_POLL_AFTER_READY_MS || 6000)
+);
+const EXTERNAL_HEALTHCHECK_POLL_BACKOFF_MS = Math.max(
+  EXTERNAL_HEALTHCHECK_POLL_AFTER_READY_MS,
+  Number(process.env.EXTERNAL_HEALTHCHECK_POLL_BACKOFF_MS || 12000)
+);
+const EXTERNAL_HEALTHCHECK_POLL_BACKOFF_AFTER_MS = Math.max(
+  10000,
+  Number(process.env.EXTERNAL_HEALTHCHECK_POLL_BACKOFF_AFTER_MS || 60000)
+);
 const HEALTHCHECK_LOG_LINES = Math.max(50, Math.min(Number(process.env.HEALTHCHECK_LOG_LINES || 1200), 2000));
 const CRASHLOOP_RESTART_THRESHOLD = Number(process.env.CRASHLOOP_RESTART_THRESHOLD || 5);
 const DEV_SCALE_TO_ZERO_AFTER_MS = Number(process.env.DEV_SCALE_TO_ZERO_AFTER_MS || 15 * 60 * 1000);
 const TEST_SCALE_TO_ZERO_AFTER_MS = Number(process.env.TEST_SCALE_TO_ZERO_AFTER_MS || 3 * 60 * 60 * 1000);
 const SCALE_TO_ZERO_INTERVAL_MS = Number(process.env.SCALE_TO_ZERO_INTERVAL_MS || 60000);
+const DEV_CRASH_HARD_ENABLED = String(process.env.DEV_CRASH_HARD_ENABLED || 'true').toLowerCase() !== 'false';
+const DEV_CRASH_HARD_INTERVAL_MS = Math.max(5000, Number(process.env.DEV_CRASH_HARD_INTERVAL_MS || 15000));
 const RUNTIME_QUOTA_INTERVAL_MS = Number(process.env.RUNTIME_QUOTA_INTERVAL_MS || 60000);
 const DEFAULT_USER_PLAN = process.env.DEFAULT_USER_PLAN || 'starter';
 const RUNTIME_QUOTAS = parseRuntimeQuotas(process.env.RUNTIME_QUOTAS || process.env.RUNTIME_QUOTAS_JSON || '');
@@ -434,10 +454,26 @@ const BANDWIDTH_RECONCILE_INTERVAL_MS = Number(
 const BUILD_LOG_FLUSH_INTERVAL_MS = Number(process.env.BUILD_LOG_FLUSH_INTERVAL_MS || 1500);
 const BUILD_LOG_MAX_BYTES = Number(process.env.BUILD_LOG_MAX_BYTES || 2_000_000);
 const BUILD_CANCEL_POLL_INTERVAL_MS = Number(process.env.BUILD_CANCEL_POLL_INTERVAL_MS || 2000);
+const RUNTIME_LOG_CAPTURE_INTERVAL_MS = Math.max(
+  2000,
+  Number(process.env.RUNTIME_LOG_CAPTURE_INTERVAL_MS || 4000)
+);
+const RUNTIME_LOG_CAPTURE_LINES = Math.max(
+  200,
+  Math.min(Number(process.env.RUNTIME_LOG_CAPTURE_LINES || 1200), 4000)
+);
+const RUNTIME_LOG_PREVIOUS_TAIL_LINES = Math.max(
+  50,
+  Math.min(Number(process.env.RUNTIME_LOG_PREVIOUS_TAIL_LINES || 500), 2000)
+);
+const RUNTIME_LOG_MAX_BYTES = Math.max(100_000, Number(process.env.RUNTIME_LOG_MAX_BYTES || 2_000_000));
+const INCLUDE_RUNTIME_FAILURE_BOUNDARY_LOGS =
+  String(process.env.INCLUDE_RUNTIME_FAILURE_BOUNDARY_LOGS || 'false').toLowerCase() === 'true';
 
 export const taskQueue = new Queue('tasks', { connection });
 const alertLastSentAt = new Map();
 const activeBuilds = new Map();
+const runtimeLogStreamState = new Map();
 
 function alertKey(type, scope) {
   return `${type}:${scope || 'global'}`;
@@ -499,6 +535,69 @@ async function appendBuildLog(buildId, chunk) {
   } catch (err) {
     console.warn('Failed to append build log', err?.message || err);
   }
+}
+
+function runtimeLogStorageUnsupported(err) {
+  const msg = String(err?.message || '').toLowerCase();
+  return msg.includes('latest_runtime_log');
+}
+
+function runtimeLogKey(projectId, environment) {
+  return `${projectId}:${environment}`;
+}
+
+function clearRuntimeLogStreamState(projectId, environment) {
+  runtimeLogStreamState.delete(runtimeLogKey(projectId, environment));
+}
+
+async function resetLatestRuntimeLog(projectId, environment, attemptId = null) {
+  clearRuntimeLogStreamState(projectId, environment);
+  try {
+    await pool.query(
+      `update environments
+       set latest_runtime_log = '',
+           latest_runtime_log_updated_at = now(),
+           latest_runtime_log_attempt_id = $3
+       where project_id = $1
+         and name = $2`,
+      [projectId, environment, attemptId]
+    );
+  } catch (err) {
+    if (runtimeLogStorageUnsupported(err)) return;
+    console.warn('Failed to reset latest runtime log', err?.message || err);
+  }
+}
+
+async function appendLatestRuntimeLog(projectId, environment, chunk, attemptId = null) {
+  if (!chunk) return;
+  const payload = String(chunk).replace(/\r/g, '');
+  if (!payload) return;
+  try {
+    await pool.query(
+      `update environments
+       set latest_runtime_log = case
+             when latest_runtime_log is null then right($4, $5)
+             when length(latest_runtime_log) + length($4) > $5
+               then right(latest_runtime_log || $4, $5)
+             else latest_runtime_log || $4
+           end,
+           latest_runtime_log_updated_at = now(),
+           latest_runtime_log_attempt_id = coalesce($3::uuid, latest_runtime_log_attempt_id)
+       where project_id = $1
+         and name = $2
+         and ($3::uuid is null or latest_runtime_log_attempt_id = $3::uuid or latest_runtime_log_attempt_id is null)`,
+      [projectId, environment, attemptId, payload, RUNTIME_LOG_MAX_BYTES]
+    );
+  } catch (err) {
+    if (runtimeLogStorageUnsupported(err)) return;
+    console.warn('Failed to append latest runtime log', err?.message || err);
+  }
+}
+
+async function beginLatestRuntimeLogAttempt(projectId, environment, attemptId) {
+  await resetLatestRuntimeLog(projectId, environment, attemptId || null);
+  const startLine = `[system] Deploy attempt started at ${new Date().toISOString()}${attemptId ? ` (build ${attemptId})` : ''}\n`;
+  await appendLatestRuntimeLog(projectId, environment, startLine, attemptId || null);
 }
 
 async function requestBuildCancel(buildId) {
@@ -563,6 +662,7 @@ async function recordAdminAlert(type, message, data, level = 'warning') {
 
 function alertLevelFor(type) {
   if (type === 'healthcheck_failed') return 'error';
+  if (type === 'dev_restart_hard_fail') return 'error';
   if (type === 'queue_backlog') return 'warning';
   return 'warning';
 }
@@ -744,6 +844,11 @@ function isLocalPlatform() {
   return PLATFORM_ENV === 'local';
 }
 
+function usesDevPodRuntime(environment) {
+  if (isLocalPlatform()) return false;
+  return String(environment || '').toLowerCase() === 'development' && DEV_RUNTIME_MODE !== 'deployment';
+}
+
 function healthcheckProtocolForEnv(environment) {
   if (isLocalPlatform()) return 'http';
   if (environment === 'development' && HEALTHCHECK_DEFAULTS.protocolDev) return HEALTHCHECK_DEFAULTS.protocolDev;
@@ -763,6 +868,17 @@ function healthcheckUrl(environment, host) {
   return `${protocol}://${host}${path}`;
 }
 
+function deploymentHealthHost(environment, host, internalHost) {
+  if (isLocalPlatform()) return host;
+  if (DEPLOY_HEALTH_TARGET === 'internal' && environment !== 'production') return internalHost;
+  return host;
+}
+
+function healthTimeoutForHost(host) {
+  if (host.endsWith('.svc.cluster.local')) return HEALTHCHECK_DEFAULTS.timeoutMs;
+  return Math.max(HEALTHCHECK_DEFAULTS.timeoutMs, EXTERNAL_HEALTHCHECK_TIMEOUT_MS);
+}
+
 function healthcheckDelayForElapsed(elapsedMs) {
   const base = Math.max(500, Number(HEALTHCHECK_DEFAULTS.intervalMs || 3000));
   const stage1 = base * 15; // ~45s when base=3s
@@ -772,32 +888,297 @@ function healthcheckDelayForElapsed(elapsedMs) {
   return base * 5;
 }
 
-async function detectCrashLoop(projectId, environment) {
-  if (isLocalPlatform()) return null;
+function podReadinessDelayForElapsed(elapsedMs) {
+  if (elapsedMs < 60_000) return POD_READINESS_POLL_MS;
+  return Math.max(POD_READINESS_POLL_MS, 3000);
+}
+
+function externalHealthcheckDelayForReadyElapsed(readyElapsedMs) {
+  if (readyElapsedMs < EXTERNAL_HEALTHCHECK_POLL_BACKOFF_AFTER_MS) {
+    return EXTERNAL_HEALTHCHECK_POLL_AFTER_READY_MS;
+  }
+  return EXTERNAL_HEALTHCHECK_POLL_BACKOFF_MS;
+}
+
+function splitLogLines(text) {
+  if (!text) return [];
+  return String(text).replace(/\r/g, '').split('\n');
+}
+
+function computeLogDelta(previous, current) {
+  const prev = String(previous || '').replace(/\r/g, '');
+  const next = String(current || '').replace(/\r/g, '');
+  if (!next) return { lines: [], reset: false };
+  if (!prev) return { lines: splitLogLines(next), reset: false };
+  if (prev === next) return { lines: [], reset: false };
+
+  if (next.startsWith(prev)) {
+    const deltaRaw = next.slice(prev.length).replace(/^\n/, '');
+    return { lines: splitLogLines(deltaRaw), reset: false };
+  }
+
+  const prevLines = splitLogLines(prev);
+  const nextLines = splitLogLines(next);
+  const maxOverlap = Math.min(prevLines.length, nextLines.length);
+  for (let overlap = maxOverlap; overlap > 0; overlap -= 1) {
+    let match = true;
+    for (let i = 0; i < overlap; i += 1) {
+      if (prevLines[prevLines.length - overlap + i] !== nextLines[i]) {
+        match = false;
+        break;
+      }
+    }
+    if (match) {
+      return { lines: nextLines.slice(overlap), reset: false };
+    }
+  }
+
+  return { lines: nextLines, reset: true };
+}
+
+async function fetchPodsForApp(projectId, environment) {
   const namespace = `vibes-${environment}`;
   const appName = `vibes-app-${projectId}`;
-  try {
-    const { stdout } = await exec('sh', ['-lc', `kubectl -n ${namespace} get pods -l app=${appName} -o json`]);
-    const data = JSON.parse(stdout || '{}');
-    const pods = Array.isArray(data.items) ? data.items : [];
-    for (const pod of pods) {
-      const statuses = pod.status?.containerStatuses || [];
-      for (const status of statuses) {
+  const { stdout } = await exec('sh', ['-lc', `kubectl -n ${namespace} get pods -l app=${appName} -o json`]);
+  const data = JSON.parse(stdout || '{}');
+  return Array.isArray(data.items) ? data.items : [];
+}
+
+function classifyRuntimeFailure({ reason = '', detail = '', exitCode = null, podReason = '', podMessage = '' } = {}) {
+  const normalizedReason = String(reason || podReason || '').trim();
+  const reasonUpper = normalizedReason.toUpperCase();
+  const text = `${normalizedReason} ${detail || ''} ${podReason || ''} ${podMessage || ''}`.toLowerCase();
+  const hasText = (pattern) => pattern.test(text);
+
+  if (
+    reasonUpper === 'EVICTED' ||
+    reasonUpper === 'NODELOST' ||
+    reasonUpper === 'PREEMPTED' ||
+    reasonUpper === 'TERMINATED' ||
+    hasText(/evicted|node lost|node was low on|preempt|spot interruption|disruption|drain/i)
+  ) {
+    return {
+      category: 'platform_disruption',
+      label: 'Cluster disruption',
+      reason: normalizedReason || 'PlatformDisruption'
+    };
+  }
+
+  if (
+    reasonUpper === 'FAILEDMOUNT' ||
+    reasonUpper === 'FAILEDSCHEDULING' ||
+    reasonUpper === 'IMAGEPULLBACKOFF' ||
+    reasonUpper === 'ERRIMAGEPULL' ||
+    reasonUpper === 'CREATECONTAINERCONFIGERROR' ||
+    reasonUpper === 'INVALIDIMAGENAME' ||
+    reasonUpper === 'RUNCONTAINERERROR' ||
+    hasText(/failed scheduling|failed mount|image pull|imagepullbackoff|errimagepull/i)
+  ) {
+    return {
+      category: 'platform_configuration',
+      label: 'Platform/runtime configuration',
+      reason: normalizedReason || 'PlatformConfiguration'
+    };
+  }
+
+  if (reasonUpper === 'OOMKILLED' || hasText(/oomkilled|out of memory|oom/i)) {
+    return {
+      category: 'resource_limit',
+      label: 'Resource limit / OOM',
+      reason: normalizedReason || 'OOMKilled'
+    };
+  }
+
+  if (
+    reasonUpper === 'PODFAILED' ||
+    reasonUpper === 'CONTAINERRESTARTEDBEFOREHEALTHY' ||
+    reasonUpper === 'CRASHLOOPBACKOFF' ||
+    reasonUpper === 'ERROR' ||
+    reasonUpper === 'CONTAINERCANNOTRUN' ||
+    reasonUpper === 'STARTERROR' ||
+    (Number.isFinite(exitCode) && Number(exitCode) !== 0)
+  ) {
+    return {
+      category: 'app_failure',
+      label: 'Application crash',
+      reason: normalizedReason || (Number.isFinite(exitCode) ? `ExitCode${exitCode}` : 'AppFailure')
+    };
+  }
+
+  return {
+    category: 'unknown',
+    label: 'Unknown failure cause',
+    reason: normalizedReason || 'Unknown'
+  };
+}
+
+function formatFailureClassification(classification) {
+  if (!classification) return '';
+  return `Failure classification: ${classification.label} (${classification.category})`;
+}
+
+function buildFastFail({ reason = '', message = '', detail = '', exitCode = null, podReason = '', podMessage = '' } = {}) {
+  const classification = classifyRuntimeFailure({ reason, detail, exitCode, podReason, podMessage });
+  return {
+    reason,
+    message,
+    detail,
+    exitCode,
+    classification
+  };
+}
+
+function analyzePodsForHealth(projectId, environment, pods) {
+  let ready = false;
+  let fastFail = null;
+  let crashloop = null;
+  let newestPodName = '';
+  let newestPodTimestamp = 0;
+  let newestPodReady = false;
+  for (const pod of pods) {
+    const podName = pod.metadata?.name || 'unknown';
+    const podTimestamp = new Date(
+      pod.status?.startTime || pod.metadata?.creationTimestamp || 0
+    ).getTime() || 0;
+    const phase = pod.status?.phase || '';
+    const podReason = pod.status?.reason || '';
+    const podMessage = pod.status?.message || '';
+    const containerStatuses = pod.status?.containerStatuses || [];
+    const statuses = [
+      ...(pod.status?.initContainerStatuses || []),
+      ...containerStatuses
+    ];
+    const readyCondition = Array.isArray(pod.status?.conditions)
+      ? pod.status.conditions.find((condition) => condition.type === 'Ready')
+      : null;
+    const podReady =
+      readyCondition?.status === 'True' &&
+      containerStatuses.length > 0 &&
+      containerStatuses.every((status) => status?.ready);
+    if (podReady) ready = true;
+    if (podTimestamp >= newestPodTimestamp) {
+      newestPodTimestamp = podTimestamp;
+      newestPodName = podName;
+      newestPodReady = podReady;
+    }
+
+    for (const status of statuses) {
+      const containerName = status?.name || 'container';
+      const restartCount = Number(status?.restartCount || 0);
+      const info = describeContainerState(status, podName);
+      if (!fastFail && environment === 'development' && restartCount > 0) {
+        fastFail = buildFastFail({
+          reason: 'ContainerRestartedBeforeHealthy',
+          message: `Pod ${podName} ${containerName} restarted ${restartCount} time(s) before health check passed.`,
+          detail: info?.detail || info?.message || '',
+          exitCode: info?.exitCode ?? null,
+          podReason,
+          podMessage
+        });
+      }
+      if (fastFail || !info) continue;
+      const reason = info.reason || '';
+      const fatalWaiting = new Set([
+        'ImagePullBackOff',
+        'ErrImagePull',
+        'CreateContainerConfigError',
+        'InvalidImageName',
+        'ErrImageNeverPull',
+        'RunContainerError'
+      ]);
+      const fatalTerminated = new Set(['Error', 'OOMKilled', 'ContainerCannotRun', 'StartError']);
+      if (reason === 'CrashLoopBackOff' && restartCount >= HEALTHCHECK_FAST_FAIL_RESTARTS) {
+        fastFail = buildFastFail({
+          reason,
+          message: info.message,
+          detail: info.detail,
+          exitCode: info?.exitCode ?? null,
+          podReason,
+          podMessage
+        });
+        continue;
+      }
+      if (fatalWaiting.has(reason)) {
+        fastFail = buildFastFail({
+          reason,
+          message: info.message,
+          detail: info.detail,
+          exitCode: info?.exitCode ?? null,
+          podReason,
+          podMessage
+        });
+        continue;
+      }
+      if (fatalTerminated.has(reason) || (info.exitCode != null && info.exitCode !== 0)) {
+        fastFail = buildFastFail({
+          reason,
+          message: info.message,
+          detail: info.detail,
+          exitCode: info?.exitCode ?? null,
+          podReason,
+          podMessage
+        });
+      }
+    }
+
+    if (!fastFail && phase === 'Failed') {
+      fastFail = buildFastFail({
+        reason: podReason || 'PodFailed',
+        message: `Pod ${podName} failed.`,
+        detail: podMessage,
+        podReason,
+        podMessage
+      });
+    }
+
+    if (!crashloop) {
+      for (const status of containerStatuses) {
         const reason = status.state?.waiting?.reason || '';
         const restartCount = Number(status.restartCount || 0);
         if (reason === 'CrashLoopBackOff' && restartCount >= CRASHLOOP_RESTART_THRESHOLD) {
-          return {
-            podName: pod.metadata?.name || '',
+          crashloop = {
+            podName,
             restartCount,
             reason
           };
+          break;
         }
       }
     }
-  } catch {
-    // Ignore crashloop detection errors to avoid blocking deploys.
   }
-  return null;
+  return { ready, fastFail, crashloop, newestPodName, newestPodReady };
+}
+
+async function inspectPodsForHealth(projectId, environment) {
+  if (isLocalPlatform()) {
+    return {
+      ready: true,
+      fastFail: null,
+      crashloop: null,
+      newestPodName: '',
+      newestPodReady: true,
+      pollError: false
+    };
+  }
+  try {
+    const pods = await fetchPodsForApp(projectId, environment);
+    const analyzed = analyzePodsForHealth(projectId, environment, pods);
+    return { ...analyzed, pollError: false };
+  } catch (err) {
+    return {
+      ready: false,
+      fastFail: null,
+      crashloop: null,
+      newestPodName: '',
+      newestPodReady: false,
+      pollError: true
+    };
+  }
+}
+
+async function detectCrashLoop(projectId, environment) {
+  const health = await inspectPodsForHealth(projectId, environment);
+  return health.crashloop || null;
 }
 
 function describeContainerState(status, podName) {
@@ -844,70 +1225,8 @@ function describeContainerState(status, podName) {
 }
 
 async function detectFastFail(projectId, environment) {
-  if (isLocalPlatform()) return null;
-  const namespace = `vibes-${environment}`;
-  const appName = `vibes-app-${projectId}`;
-  try {
-    const { stdout } = await exec('sh', ['-lc', `kubectl -n ${namespace} get pods -l app=${appName} -o json`]);
-    const data = JSON.parse(stdout || '{}');
-    const pods = Array.isArray(data.items) ? data.items : [];
-    for (const pod of pods) {
-      const podName = pod.metadata?.name || 'unknown';
-      const phase = pod.status?.phase || '';
-      const podReason = pod.status?.reason || '';
-      const podMessage = pod.status?.message || '';
-      if (phase === 'Failed') {
-        return {
-          reason: podReason || 'PodFailed',
-          message: `Pod ${podName} failed.`,
-          detail: podMessage
-        };
-      }
-      const statuses = [
-        ...(pod.status?.initContainerStatuses || []),
-        ...(pod.status?.containerStatuses || [])
-      ];
-      for (const status of statuses) {
-        const info = describeContainerState(status, podName);
-        if (!info) continue;
-        const reason = info.reason || '';
-        const restartCount = Number(info.restartCount || 0);
-        const fatalWaiting = new Set([
-          'ImagePullBackOff',
-          'ErrImagePull',
-          'CreateContainerConfigError',
-          'InvalidImageName',
-          'ErrImageNeverPull',
-          'RunContainerError'
-        ]);
-        const fatalTerminated = new Set(['Error', 'OOMKilled', 'ContainerCannotRun', 'StartError']);
-        if (reason === 'CrashLoopBackOff' && restartCount >= HEALTHCHECK_FAST_FAIL_RESTARTS) {
-          return {
-            reason,
-            message: info.message,
-            detail: info.detail
-          };
-        }
-        if (fatalWaiting.has(reason)) {
-          return {
-            reason,
-            message: info.message,
-            detail: info.detail
-          };
-        }
-        if (fatalTerminated.has(reason) || (info.exitCode != null && info.exitCode !== 0)) {
-          return {
-            reason,
-            message: info.message,
-            detail: info.detail
-          };
-        }
-      }
-    }
-  } catch (err) {
-    // Ignore fast-fail detection errors to avoid blocking deploys.
-  }
-  return null;
+  const health = await inspectPodsForHealth(projectId, environment);
+  return health.fastFail || null;
 }
 
 async function checkHealthOnce(projectId, environment, host, appPort) {
@@ -931,20 +1250,55 @@ async function checkHealthOnce(projectId, environment, host, appPort) {
   return false;
 }
 
-async function waitForHealth(projectId, environment, host, appPort, buildId = null) {
-  const timeoutMs = HEALTHCHECK_DEFAULTS.timeoutMs;
+async function waitForHealth(projectId, environment, host, appPort, buildId = null, options = {}) {
+  const timeoutMs = Number(options.timeoutMs || HEALTHCHECK_DEFAULTS.timeoutMs);
   const url = healthcheckUrl(environment, host);
   const start = Date.now();
   const deadline = start + timeoutMs;
-  let nextFastFailAt = start;
+  const externalTarget = !isLocalPlatform() && !host.endsWith('.svc.cluster.local');
+  let readyAt = null;
+
+  const stopOnPodFailure = async () => {
+    if (isLocalPlatform()) return;
+    if (usesDevPodRuntime(environment)) return;
+    try {
+      await scaleDeploymentToZero(projectId, environment);
+    } catch { }
+  };
+
   while (Date.now() < deadline) {
     await ensureBuildNotCancelled(buildId);
     const elapsed = Date.now() - start;
-    if (elapsed <= HEALTHCHECK_FAST_FAIL_WINDOW_MS && Date.now() >= nextFastFailAt) {
-      nextFastFailAt = Date.now() + HEALTHCHECK_FAST_FAIL_POLL_MS;
-      const fastFail = await detectFastFail(projectId, environment);
-      if (fastFail) return { ok: false, fastFail };
+
+    if (!isLocalPlatform()) {
+      const podState = await inspectPodsForHealth(projectId, environment);
+      if (podState.fastFail) {
+        await stopOnPodFailure();
+        return { ok: false, fastFail: podState.fastFail };
+      }
+      if (podState.crashloop) {
+        await stopOnPodFailure();
+        return { ok: false, crashloop: podState.crashloop };
+      }
+      if (externalTarget) {
+        if (podState.newestPodReady) {
+          if (!readyAt) {
+            readyAt = Date.now();
+            const podLabel = podState.newestPodName ? ` (${podState.newestPodName})` : '';
+            console.log(
+              `Newest pod is ready${podLabel} for ${projectId}/${environment}; starting external health checks (${url}).`
+            );
+          }
+        } else {
+          const delay = Math.min(podReadinessDelayForElapsed(elapsed), Math.max(0, deadline - Date.now()));
+          if (delay > 0) {
+            await new Promise((resolve) => setTimeout(resolve, delay));
+          }
+          continue;
+        }
+      }
     }
+
     try {
       console.log(`Checking health for ${url}...`);
       const controller = new AbortController();
@@ -961,11 +1315,12 @@ async function waitForHealth(projectId, environment, host, appPort, buildId = nu
         await exec('sh', ['-lc', cmd]);
         return { ok: true };
       } catch { }
-    } else {
-      const crashloop = await detectCrashLoop(projectId, environment);
-      if (crashloop) return { ok: false, crashloop };
     }
-    const delay = Math.min(healthcheckDelayForElapsed(elapsed), Math.max(0, deadline - Date.now()));
+    let delay = healthcheckDelayForElapsed(elapsed);
+    if (externalTarget && readyAt) {
+      delay = externalHealthcheckDelayForReadyElapsed(Date.now() - readyAt);
+    }
+    delay = Math.min(delay, Math.max(0, deadline - Date.now()));
     if (delay > 0) {
       await new Promise((r) => setTimeout(r, delay));
     }
@@ -1021,19 +1376,41 @@ async function scaleDeploymentToZero(projectId, environment) {
   }
   const namespace = `vibes-${environment}`;
   const appName = `vibes-app-${projectId}`;
-  const cmd = `kubectl -n ${namespace} scale deployment ${appName} --replicas=0`;
-  try {
-    await exec('sh', ['-lc', cmd]);
-    return 'scaled';
-  } catch (err) {
-    const msg = `${err?.stderr || ''}\n${err?.message || ''}`.toLowerCase();
-    if (msg.includes('notfound') || msg.includes('not found')) {
-      console.warn(`Scale to zero: deployment ${appName} not found in ${namespace}`);
-      return 'missing';
+  const usePodRuntime = usesDevPodRuntime(environment);
+  let deploymentMissing = false;
+  let scaled = false;
+
+  if (!usePodRuntime) {
+    const cmd = `kubectl -n ${namespace} scale deployment ${appName} --replicas=0`;
+    try {
+      await exec('sh', ['-lc', cmd]);
+      scaled = true;
+    } catch (err) {
+      const msg = `${err?.stderr || ''}\n${err?.message || ''}`.toLowerCase();
+      if (msg.includes('notfound') || msg.includes('not found')) {
+        deploymentMissing = true;
+        console.warn(`Scale to zero: deployment ${appName} not found in ${namespace}`);
+      } else {
+        console.warn(`Scale to zero failed for ${appName}`, err?.message || err);
+      }
     }
-    console.warn(`Scale to zero failed for ${appName}`, err?.message || err);
-    return 'failed';
   }
+
+  if (usePodRuntime || deploymentMissing) {
+    try {
+      await exec('sh', [
+        '-lc',
+        `kubectl -n ${namespace} delete pod -l app=${appName} --ignore-not-found --wait=false`
+      ]);
+      scaled = true;
+    } catch (err) {
+      console.warn(`Scale to zero pod delete failed for ${appName}`, err?.message || err);
+    }
+  }
+
+  if (scaled) return 'scaled';
+  if (deploymentMissing) return 'missing';
+  return 'failed';
 }
 
 async function clearPendingDeployJobs(projectId, environment) {
@@ -1055,6 +1432,7 @@ async function clearPendingDeployJobs(projectId, environment) {
 async function stopEnvironment(projectId, environment) {
   await clearPendingDeployJobs(projectId, environment);
   await scaleDeploymentToZero(projectId, environment);
+  clearRuntimeLogStreamState(projectId, environment);
   let refCommit = null;
   try {
     const envRes = await pool.query(
@@ -1064,6 +1442,181 @@ async function stopEnvironment(projectId, environment) {
     refCommit = envRes.rows[0]?.deployed_commit || null;
   } catch {}
   await updateBuildStatus(projectId, environment, 'offline', refCommit);
+}
+
+function sortPodsNewestFirst(pods) {
+  const next = Array.isArray(pods) ? [...pods] : [];
+  next.sort((a, b) => {
+    const aTime = new Date(a?.status?.startTime || a?.metadata?.creationTimestamp || 0).getTime();
+    const bTime = new Date(b?.status?.startTime || b?.metadata?.creationTimestamp || 0).getTime();
+    return bTime - aTime;
+  });
+  return next;
+}
+
+async function fetchCurrentPodLogSnapshot(projectId, environment, lines = RUNTIME_LOG_CAPTURE_LINES) {
+  const tail = Math.max(1, Math.min(Number(lines) || RUNTIME_LOG_CAPTURE_LINES, 4000));
+  if (isLocalPlatform()) {
+    if (environment !== 'development') return { snapshot: '', podName: '', namespace: '', statuses: [] };
+    const container = `vibes-app-${projectId}-${environment}`;
+    try {
+      const { stdout, stderr } = await exec('sh', ['-lc', `podman logs --timestamps --tail=${tail} ${container}`]);
+      return {
+        snapshot: `${stdout || ''}${stderr || ''}`.trim(),
+        podName: container,
+        namespace: 'local',
+        statuses: []
+      };
+    } catch {
+      return { snapshot: '', podName: container, namespace: 'local', statuses: [] };
+    }
+  }
+  const namespace = `vibes-${environment}`;
+  const pods = sortPodsNewestFirst(await fetchPodsForApp(projectId, environment));
+  if (!pods.length) return { snapshot: '', podName: '', namespace, statuses: [] };
+  const pod = pods[0];
+  const podName = pod?.metadata?.name || '';
+  const statuses = [
+    ...(pod?.status?.initContainerStatuses || []),
+    ...(pod?.status?.containerStatuses || [])
+  ];
+  if (!podName) return { snapshot: '', podName: '', namespace, statuses };
+  try {
+    const { stdout, stderr } = await exec('sh', [
+      '-lc',
+      `kubectl -n ${namespace} logs ${podName} --tail=${tail} --timestamps`
+    ]);
+    return {
+      snapshot: `${stdout || ''}${stderr || ''}`.trim(),
+      podName,
+      namespace,
+      statuses
+    };
+  } catch (err) {
+    console.warn(`kubectl logs failed for ${podName}`, err?.message || err);
+    return { snapshot: '', podName, namespace, statuses };
+  }
+}
+
+function formatRestartReason(status) {
+  const waiting = status?.state?.waiting;
+  const terminated = status?.state?.terminated;
+  const lastTerminated = status?.lastState?.terminated;
+  const reason = waiting?.reason || terminated?.reason || lastTerminated?.reason || '';
+  const exitCode = terminated?.exitCode ?? lastTerminated?.exitCode;
+  const signal = terminated?.signal ?? lastTerminated?.signal;
+  const detail = [];
+  if (reason) detail.push(reason);
+  if (Number.isFinite(Number(exitCode)) && Number(exitCode) >= 0) detail.push(`exit ${Number(exitCode)}`);
+  if (Number.isFinite(Number(signal)) && Number(signal) > 0) detail.push(`signal ${Number(signal)}`);
+  return detail.join(', ');
+}
+
+async function fetchPreviousContainerLogs(namespace, podName, containerName, lines = RUNTIME_LOG_PREVIOUS_TAIL_LINES) {
+  const tail = Math.max(10, Math.min(Number(lines) || RUNTIME_LOG_PREVIOUS_TAIL_LINES, 2000));
+  if (!namespace || !podName || !containerName) return '';
+  try {
+    const { stdout, stderr } = await exec('sh', [
+      '-lc',
+      `kubectl -n ${namespace} logs ${podName} -c ${containerName} --previous --tail=${tail} --timestamps`
+    ]);
+    return `${stdout || ''}${stderr || ''}`.trim();
+  } catch {
+    return '';
+  }
+}
+
+async function fetchPodTailByName(namespace, podName, lines = RUNTIME_LOG_PREVIOUS_TAIL_LINES) {
+  const tail = Math.max(10, Math.min(Number(lines) || RUNTIME_LOG_PREVIOUS_TAIL_LINES, 2000));
+  if (!namespace || !podName) return '';
+  try {
+    const { stdout, stderr } = await exec('sh', [
+      '-lc',
+      `kubectl -n ${namespace} logs ${podName} --tail=${tail} --timestamps`
+    ]);
+    return `${stdout || ''}${stderr || ''}`.trim();
+  } catch {
+    return '';
+  }
+}
+
+async function captureLatestRuntimeLog(projectId, environment, attemptId = null) {
+  const key = runtimeLogKey(projectId, environment);
+  const normalizedAttempt = attemptId || null;
+  const existing = runtimeLogStreamState.get(key);
+  const state =
+    existing && existing.attemptId === normalizedAttempt
+      ? existing
+      : { attemptId: normalizedAttempt, lastSnapshot: '', restartCounts: new Map(), lastPodName: '' };
+
+  const snapshotData = await fetchCurrentPodLogSnapshot(projectId, environment, RUNTIME_LOG_CAPTURE_LINES);
+  const nextSnapshot = String(snapshotData?.snapshot || '').replace(/\r/g, '');
+  const appendChunks = [];
+  const previousPodName = state.lastPodName || '';
+  const currentPodName = snapshotData.podName || '';
+
+  if (!isLocalPlatform() && previousPodName && currentPodName && previousPodName !== currentPodName) {
+    appendChunks.push(
+      `[system] Active pod switched from ${previousPodName} to ${currentPodName}; attempting to capture tail from previous pod.`
+    );
+    const previousPodTail = await fetchPodTailByName(
+      snapshotData.namespace,
+      previousPodName,
+      RUNTIME_LOG_PREVIOUS_TAIL_LINES
+    );
+    if (previousPodTail) {
+      appendChunks.push(`[pod ${previousPodName} tail]\n${previousPodTail}`);
+    }
+  }
+  if (currentPodName) state.lastPodName = currentPodName;
+
+  for (const status of snapshotData.statuses || []) {
+    const containerName = status?.name || 'container';
+    const restartCount = Number(status?.restartCount || 0);
+    if (!Number.isFinite(restartCount) || restartCount <= 0) continue;
+    const restartKey = `${snapshotData.podName}/${containerName}`;
+    const previousCount = Number(state.restartCounts.get(restartKey) || 0);
+    if (restartCount > previousCount) {
+      const reason = formatRestartReason(status);
+      appendChunks.push(
+        `[system] Container restart detected for ${restartKey}: restart count ${restartCount}${reason ? ` (${reason})` : ''}.`
+      );
+      if (!isLocalPlatform()) {
+        const previousLogs = await fetchPreviousContainerLogs(
+          snapshotData.namespace,
+          snapshotData.podName,
+          containerName,
+          RUNTIME_LOG_PREVIOUS_TAIL_LINES
+        );
+        if (previousLogs) {
+          appendChunks.push(`[previous ${restartKey}]\n${previousLogs}`);
+        }
+      }
+    }
+    state.restartCounts.set(restartKey, restartCount);
+  }
+
+  const previousSnapshot = state.lastSnapshot || '';
+  if (!previousSnapshot && nextSnapshot) {
+    appendChunks.push(nextSnapshot);
+  } else if (previousSnapshot) {
+    const delta = computeLogDelta(previousSnapshot, nextSnapshot);
+    if (delta.reset) {
+      appendChunks.push('[system] Log stream reset detected; continuing with latest container output.');
+      if (delta.lines.length) appendChunks.push(delta.lines.join('\n'));
+    } else if (delta.lines.length) {
+      appendChunks.push(delta.lines.join('\n'));
+    }
+  }
+  state.lastSnapshot = nextSnapshot;
+  runtimeLogStreamState.set(key, state);
+
+  if (!appendChunks.length) return;
+  const payload = `${appendChunks
+    .map((chunk) => String(chunk || '').trimEnd())
+    .filter(Boolean)
+    .join('\n\n')}\n`;
+  await appendLatestRuntimeLog(projectId, environment, payload, normalizedAttempt);
 }
 
 async function fetchPodLogs(projectId, environment, lines = 10) {
@@ -1082,18 +1635,8 @@ async function fetchPodLogs(projectId, environment, lines = 10) {
   const namespace = `vibes-${environment}`;
   const appName = `vibes-app-${projectId}`;
   try {
-    const { stdout } = await exec('sh', [
-      '-lc',
-      `kubectl -n ${namespace} get pods -l app=${appName} -o json`
-    ]);
-    const data = JSON.parse(stdout || '{}');
-    const pods = Array.isArray(data.items) ? data.items : [];
+    const pods = sortPodsNewestFirst(await fetchPodsForApp(projectId, environment));
     if (!pods.length) return '';
-    pods.sort((a, b) => {
-      const aTime = new Date(a.status?.startTime || a.metadata?.creationTimestamp || 0).getTime();
-      const bTime = new Date(b.status?.startTime || b.metadata?.creationTimestamp || 0).getTime();
-      return bTime - aTime;
-    });
     const podName = pods[0]?.metadata?.name;
     if (!podName) return '';
     const { stdout: logOut, stderr: logErr } = await exec('sh', [
@@ -1118,15 +1661,207 @@ async function fetchPodLogs(projectId, environment, lines = 10) {
   }
 }
 
+async function captureRuntimeFailureEvidence(projectId, environment, attemptId = null) {
+  const normalizedAttempt = attemptId || null;
+  try {
+    for (let i = 0; i < 3; i += 1) {
+      await captureLatestRuntimeLog(projectId, environment, normalizedAttempt);
+      if (i < 2) {
+        await new Promise((resolve) => setTimeout(resolve, 400));
+      }
+    }
+    if (INCLUDE_RUNTIME_FAILURE_BOUNDARY_LOGS) {
+      const podLogs = await fetchPodLogs(projectId, environment, Math.min(HEALTHCHECK_LOG_LINES, 400));
+      if (podLogs) {
+        await appendLatestRuntimeLog(
+          projectId,
+          environment,
+          `[system] Runtime logs captured at failure boundary:\n${podLogs}\n`,
+          normalizedAttempt
+        );
+      }
+    }
+  } catch (err) {
+    console.warn('Failed to capture runtime failure evidence', err?.message || err);
+  }
+}
+
+async function detectRuntimeRestarts(projectId, environment) {
+  if (isLocalPlatform()) return null;
+  const namespace = `vibes-${environment}`;
+  const appName = `vibes-app-${projectId}`;
+  try {
+    const { stdout } = await exec('sh', ['-lc', `kubectl -n ${namespace} get pods -l app=${appName} -o json`]);
+    const data = JSON.parse(stdout || '{}');
+    const pods = Array.isArray(data.items) ? data.items : [];
+    if (!pods.length) return null;
+    const entries = [];
+    for (const pod of pods) {
+      const podName = pod?.metadata?.name || 'unknown';
+      const statuses = [
+        ...(pod?.status?.initContainerStatuses || []),
+        ...(pod?.status?.containerStatuses || [])
+      ];
+      for (const status of statuses) {
+        const restartCount = Number(status?.restartCount || 0);
+        if (restartCount <= 0) continue;
+        const reason =
+          status?.state?.waiting?.reason ||
+          status?.state?.terminated?.reason ||
+          status?.lastState?.terminated?.reason ||
+          '';
+        const message =
+          status?.state?.waiting?.message ||
+          status?.state?.terminated?.message ||
+          status?.lastState?.terminated?.message ||
+          '';
+        entries.push({
+          podName,
+          containerName: status?.name || 'container',
+          restartCount,
+          reason,
+          message
+        });
+      }
+    }
+    if (!entries.length) return null;
+    const totalRestarts = entries.reduce((sum, entry) => sum + Number(entry.restartCount || 0), 0);
+    const summary = entries
+      .slice(0, 12)
+      .map((entry) => {
+        const reason = entry.reason ? ` (${entry.reason})` : '';
+        const message = entry.message ? ` ${String(entry.message).slice(0, 180)}` : '';
+        return `- ${entry.podName}/${entry.containerName}: restarts ${entry.restartCount}${reason}${message}`;
+      })
+      .join('\n');
+    return { totalRestarts, summary, entries };
+  } catch (err) {
+    console.warn(`Restart detection failed for ${appName}`, err?.message || err);
+    return null;
+  }
+}
+
+async function fetchRecentPodEvents(namespace, podName, limit = 8) {
+  if (!podName) return [];
+  try {
+    const { stdout } = await exec('sh', [
+      '-lc',
+      `kubectl -n ${namespace} get events --field-selector involvedObject.kind=Pod,involvedObject.name=${podName} -o json`
+    ]);
+    const data = JSON.parse(stdout || '{}');
+    const items = Array.isArray(data.items) ? data.items : [];
+    return items
+      .map((item) => ({
+        reason: item?.reason || '',
+        message: item?.message || '',
+        type: item?.type || '',
+        time:
+          item?.lastTimestamp ||
+          item?.eventTime ||
+          item?.firstTimestamp ||
+          item?.metadata?.creationTimestamp ||
+          ''
+      }))
+      .sort((a, b) => new Date(b.time || 0).getTime() - new Date(a.time || 0).getTime())
+      .slice(0, Math.max(1, Math.min(Number(limit) || 8, 20)));
+  } catch {
+    return [];
+  }
+}
+
+function classifyFailureFromEvents(events = []) {
+  for (const event of events) {
+    const reason = String(event?.reason || '');
+    const detail = String(event?.message || '');
+    const classification = classifyRuntimeFailure({ reason, detail });
+    if (classification.category !== 'unknown') return classification;
+  }
+  return null;
+}
+
+async function detectLikelyRuntimeFailure(projectId, environment) {
+  if (isLocalPlatform()) return null;
+  try {
+    const namespace = `vibes-${environment}`;
+    const pods = sortPodsNewestFirst(await fetchPodsForApp(projectId, environment));
+    if (!pods.length) {
+      return {
+        podName: '',
+        reason: 'PodMissing',
+        exitCode: null,
+        classification: {
+          category: 'platform_disruption',
+          label: 'Cluster disruption',
+          reason: 'PodMissing'
+        },
+        events: []
+      };
+    }
+    const pod = pods[0];
+    const podName = pod?.metadata?.name || '';
+    const podReason = pod?.status?.reason || '';
+    const podMessage = pod?.status?.message || '';
+    const statuses = [
+      ...(pod?.status?.initContainerStatuses || []),
+      ...(pod?.status?.containerStatuses || [])
+    ];
+    const firstState = statuses.map((status) => describeContainerState(status, podName)).find(Boolean) || null;
+    let classification = classifyRuntimeFailure({
+      reason: firstState?.reason || podReason,
+      detail: firstState?.detail || podMessage,
+      exitCode: firstState?.exitCode ?? null,
+      podReason,
+      podMessage
+    });
+    const events = await fetchRecentPodEvents(namespace, podName);
+    const eventClassification = classifyFailureFromEvents(events);
+    if (
+      eventClassification &&
+      (classification.category === 'unknown' || eventClassification.category === 'platform_disruption')
+    ) {
+      classification = eventClassification;
+    }
+    return {
+      podName,
+      reason: firstState?.reason || podReason || '',
+      exitCode: firstState?.exitCode ?? null,
+      classification,
+      events
+    };
+  } catch {
+    return null;
+  }
+}
+
 async function buildHealthcheckError(projectId, environment, host) {
   const podLogs = await fetchPodLogs(projectId, environment, HEALTHCHECK_LOG_LINES);
-  const detail = podLogs
-    ? `Pod logs (last ${HEALTHCHECK_LOG_LINES} lines, latest + previous if available):\n${podLogs}`
-    : 'Pod logs unavailable.';
+  const failure = await detectLikelyRuntimeFailure(projectId, environment);
+  const classificationLine = formatFailureClassification(failure?.classification || null);
+  const eventsText = Array.isArray(failure?.events) && failure.events.length
+    ? `Recent pod events:\n${failure.events
+        .map((event) => `- ${event.type || 'Normal'} ${event.reason || ''}: ${String(event.message || '').slice(0, 240)}`)
+        .join('\n')}`
+    : '';
+  const podSummary = failure?.podName
+    ? `Pod status: ${failure.podName}${failure.reason ? ` reason=${failure.reason}` : ''}${
+        Number.isFinite(failure.exitCode) ? ` exit=${failure.exitCode}` : ''
+      }`
+    : '';
+  const detail = [
+    classificationLine,
+    podSummary,
+    eventsText,
+    podLogs
+      ? `Pod logs (last ${HEALTHCHECK_LOG_LINES} lines, latest + previous if available):\n${podLogs}`
+      : 'Pod logs unavailable.'
+  ]
+    .filter(Boolean)
+    .join('\n\n');
   const err = new Error(`Health check failed for ${host}`);
   err.code = 'healthcheck_failed';
   err.detail = detail;
   err.podLogs = podLogs;
+  err.classification = failure?.classification || null;
   err.host = host;
   err.environment = environment;
   err.projectId = projectId;
@@ -1135,6 +1870,7 @@ async function buildHealthcheckError(projectId, environment, host) {
 
 async function resumeDeployment(projectId, environment, envPath) {
   if (isLocalPlatform()) return false;
+  if (usesDevPodRuntime(environment)) return false;
   const namespace = `vibes-${environment}`;
   const appName = `vibes-app-${projectId}`;
   const rdsCaPath = process.env.RDS_CA_PATH || '/etc/ssl/certs/rds-ca.pem';
@@ -1163,6 +1899,7 @@ async function resumeDeployment(projectId, environment, envPath) {
 
 async function shouldFastResume(projectId, environment, commitHash) {
   if (environment !== 'development') return false;
+  if (usesDevPodRuntime(environment)) return false;
   if (!commitHash) return false;
   if (isLocalPlatform()) return false;
   const envRes = await pool.query(
@@ -1243,17 +1980,26 @@ async function fastResumeEnvironment(projectId, environment, commitHash, buildId
   const appName = `vibes-app-${projectId}`;
   const namespace = `vibes-${environment}`;
   const internalHost = `${appName}.${namespace}.svc.cluster.local`;
-  const healthHost =
-    PLATFORM_ENV === 'local' || environment === 'production' ? host : internalHost;
+  const healthHost = deploymentHealthHost(environment, host, internalHost);
+  const healthTimeoutMs = healthTimeoutForHost(healthHost);
   const appPort = Number(envVars.PORT || process.env.PORT || 3000);
   await ensureBuildNotCancelled(buildId);
-  const health = await waitForHealth(projectId, environment, healthHost, appPort, buildId);
+  const health = await waitForHealth(projectId, environment, healthHost, appPort, buildId, {
+    timeoutMs: healthTimeoutMs
+  });
   if (!health.ok) {
     if (health.fastFail) {
-      const detail = [health.fastFail.message, health.fastFail.detail].filter(Boolean).join('\n');
+      const detail = [
+        formatFailureClassification(health.fastFail.classification || null),
+        health.fastFail.message,
+        health.fastFail.detail
+      ]
+        .filter(Boolean)
+        .join('\n');
       const err = new Error(`Deploy failed early: ${health.fastFail.reason || 'pod_error'}`);
       err.code = 'deploy_failed_fast';
       err.detail = detail;
+      err.classification = health.fastFail.classification || null;
       err.host = host;
       throw err;
     }
@@ -1673,8 +2419,8 @@ async function deployEnvironment(projectId, environment, commitHash, buildId = n
   const appName = `vibes-app-${projectId}`;
   const namespace = `vibes-${environment}`;
   const internalHost = `${appName}.${namespace}.svc.cluster.local`;
-  const healthHost =
-    PLATFORM_ENV === 'local' || environment === 'production' ? host : internalHost;
+  const healthHost = deploymentHealthHost(environment, host, internalHost);
+  const healthTimeoutMs = healthTimeoutForHost(healthHost);
   const { repoPath, tempDir: repoTemp } = await loadRepoFromSnapshot(projectId);
   if (commitHash) {
     await runGit(['checkout', commitHash], repoPath);
@@ -1685,6 +2431,10 @@ async function deployEnvironment(projectId, environment, commitHash, buildId = n
   if (!deployTag) {
     snapshotHash = (await hashFile(snapshotPath)).slice(0, 12);
     deployTag = snapshotHash;
+  }
+  if (buildId) {
+    const suffix = String(buildId).replace(/[^a-zA-Z0-9]+/g, '').slice(0, 12);
+    if (suffix) deployTag = `${deployTag}-${suffix}`;
   }
   const env = {
     ...process.env,
@@ -1755,8 +2505,31 @@ async function deployEnvironment(projectId, environment, commitHash, buildId = n
     await fs.rm(repoTemp, { recursive: true, force: true });
   }
   const appPort = Number(envVars.PORT || process.env.PORT || 3000);
-  const health = await waitForHealth(projectId, environment, healthHost, appPort, buildId);
+  if (buildId) {
+    await appendBuildLog(
+      buildId,
+      `\n[system] Waiting for health check on ${healthcheckUrl(environment, healthHost)} (timeout ${healthTimeoutMs}ms)\n`
+    );
+  }
+  const health = await waitForHealth(projectId, environment, healthHost, appPort, buildId, {
+    timeoutMs: healthTimeoutMs
+  });
   if (!health.ok) {
+    if (health.fastFail) {
+      const baseDetail = [
+        formatFailureClassification(health.fastFail.classification || null),
+        health.fastFail.message,
+        health.fastFail.detail
+      ]
+        .filter(Boolean)
+        .join('\n');
+      const err = new Error(`Deploy failed early: ${health.fastFail.reason || 'pod_error'}`);
+      err.code = 'deploy_failed_fast';
+      err.detail = baseDetail;
+      err.classification = health.fastFail.classification || null;
+      err.host = host;
+      throw err;
+    }
     const err = await buildHealthcheckError(projectId, environment, host);
     if (health.crashloop) {
       const detail = `CrashLoopBackOff detected (${health.crashloop.restartCount} restarts) on pod ${health.crashloop.podName || 'unknown'}.`;
@@ -1976,30 +2749,133 @@ function extractCodexThreadId(raw) {
   return '';
 }
 
+function codexWrapperMode() {
+  const mode = String(process.env.CODEX_WRAPPER_MODE || 'lean').trim().toLowerCase();
+  return mode === 'strict' ? 'strict' : 'lean';
+}
+
+function buildCodexPrompt(prompt, mode = codexWrapperMode()) {
+  const strictWrapper = [
+    'You are modifying this repository directly.',
+    'Current branch: ai-task (do not change this).',
+    '',
+    'TASK:',
+    prompt,
+    '',
+    'MISSION:',
+    'Ship working code now. Prioritize reliability and user-visible progress over perfect completeness.',
+    '',
+    'HARD REQUIREMENTS (cannot be violated):',
+    '1) The app must remain deployable and startable after changes.',
+    '2) If uncertain, choose the safest working implementation and continue.',
+    '3) Do not leave partially broken code paths.',
+    '4) Do not output only advice; make concrete code changes.',
+    '',
+    'PLATFORM CONTRACT:',
+    '- Runtime is always live-server/containerized (not local-dev assumptions).',
+    '- Dockerfile present => Dockerfile is source of truth.',
+    '- No Dockerfile => fallback assumptions:',
+    '  - Node runtime',
+    '  - START_COMMAND if provided; otherwise npm start',
+    '- App must bind 0.0.0.0:$PORT (default 3000 if unset).',
+    '- Health check endpoint is fixed at `/` (root path) and must return success (2xx/3xx).',
+    '- Do not assume custom health check paths unless explicitly provided by platform in the future.',
+    '- Do not run dependency install or build/compile steps during runtime startup; startup should only launch the app.',
+    '- DATABASE_URL is PostgreSQL.',
+    '- If Prisma is used in development: RUN_MIGRATIONS=true must be startup-idempotent.',
+    '- In development, do not crash startup on Prisma P3005 (non-empty schema); warn and continue or use a safe fallback.',
+    '',
+    'STACK-AGNOSTIC BEHAVIOR:',
+    '- Preserve existing stack unless user explicitly asks to change it.',
+    '- Non-Node apps are valid when Dockerfile defines runtime.',
+    '- Never force framework migrations unless required.',
+    '',
+    'NON-TECHNICAL CUSTOMER DEFAULT:',
+    '- Infer intent from outcomes, not technical wording.',
+    '- Deliver visible product progress each task.',
+    '- If request is broad, ship highest-value vertical slice that runs.',
+    '',
+    'STRICT UX LANGUAGE POLICY:',
+    '- Never expose internal IDs, slugs, UUIDs, commit hashes, table names, env var names, or infra terms in customer-facing UI.',
+    '- Never use implementation technology names as user-facing labels.',
+    '- Use plain-language copy for end users.',
+    '- Technical details belong in logs/admin/debug only.',
+    '',
+    'IMPLEMENTATION PROTOCOL (follow in order):',
+    'A) Read current code paths affected by the task.',
+    'B) Implement end-to-end changes (UI/API/data/config) needed for one working slice.',
+    'C) Run available validation/startup checks.',
+    'D) Fix issues found before finalizing.',
+    'E) Ensure at least one user-visible improvement is working.',
+    '',
+    'QUALITY GATE (must pass before final response):',
+    '- Startup reliability preserved.',
+    '- Primary changed flow works.',
+    '- UX leak check passed (no technical/internal wording in customer UI).',
+    '- Any required env vars/config documented clearly.',
+    '',
+    'RESPONSE FORMAT (plain text, no markdown fences):',
+    '1) Progress made toward customer goal',
+    '2) What now works',
+    '3) Required config/env (if any)',
+    '4) Remaining gaps/tradeoffs',
+    '5) Verification performed',
+    '6) Startup status: PASS or FAIL'
+  ].join('\n');
+
+  if (mode === 'strict') return strictWrapper;
+
+  return [
+    'You are modifying this repository directly.',
+    'Current branch: ai-task (do not change this).',
+    '',
+    'TASK:',
+    prompt,
+    '',
+    'MISSION:',
+    'Implement the request with concrete code changes that run in this repo.',
+    '',
+    'PRIORITIES:',
+    '- Prefer minimal, reliable edits that preserve existing architecture.',
+    '- Keep deploy/startup healthy.',
+    '- If uncertain, choose the safest working implementation and continue.',
+    '- Make tangible user-visible progress.',
+    '',
+    'PLATFORM GUARDRAILS:',
+    '- Container/live-server runtime assumptions.',
+    '- Bind 0.0.0.0:$PORT (default 3000).',
+    '- Health endpoint `/` must return 2xx/3xx.',
+    '- Do not run dependency install or build/compile steps during runtime startup; startup should only launch the app.',
+    '- Use DATABASE_URL for Postgres when needed.',
+    '- If Prisma is present in development and RUN_MIGRATIONS is not false, migration startup must be idempotent.',
+    '- Do not crash startup on Prisma P3005 in development; handle it as a warning/fallback.',
+    '',
+    'EXECUTION:',
+    '1) Read affected files first.',
+    '2) Implement an end-to-end working slice.',
+    '3) Run available checks and fix issues.',
+    '',
+    'RESPONSE FORMAT (plain text):',
+    '1) What changed',
+    '2) What now works',
+    '3) Required config/env',
+    '4) Remaining gaps',
+    '5) Verification performed'
+  ].join('\n');
+}
+
 async function runCodex(prompt, cwd, threadId = '', apiKey = '') {
   const trimmedKey = (apiKey || '').trim();
   if (!trimmedKey) {
     await ensureCodexAuth();
   }
-  const wrappedPrompt = [
-    'You are modifying this repository directly.',
-    `Current branch: ai-task (do not change this)`,
-    'Task:',
-    prompt,
-    '',
-    'Rules:',
-    '- Make the minimal high-quality code changes needed.',
-    '- Keep existing architecture and style.',
-    '- Update related tests/docs if required.',
-    '- Do not print markdown fences.',
-    '- Make the file edits directly in the working tree.',
-    '',
-    'At the end, provide a concise summary of changes and key files touched.'
-  ].join('\n');
+  const wrapperMode = codexWrapperMode();
+  const wrappedPrompt = buildCodexPrompt(prompt, wrapperMode);
   const responseFilePath = path.join(cwd, '.codex-last-message.txt');
   const template = process.env.CODEX_COMMAND_TEMPLATE;
   const resumeTemplate = process.env.CODEX_COMMAND_TEMPLATE_RESUME;
   console.log('Codex config:', {
+    wrapperMode,
     hasTemplate: Boolean(template),
     hasResumeTemplate: Boolean(resumeTemplate),
     codexCommand: process.env.CODEX_COMMAND || '',
@@ -2416,6 +3292,109 @@ async function reconcileScaleToZero() {
   }
 }
 
+let devCrashHardRunning = false;
+
+async function reconcileDevelopmentCrashHard() {
+  if (devCrashHardRunning) return;
+  if (!DEV_CRASH_HARD_ENABLED) return;
+  devCrashHardRunning = true;
+  try {
+    const result = await pool.query(
+      `select e.project_id, e.deployed_commit, e.latest_runtime_log_attempt_id::text as latest_runtime_log_attempt_id
+       from environments e
+       where e.build_status = 'live'
+         and e.name = 'development'`
+    );
+    for (const row of result.rows) {
+      const restartInfo = await detectRuntimeRestarts(row.project_id, 'development');
+      if (!restartInfo) continue;
+      const podLogs = await fetchPodLogs(row.project_id, 'development', HEALTHCHECK_LOG_LINES);
+      const detail = [
+        `Development runtime restart detected. Total restarts: ${restartInfo.totalRestarts}.`,
+        restartInfo.summary ? `Restart summary:\n${restartInfo.summary}` : '',
+        podLogs
+          ? `Pod logs (last ${HEALTHCHECK_LOG_LINES} lines, latest + previous if available):\n${podLogs}`
+          : 'Pod logs unavailable.'
+      ]
+        .filter(Boolean)
+        .join('\n\n');
+      await appendLatestRuntimeLog(
+        row.project_id,
+        'development',
+        `[system] ${detail}\n`,
+        row.latest_runtime_log_attempt_id || null
+      );
+      const outcome = await scaleDeploymentToZero(row.project_id, 'development');
+      if (outcome === 'failed') {
+        console.warn(`Development crash-hard: failed to scale deployment for project ${row.project_id}`);
+        continue;
+      }
+      let buildId = null;
+      try {
+        buildId = await createBuild(row.project_id, 'development', 'failed', row.deployed_commit || null);
+        await finalizeBuild(buildId, 'failed', detail, row.deployed_commit || null);
+      } catch (err) {
+        console.warn(`Development crash-hard: failed to persist build for ${row.project_id}`, err?.message || err);
+      }
+      await updateBuildStatus(row.project_id, 'development', 'failed', row.deployed_commit || null);
+      await sendAlert(
+        'dev_restart_hard_fail',
+        'Development runtime restarted and was stopped',
+        {
+          project_id: row.project_id,
+          environment: 'development',
+          commit: row.deployed_commit || '',
+          summary: truncateText(detail)
+        },
+        `${row.project_id}:development`
+      );
+      if (buildId) {
+        await sendDeployWebhook(
+          row.project_id,
+          'development',
+          'failed',
+          row.deployed_commit || null,
+          buildId,
+          detail
+        );
+      }
+    }
+  } catch (err) {
+    console.error('Development crash-hard reconcile failed', err);
+  } finally {
+    devCrashHardRunning = false;
+  }
+}
+
+let runtimeLogCaptureRunning = false;
+
+async function reconcileLatestRuntimeLogs() {
+  if (runtimeLogCaptureRunning) return;
+  runtimeLogCaptureRunning = true;
+  try {
+    const result = await pool.query(
+      `select project_id, name, latest_runtime_log_attempt_id::text as latest_runtime_log_attempt_id
+       from environments
+       where build_status in ('building', 'live', 'canceling')`
+    );
+    const activeKeys = new Set();
+    for (const row of result.rows) {
+      const projectId = row.project_id;
+      const environment = row.name;
+      activeKeys.add(runtimeLogKey(projectId, environment));
+      await captureLatestRuntimeLog(projectId, environment, row.latest_runtime_log_attempt_id || null);
+    }
+    for (const key of runtimeLogStreamState.keys()) {
+      if (!activeKeys.has(key)) runtimeLogStreamState.delete(key);
+    }
+  } catch (err) {
+    if (runtimeLogStorageUnsupported(err)) return;
+    console.warn('Latest runtime log reconcile failed', err?.message || err);
+  } finally {
+    runtimeLogCaptureRunning = false;
+  }
+}
+
 let runtimeQuotaRunning = false;
 
 function quotaEnvironments() {
@@ -2560,6 +3539,7 @@ async function processTask(taskId) {
   let buildId = null;
   try {
     buildId = await createBuild(task.project_id, task.environment, 'building', null);
+    await beginLatestRuntimeLogAttempt(task.project_id, task.environment, buildId);
     await updateBuildStatus(task.project_id, task.environment, 'building', null);
     const log = await deployEnvironment(task.project_id, task.environment, commitHash, buildId);
     await finalizeBuild(buildId, 'live', log, commitHash);
@@ -2581,6 +3561,18 @@ async function processTask(taskId) {
       : (err?.code === 'healthcheck_failed' || err?.code === 'deploy_failed_fast')
           ? `${err.message || 'Deploy failed'}\n\n${err.detail || ''}`.trim()
           : buildLogFromError(err);
+    if (!cancelled) {
+      await captureRuntimeFailureEvidence(task.project_id, task.environment, buildId || null);
+    }
+    const runtimeFailureDetail = cancelled
+      ? '[system] Build cancelled by user.'
+      : `[system] Deploy failed: ${buildLog}`;
+    await appendLatestRuntimeLog(
+      task.project_id,
+      task.environment,
+      `${runtimeFailureDetail}\n`,
+      buildId || null
+    );
     if (buildId) {
       await finalizeBuild(buildId, cancelled ? 'cancelled' : 'failed', buildLog, commitHash);
     }
@@ -2711,6 +3703,7 @@ async function processEmptyDb(projectId, environment) {
 async function processDeployCommit(projectId, environment, commitHash) {
   await enforcePlanUsageLimits(projectId, environment);
   const buildId = await createBuild(projectId, environment, 'building', commitHash || null);
+  await beginLatestRuntimeLogAttempt(projectId, environment, buildId);
   await updateBuildStatus(projectId, environment, 'building', commitHash || null);
   try {
     await ensureBuildNotCancelled(buildId);
@@ -2727,11 +3720,13 @@ async function processDeployCommit(projectId, environment, commitHash) {
   } catch (err) {
     if (err?.code === 'build_cancelled') {
       await appendBuildLog(buildId, '\n\n[system] Build cancelled by user.\n');
+      await appendLatestRuntimeLog(projectId, environment, '[system] Build cancelled by user.\n', buildId);
       await finalizeBuild(buildId, 'cancelled', null, commitHash || null);
       await updateBuildStatus(projectId, environment, 'cancelled', commitHash || null);
       await scaleDeploymentToZero(projectId, environment);
       return;
     }
+    await captureRuntimeFailureEvidence(projectId, environment, buildId);
     if (err?.code === 'healthcheck_failed') {
       const summary = truncateText(err.detail || err.message || '');
       await sendAlert(
@@ -2746,12 +3741,20 @@ async function processDeployCommit(projectId, environment, commitHash) {
         },
         `${projectId}:${environment}`
       );
+    }
+    if (err?.code === 'healthcheck_failed' || err?.code === 'deploy_failed_fast') {
       await scaleDeploymentToZero(projectId, environment);
     }
     const buildLog =
       err?.code === 'healthcheck_failed' || err?.code === 'deploy_failed_fast'
         ? `${err.message}\n\n${err.detail || ''}`.trim()
         : buildLogFromError(err);
+    await appendLatestRuntimeLog(
+      projectId,
+      environment,
+      `[system] Deploy failed: ${buildLog}\n`,
+      buildId
+    );
     if (err?.code === 'healthcheck_failed') {
       await appendBuildLog(buildId, `\n\n[system] ${buildLog}\n`);
     }
@@ -2883,6 +3886,19 @@ if (SCALE_TO_ZERO_INTERVAL_MS > 0) {
   setInterval(() => {
     reconcileScaleToZero();
   }, SCALE_TO_ZERO_INTERVAL_MS);
+}
+
+if (DEV_CRASH_HARD_ENABLED && DEV_CRASH_HARD_INTERVAL_MS > 0) {
+  setInterval(() => {
+    reconcileDevelopmentCrashHard();
+  }, DEV_CRASH_HARD_INTERVAL_MS);
+}
+
+if (RUNTIME_LOG_CAPTURE_INTERVAL_MS > 0) {
+  reconcileLatestRuntimeLogs();
+  setInterval(() => {
+    reconcileLatestRuntimeLogs();
+  }, RUNTIME_LOG_CAPTURE_INTERVAL_MS);
 }
 
 if (RUNTIME_QUOTA_INTERVAL_MS > 0) {

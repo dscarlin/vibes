@@ -161,7 +161,32 @@ const state = {
   iosSetupOpen: false,
   iosSetupStep: 1,
   iosSetupMessage: '',
-  taskLogs: {},
+  appLogsVisible: false,
+  appLogsByEnv: {
+    development: '',
+    testing: '',
+    production: ''
+  },
+  appLogSnapshotByEnv: {
+    development: '',
+    testing: '',
+    production: ''
+  },
+  appLogLoading: {
+    development: false,
+    testing: false,
+    production: false
+  },
+  appLogError: {
+    development: '',
+    testing: '',
+    production: ''
+  },
+  appLogFrozenByEnv: {
+    development: false,
+    testing: false,
+    production: false
+  },
   taskDetails: {},
   sessionDetails: {},
   taskPromptDraft: '',
@@ -184,6 +209,14 @@ let promptResolver = null;
 let localRunTailTimer = null;
 let localRunWaitTimer = null;
 let buildLogPoller = null;
+let appLogPoller = null;
+let appLogTypewriter = null;
+let appLogLineQueue = [];
+let appLogQueueEnv = '';
+let appLogScrollAnchor = null;
+const APP_LOG_POLL_INTERVAL_MS = 2000;
+const APP_LOG_FETCH_LINES = 2000;
+const APP_LOG_TYPE_INTERVAL_MS = 40;
 
 function scheduleHeaderProgressRefresh(delay = 3100) {
   if (headerProgressTimer) {
@@ -664,9 +697,27 @@ function storeProject(userId, projectId) {
   localStorage.setItem(key, projectId);
 }
 
+function captureAppLogScrollAnchor() {
+  const pre = document.querySelector('pre[data-app-log-stream]');
+  if (!pre) {
+    appLogScrollAnchor = null;
+    return;
+  }
+  const distanceFromBottom = Math.max(0, pre.scrollHeight - pre.clientHeight - pre.scrollTop);
+  appLogScrollAnchor = { distanceFromBottom };
+}
+
+function restoreAppLogScrollAnchor() {
+  const pre = document.querySelector('pre[data-app-log-stream]');
+  if (!pre || !appLogScrollAnchor) return;
+  pre.scrollTop = Math.max(0, pre.scrollHeight - pre.clientHeight - appLogScrollAnchor.distanceFromBottom);
+}
+
 function setState(partial) {
+  captureAppLogScrollAnchor();
   Object.assign(state, partial);
   document.querySelector('app-shell')?.render();
+  restoreAppLogScrollAnchor();
 }
 
 function updateLocalRunLog(text, { append = false } = {}) {
@@ -884,9 +935,25 @@ async function loadProjects() {
       : (storedProjectId || projects[0]?.id || null);
     const storedEnv = loadStoredEnv(state.user?.id, projectId);
     if (projectId) storeProject(state.user?.id, projectId);
-    setState({ projects, projectId, environment: storedEnv || state.environment });
+    const projectChanged = Boolean(state.projectId && projectId && state.projectId !== projectId);
+    if (projectChanged) stopAppLogPolling();
+    setState({
+      projects,
+      projectId,
+      environment: storedEnv || state.environment,
+      ...(projectChanged
+        ? {
+            appLogsByEnv: blankEnvMap(''),
+            appLogSnapshotByEnv: blankEnvMap(''),
+            appLogLoading: blankEnvMap(false),
+            appLogError: blankEnvMap(''),
+            appLogFrozenByEnv: blankEnvMap(false)
+          }
+        : {})
+    });
     await loadRuntimeUsage();
     if (!projectId) {
+      stopAppLogPolling();
       setState({
         tasks: [],
         sessions: [],
@@ -902,6 +969,12 @@ async function loadProjects() {
         failedBuildLogLoading: { development: false, testing: false, production: false },
         failedBuildLogError: { development: '', testing: '', production: '' },
         failedBuildLogLines: { development: 200, testing: 200, production: 200 },
+        appLogsVisible: false,
+        appLogsByEnv: blankEnvMap(''),
+        appLogSnapshotByEnv: blankEnvMap(''),
+        appLogLoading: blankEnvMap(false),
+        appLogError: blankEnvMap(''),
+        appLogFrozenByEnv: blankEnvMap(false),
         environment: 'development',
         nerdLevel: 'beginner'
       });
@@ -1008,6 +1081,278 @@ function ensureBuildLogPolling() {
   }
 }
 
+function blankEnvMap(value = '') {
+  return {
+    development: value,
+    testing: value,
+    production: value
+  };
+}
+
+function stopAppLogTypewriter() {
+  if (appLogTypewriter) {
+    clearInterval(appLogTypewriter);
+    appLogTypewriter = null;
+  }
+  appLogLineQueue = [];
+  appLogQueueEnv = '';
+}
+
+function stopAppLogPolling() {
+  if (appLogPoller) {
+    clearInterval(appLogPoller);
+    appLogPoller = null;
+  }
+  stopAppLogTypewriter();
+}
+
+function isTerminalBuildStatus(status) {
+  return status === 'failed' || status === 'cancelled';
+}
+
+function resetAppLogStream(env, { clearLogs = false } = {}) {
+  stopAppLogTypewriter();
+  state.appLogFrozenByEnv[env] = false;
+  state.appLogSnapshotByEnv[env] = '';
+  state.appLogLoading[env] = false;
+  state.appLogError[env] = '';
+  if (clearLogs) state.appLogsByEnv[env] = '';
+}
+
+function prepareAppLogsForDeploy(env) {
+  resetAppLogStream(env, { clearLogs: true });
+  setState({
+    appLogsByEnv: { ...state.appLogsByEnv },
+    appLogSnapshotByEnv: { ...state.appLogSnapshotByEnv },
+    appLogLoading: { ...state.appLogLoading },
+    appLogError: { ...state.appLogError },
+    appLogFrozenByEnv: { ...state.appLogFrozenByEnv }
+  });
+}
+
+function shouldPollAppLogs() {
+  const env = state.environment;
+  return Boolean(
+    state.token &&
+    state.projectId &&
+    state.appLogsVisible &&
+    !state.appLogFrozenByEnv[env]
+  );
+}
+
+function splitLogLines(text) {
+  if (!text) return [];
+  return String(text)
+    .replace(/\r/g, '')
+    .split('\n');
+}
+
+function computeLogDelta(previous, current) {
+  const prev = String(previous || '').replace(/\r/g, '');
+  const next = String(current || '').replace(/\r/g, '');
+  if (!next) return { lines: [], reset: false };
+  if (!prev) return { lines: splitLogLines(next), reset: false };
+  if (prev === next) return { lines: [], reset: false };
+
+  if (next.startsWith(prev)) {
+    const deltaRaw = next.slice(prev.length).replace(/^\n/, '');
+    return { lines: splitLogLines(deltaRaw).filter((line) => line !== ''), reset: false };
+  }
+
+  const prevLines = splitLogLines(prev);
+  const nextLines = splitLogLines(next);
+  const maxOverlap = Math.min(prevLines.length, nextLines.length);
+  for (let overlap = maxOverlap; overlap > 0; overlap -= 1) {
+    let match = true;
+    for (let i = 0; i < overlap; i += 1) {
+      if (prevLines[prevLines.length - overlap + i] !== nextLines[i]) {
+        match = false;
+        break;
+      }
+    }
+    if (match) {
+      return { lines: nextLines.slice(overlap), reset: false };
+    }
+  }
+
+  return { lines: nextLines, reset: true };
+}
+
+function freezeAppLogStream(env, nextSnapshot = '') {
+  stopAppLogTypewriter();
+  const normalizedNext = String(nextSnapshot || '').replace(/\r/g, '');
+  const previousSnapshot = state.appLogSnapshotByEnv[env] || '';
+  const currentText = state.appLogsByEnv[env] || '';
+  let merged = currentText;
+  if (!merged || previousSnapshot.length > merged.length) {
+    merged = previousSnapshot;
+  }
+  if (!merged && normalizedNext) {
+    merged = normalizedNext;
+  } else if (previousSnapshot && normalizedNext) {
+    const delta = computeLogDelta(previousSnapshot, normalizedNext);
+    if (!delta.reset && delta.lines.length) {
+      merged = `${merged}\n${delta.lines.join('\n')}`;
+    }
+    // If reset=true, this is likely a new container stream; keep existing logs unchanged.
+  }
+  if (normalizedNext) {
+    state.appLogSnapshotByEnv[env] = normalizedNext;
+  }
+  state.appLogsByEnv[env] = merged || currentText || previousSnapshot || normalizedNext;
+  state.appLogLoading[env] = false;
+  state.appLogFrozenByEnv[env] = true;
+}
+
+function updateAppLogPanel({ forceScroll = false } = {}) {
+  const pre = document.querySelector('pre[data-app-log-stream]');
+  if (!pre) return;
+  const env = state.environment;
+  const text = state.appLogsByEnv[env] || '';
+  const fallback = state.appLogLoading[env]
+    ? 'Connecting to application logs...'
+    : (state.appLogError[env] || 'No application logs yet.');
+  const nextValue = text || fallback;
+  if (pre.textContent === nextValue) return;
+
+  const oldHeight = pre.scrollHeight;
+  const oldTop = pre.scrollTop;
+  const nearBottom = pre.scrollHeight - pre.clientHeight - pre.scrollTop <= 8;
+  pre.textContent = nextValue;
+  if (forceScroll || nearBottom) {
+    pre.scrollTop = pre.scrollHeight;
+    return;
+  }
+  const delta = pre.scrollHeight - oldHeight;
+  pre.scrollTop = Math.max(0, oldTop + delta);
+}
+
+function appendAppLogLines(env, lines) {
+  const chunks = (lines || []).map((line) => String(line)).filter((line) => line.length > 0);
+  if (!chunks.length) return;
+  const current = state.appLogsByEnv[env] || '';
+  const joined = chunks.join('\n');
+  state.appLogsByEnv[env] = current ? `${current}\n${joined}` : joined;
+}
+
+function appLogBatchSize() {
+  const queued = appLogLineQueue.length;
+  if (queued > 800) return 40;
+  if (queued > 400) return 20;
+  if (queued > 160) return 10;
+  if (queued > 60) return 4;
+  return 1;
+}
+
+function enqueueAppLogLines(env, lines) {
+  const chunks = (lines || []).map((line) => String(line)).filter((line) => line.length > 0);
+  if (!chunks.length) return;
+  if (appLogQueueEnv !== env) {
+    appLogQueueEnv = env;
+    appLogLineQueue = [];
+  }
+  appLogLineQueue.push(...chunks);
+  if (appLogTypewriter) return;
+  appLogTypewriter = setInterval(() => {
+    if (!state.appLogsVisible || state.environment !== env) {
+      stopAppLogTypewriter();
+      return;
+    }
+    const next = appLogLineQueue.shift();
+    if (next == null) {
+      stopAppLogTypewriter();
+      return;
+    }
+    const batch = [next];
+    const take = appLogBatchSize();
+    for (let i = 1; i < take; i += 1) {
+      const extra = appLogLineQueue.shift();
+      if (extra == null) break;
+      batch.push(extra);
+    }
+    appendAppLogLines(env, batch);
+    updateAppLogPanel();
+  }, APP_LOG_TYPE_INTERVAL_MS);
+}
+
+async function fetchApplicationLogs({ force = false, allowFrozen = false, freezeAfterFetch = false } = {}) {
+  if (!state.projectId || !state.token || !state.appLogsVisible) return;
+  const env = state.environment;
+  if (state.appLogFrozenByEnv[env] && !allowFrozen) return;
+  if (state.appLogLoading[env] && !force) return;
+  if (freezeAfterFetch) stopAppLogPolling();
+  state.appLogLoading[env] = true;
+  state.appLogError[env] = '';
+  updateAppLogPanel();
+  try {
+    const includePrevious = ['building', 'canceling', 'failed'].includes(state.buildStatus[env]);
+    const previousOnly = Boolean(freezeAfterFetch);
+    const data = await api(
+      `/projects/${state.projectId}/runtime-logs?environment=${env}&lines=${APP_LOG_FETCH_LINES}${includePrevious ? '&includePrevious=true' : ''}${previousOnly ? '&previousOnly=true' : ''}`,
+      { timeoutMs: 15000 }
+    );
+    const nextSnapshot = String(data?.logs || '').replace(/\r/g, '');
+    const previousSnapshot = state.appLogSnapshotByEnv[env] || '';
+    if (state.appLogFrozenByEnv[env] && !allowFrozen) return;
+    if (freezeAfterFetch) {
+      freezeAppLogStream(env, nextSnapshot);
+      updateAppLogPanel({ forceScroll: true });
+      stopAppLogPolling();
+      return;
+    }
+    state.appLogSnapshotByEnv[env] = nextSnapshot;
+    if (!previousSnapshot) {
+      state.appLogsByEnv[env] = nextSnapshot;
+      updateAppLogPanel({ forceScroll: true });
+    } else {
+      const delta = computeLogDelta(previousSnapshot, nextSnapshot);
+      const status = state.buildStatus[env];
+      if (delta.reset && ['canceling', 'failed'].includes(status)) {
+        // Preserve prior logs only once a build has reached terminal/error states.
+        // During active builds, a reset often means the new pod/container stream started.
+        freezeAppLogStream(env, previousSnapshot);
+        updateAppLogPanel();
+        stopAppLogPolling();
+        return;
+      }
+      if (delta.reset) {
+        enqueueAppLogLines(env, ['--- log stream reset ---', ...delta.lines]);
+      } else {
+        enqueueAppLogLines(env, delta.lines);
+      }
+    }
+  } catch (err) {
+    state.appLogError[env] = err?.message || 'Failed to load application logs.';
+    if (freezeAfterFetch) {
+      freezeAppLogStream(env, state.appLogSnapshotByEnv[env] || '');
+      stopAppLogPolling();
+    }
+    updateAppLogPanel();
+  } finally {
+    state.appLogLoading[env] = false;
+  }
+}
+
+function startAppLogPolling() {
+  if (appLogPoller || !shouldPollAppLogs()) return;
+  fetchApplicationLogs({ force: true });
+  appLogPoller = setInterval(() => {
+    if (!shouldPollAppLogs()) {
+      stopAppLogPolling();
+      return;
+    }
+    fetchApplicationLogs();
+  }, APP_LOG_POLL_INTERVAL_MS);
+}
+
+function ensureAppLogPolling() {
+  if (shouldPollAppLogs()) {
+    startAppLogPolling();
+    return;
+  }
+  stopAppLogPolling();
+}
+
 async function loadTasks(projectId) {
   const tasks = await api(`/projects/${projectId}/tasks`);
   setState({ tasks });
@@ -1043,41 +1388,12 @@ async function loadLatestBuild(projectId, environment, options = {}) {
   });
   if (environment === state.environment) {
     ensureBuildLogPolling();
-  }
-}
-
-async function loadFailedBuildLog(projectId, environment, { force = false, lines } = {}) {
-  if (!projectId) return;
-  if (!force && state.failedBuildLogVisible[environment] && state.failedBuildLog[environment]) return;
-  const nextLines = Math.max(1, Math.min(Number(lines || state.failedBuildLogLines[environment] || 200), 2000));
-  state.failedBuildLogLines[environment] = nextLines;
-  state.failedBuildLogLoading[environment] = true;
-  state.failedBuildLogError[environment] = '';
-  setState({
-    failedBuildLogLoading: { ...state.failedBuildLogLoading },
-    failedBuildLogError: { ...state.failedBuildLogError },
-    failedBuildLogLines: { ...state.failedBuildLogLines }
-  });
-  try {
-    const data = await api(
-      `/projects/${projectId}/builds/log?environment=${environment}&status=failed&lines=${nextLines}`
-    );
-    state.failedBuildLog[environment] = data;
-    state.failedBuildLogVisible[environment] = true;
-    setState({
-      failedBuildLog: { ...state.failedBuildLog },
-      failedBuildLogVisible: { ...state.failedBuildLogVisible }
-    });
-  } catch (err) {
-    state.failedBuildLogError[environment] = err?.message || 'Failed to load build log.';
-    setState({
-      failedBuildLogError: { ...state.failedBuildLogError }
-    });
-  } finally {
-    state.failedBuildLogLoading[environment] = false;
-    setState({
-      failedBuildLogLoading: { ...state.failedBuildLogLoading }
-    });
+    if (
+      state.appLogsVisible &&
+      isTerminalBuildStatus(nextStatus)
+    ) {
+      fetchApplicationLogs({ force: true, allowFrozen: true, freezeAfterFetch: true });
+    }
   }
 }
 
@@ -1094,33 +1410,6 @@ async function loadLastSuccessBuilds(projectId) {
   } catch {
     // keep existing state; no UI error for this optional data
   }
-}
-
-async function fetchRuntimeLogs(id, lines) {
-  if (!id) return;
-  const current = state.taskLogs[id] || {};
-  const nextLines = Math.max(1, Math.min(Number(lines || current.lines || 400), 2000));
-  state.taskLogs[id] = { ...current, loading: true, error: '', lines: nextLines };
-  setState({ taskLogs: { ...state.taskLogs } });
-  try {
-    const env = state.environment;
-    const data = await api(`/projects/${state.projectId}/runtime-logs?environment=${env}&lines=${nextLines}`);
-    state.taskLogs[id] = { ...state.taskLogs[id], loading: false, serverLog: data.logs || '', lines: nextLines };
-    setState({ taskLogs: { ...state.taskLogs } });
-  } catch (err) {
-    state.taskLogs[id] = { ...state.taskLogs[id], loading: false, error: err.message, lines: nextLines };
-    setState({ taskLogs: { ...state.taskLogs } });
-  }
-}
-
-async function openRuntimeLogs(id) {
-  if (!id) return;
-  const current = state.taskLogs[id] || { open: false };
-  if (!current.open) {
-    state.taskLogs[id] = { ...current, open: true };
-    setState({ taskLogs: { ...state.taskLogs } });
-  }
-  await fetchRuntimeLogs(id);
 }
 
 async function loadDeployWebhook(projectId) {
@@ -1195,23 +1484,6 @@ function formatDurationMs(ms) {
   const hours = Math.floor(minutes / 60);
   const mins = minutes % 60;
   return `${hours}h ${mins}m`;
-}
-
-function parseHealthcheckFailure(build) {
-  if (!build || build.status !== 'failed') return null;
-  const log = build.build_log || '';
-  if (!/health check failed/i.test(log)) return null;
-  const marker = 'Pod logs';
-  const idx = log.indexOf(marker);
-  if (idx === -1) {
-    return { message: log.trim() || 'Health check failed.', podLogs: '', raw: log };
-  }
-  const message = log.slice(0, idx).trim() || 'Health check failed.';
-  const podLogs = log
-    .slice(idx)
-    .replace(/^Pod logs[^\n]*\n?/, '')
-    .trim();
-  return { message, podLogs, raw: log };
 }
 
 function icon(name) {
@@ -1369,8 +1641,19 @@ function connectSocket(projectId) {
       }
       const nextRuntimeNotice = { ...(state.runtimeQuotaNotice || {}) };
       if (nextRuntimeNotice[payload.projectId]) delete nextRuntimeNotice[payload.projectId];
-      setState({ projects: remaining, projectId: nextProjectId, runtimeQuotaNotice: nextRuntimeNotice });
+      stopAppLogPolling();
+      setState({
+        projects: remaining,
+        projectId: nextProjectId,
+        runtimeQuotaNotice: nextRuntimeNotice,
+        appLogsByEnv: blankEnvMap(''),
+        appLogSnapshotByEnv: blankEnvMap(''),
+        appLogLoading: blankEnvMap(false),
+        appLogError: blankEnvMap(''),
+        appLogFrozenByEnv: blankEnvMap(false)
+      });
       if (!nextProjectId) {
+        stopAppLogPolling();
         setState({
           tasks: [],
           sessions: [],
@@ -1385,7 +1668,13 @@ function connectSocket(projectId) {
           failedBuildLogVisible: { development: false, testing: false, production: false },
           failedBuildLogLoading: { development: false, testing: false, production: false },
           failedBuildLogError: { development: '', testing: '', production: '' },
-          failedBuildLogLines: { development: 200, testing: 200, production: 200 }
+          failedBuildLogLines: { development: 200, testing: 200, production: 200 },
+          appLogsVisible: false,
+          appLogsByEnv: blankEnvMap(''),
+          appLogSnapshotByEnv: blankEnvMap(''),
+          appLogLoading: blankEnvMap(false),
+          appLogError: blankEnvMap(''),
+          appLogFrozenByEnv: blankEnvMap(false)
         });
       } else {
         loadTasks(nextProjectId);
@@ -1414,11 +1703,9 @@ function connectSocket(projectId) {
     socketClient.on('taskDeleted', (payload) => {
       const nextTasks = state.tasks.filter((t) => t.id !== payload.id);
       if (nextTasks.length !== state.tasks.length) {
-        delete state.taskLogs[payload.id];
         delete state.taskDetails[payload.id];
         setState({
           tasks: nextTasks,
-          taskLogs: { ...state.taskLogs },
           taskDetails: { ...state.taskDetails }
         });
       }
@@ -1444,18 +1731,16 @@ function connectSocket(projectId) {
         if (payload.refCommit) {
           state.pendingDeployCommit[env] = payload.refCommit;
         }
-        if (env === state.environment) {
-          let targetId = state.activeTaskId;
-          if (!targetId && payload.refCommit) {
-            targetId = state.tasks.find((t) => t.commit_hash === payload.refCommit)?.id || null;
-          }
-          if (!targetId) {
-            targetId = state.tasks[0]?.id || null;
-          }
-          if (targetId && !state.taskLogs[targetId]?.open) {
-            openRuntimeLogs(targetId);
-          }
+        if (env === state.environment && state.appLogsVisible) {
+          fetchApplicationLogs({ force: true });
         }
+      }
+      if (
+        env === state.environment &&
+        state.appLogsVisible &&
+        isTerminalBuildStatus(payload.status)
+      ) {
+        fetchApplicationLogs({ force: true, allowFrozen: true, freezeAfterFetch: true });
       }
       if (prevStatus === 'building' && (payload.status === 'live' || payload.status === 'failed' || payload.status === 'cancelled')) {
         state.progressVisibleUntil[env] = Date.now() + 3000;
@@ -1481,6 +1766,7 @@ function connectSocket(projectId) {
       }
       if (env === state.environment) {
         ensureBuildLogPolling();
+        ensureAppLogPolling();
       }
       const nextRuntimeNotice = { ...(state.runtimeQuotaNotice || {}) };
       const projectNotices = { ...(nextRuntimeNotice[state.projectId] || {}) };
@@ -1537,6 +1823,7 @@ class AppShell extends HTMLElement {
       this._ticker = null;
     }
     stopBuildLogPolling();
+    stopAppLogPolling();
   }
 
   refreshRelativeTimes() {
@@ -2159,22 +2446,18 @@ class AppShell extends HTMLElement {
   }
 
   renderSubmit(project) {
-    const latest = state.latestBuild[state.environment];
-    const showBuildLog = latest && ['failed', 'building', 'cancelled'].includes(latest.status);
-    const buildLogTitle = latest?.status === 'building' ? 'Live Build Log' : 'Latest Build Log';
-    const failedLog = state.failedBuildLog[state.environment];
-    const failedLogVisible = state.failedBuildLogVisible[state.environment];
-    const failedLogLoading = state.failedBuildLogLoading[state.environment];
-    const failedLogError = state.failedBuildLogError[state.environment];
-    const failedLogTruncated = Boolean(failedLog?.truncated);
-    const hasFailedLog = Boolean(failedLog?.build_log || failedLogError);
+    const env = state.environment;
     const isBeginner = state.nerdLevel === 'beginner';
-    const canCancelBuild = ['building', 'canceling'].includes(state.buildStatus[state.environment]);
+    const canCancelBuild = ['building', 'canceling'].includes(state.buildStatus[env]);
+    const appLogText = state.appLogsByEnv[env] || '';
+    const appLogError = state.appLogError[env] || '';
+    const appLogLoading = Boolean(state.appLogLoading[env]);
+    const appLogPreview = appLogText || (appLogLoading ? 'Connecting to application logs...' : (appLogError || 'No application logs yet.'));
     return `
       <div class="card">
         <div class="section-title">
           <h2>Submit Task</h2>
-          <span class="badge ${badgeClass(state.buildStatus[state.environment])}">${state.buildStatus[state.environment]}</span>
+          <span class="badge ${badgeClass(state.buildStatus[env])}">${state.buildStatus[env]}</span>
         </div>
         ${state.taskStatusMessage  ? `
           <div class="task-status">
@@ -2191,41 +2474,27 @@ class AppShell extends HTMLElement {
             <div class="status-text">${state.taskStatusMessage}</div>
           </div>
         ` : ''}
-        <p class="notice"><a class="tag view-project-link" href="${projectProtocol()}://${projectUrl(project, state.environment)}" target="_blank" rel="noreferrer">View your project</a></p>
+        <p class="notice"><a class="tag view-project-link" href="${projectProtocol()}://${projectUrl(project, env)}" target="_blank" rel="noreferrer">View your project</a></p>
         <textarea id="taskPrompt" placeholder="A good title for the feature or fix you want to make...\n\nDescribe exactly what you want to see, what you expect \nto happen when you click somewhere etc...\n\nWatch your ideas come to life!\nIn moments you will be viewing the updates${isBeginner ? '.' : '\nand reading a summary of what we have done!'}">${state.taskPromptDraft || ''}</textarea>
-        <div class="row m-top-sm">
-          <button id="submitTask">Submit</button>
-          ${canCancelBuild ? '<button class="ghost" id="cancelBuild">Stop build</button>' : ''}
+        <div class="row m-top-sm submit-controls">
+          <div class="row">
+            <button id="submitTask">Submit</button>
+            ${canCancelBuild ? '<button class="ghost" id="cancelBuild">Stop build</button>' : ''}
+          </div>
+          <label class="toggle app-log-toggle">
+            <input id="toggleAppLogs" type="checkbox" ${state.appLogsVisible ? 'checked' : ''} />
+            <span class="toggle-track"><span class="toggle-thumb"></span></span>
+            <span>Show Application Logs</span>
+          </label>
         </div>
-        ${!showBuildLog && hasFailedLog ? `
-          <div class="notice m-top-sm">
-            Last deploy failed. <button class="link-button" type="button" id="openFailedBuildLog">View log</button>
-          </div>
-        ` : ''}
-        ${!showBuildLog ? `
-          <div class="row m-top-sm">
-            <button class="ghost" id="toggleFailedBuildLog" ${failedLogLoading ? 'disabled' : ''}>
-              ${failedLogVisible ? 'Hide last failed build log' : 'View last failed build log'}
-            </button>
-            ${failedLogError ? `<span class="notice">${failedLogError}</span>` : ''}
-          </div>
-        ` : ''}
-        ${showBuildLog ? `
-          <details class="build-log" open>
-            <summary>${buildLogTitle}</summary>
-            <pre data-build-log="true">${latest.build_log || 'No build log available.'}</pre>
-            <button class="ghost" id="refreshBuildLog">Refresh Log</button>
-          </details>
-        ` : ''}
-        ${!showBuildLog && failedLogVisible ? `
-          <details class="build-log" open>
-            <summary>Last Failed Build Log</summary>
-            <pre>${failedLogLoading ? 'Loading...' : (failedLog?.build_log || 'No failed build log available.')}</pre>
-            <div class="row m-top-sm">
-              <button class="ghost" id="refreshFailedBuildLog" ${failedLogLoading ? 'disabled' : ''}>Refresh Log</button>
-              ${failedLogTruncated ? `<button class="ghost" id="expandFailedBuildLog" ${failedLogLoading ? 'disabled' : ''}>View full log (2000 lines)</button>` : ''}
+        ${state.appLogsVisible ? `
+          <div class="app-log-stream-wrap">
+            <div class="log-header">
+              <span>Application Logs <span class="meta">${appLogLoading ? 'connecting...' : 'streaming'}</span></span>
+              <button class="icon-button" id="copyAppLogs" title="Copy Application Logs" aria-label="Copy Application Logs">${icon('copy')}</button>
             </div>
-          </details>
+            <pre class="app-log-stream" data-app-log-stream="true">${escapeHtml(appLogPreview)}</pre>
+          </div>
         ` : ''}
       </div>
     `;
@@ -2351,21 +2620,14 @@ class AppShell extends HTMLElement {
   }
 
   renderTask(task, canDelete, sessionId = null) {
-    const logState = state.taskLogs[task.id] || { open: false };
-    const logLineCount = logState.lines || 400;
     const detailState = state.taskDetails[task.id] || { open: false };
     const isLive = task.commit_hash && task.commit_hash === state.deployedCommit[state.environment] && state.buildStatus[state.environment] === 'live';
     const isDeploying = task.commit_hash && task.commit_hash === state.pendingDeployCommit[state.environment] && ['building', 'canceling'].includes(state.buildStatus[state.environment]);
-    const canViewLogs = isLive || isDeploying;
     const latestBuild = state.latestBuild[state.environment];
     const buildMatchesTask = latestBuild?.ref_commit
       ? latestBuild.ref_commit === task.commit_hash
       : !task.commit_hash;
-    const healthFailure = buildMatchesTask ? parseHealthcheckFailure(latestBuild) : null;
-    const healthText = healthFailure
-      ? [healthFailure.message, healthFailure.podLogs].filter(Boolean).join('\n\n')
-      : '';
-    const projectName = state.projects.find((p) => p.id === state.projectId)?.name || 'Project';  
+    const isFailed = Boolean(buildMatchesTask && latestBuild?.status === 'failed');
     return `
       <div class="task" data-task-id="${task.id}" ${sessionId ? `data-session-id="${sessionId}"` : ''}>
         <div class="task-header">
@@ -2375,7 +2637,7 @@ class AppShell extends HTMLElement {
             <div class="badges deploy-status">
               ${isDeploying ? '<span class="badge building">deploying</span>' : ''}
                ${isLive ? '<span class="badge live">live</span>' : ''}
-              ${healthFailure && !isDeploying ? '<span class="badge failed">failed</span>' : ''}
+              ${isFailed && !isDeploying ? '<span class="badge failed">failed</span>' : ''}
             </div>
             <div class="badges status"> 
             <span class="badge ${badgeClass(task.status)}">${task.status}</span>
@@ -2394,7 +2656,6 @@ class AppShell extends HTMLElement {
               <div class="detail-item"><span class="meta">Created</span><span>${task.created_at || '—'}</span></div>
               <div class="detail-item"><span class="meta">Completed</span><span>${task.completed_at || '—'}</span></div>
                ${canDelete ? `<button class="icon-button delete-latest-task" title="Delete latest task" aria-label="Delete latest task">${icon('trash')}</button>` : ''}
-           ${canViewLogs ? `<button class="icon-button logs-button" data-scope="task" data-id="${task.id}" title="Logs" aria-label="Logs">${icon('logs')}</button>` : ''}
             </div>
             <div class="detail-block" data-field="prompt">
               <div class="detail-block-header">
@@ -2410,30 +2671,6 @@ class AppShell extends HTMLElement {
               </div>
               <pre class="expandable-pre">${task.codex_output || 'No task output yet.'}</pre>
             </div>
-            ${healthFailure ? `
-              <div class="detail-block" data-field="healthcheck">
-                <div class="detail-block-header">
-                  <span class="meta">Health check failed</span>
-                  <button class="icon-button copy-task" data-field="healthcheck" title="Copy logs" aria-label="Copy logs">${icon('copy')}</button>
-                </div>
-                <pre class="expandable-pre">${healthText || 'No logs captured.'}</pre>
-              </div>
-            ` : ''}
-          </div>
-        ` : ''}
-        ${logState.open ? `
-          <div class="log-panel">` +
-           // <div class="log-header">Task Logs</div>
-          //  <pre>${task.codex_output || 'No task output yet.'}</pre>
-          ` <div class="log-header">
-              <span>${projectName} Application Logs <span class="meta">Last ${logLineCount} lines</span></span>
-              <div class="log-actions">
-                <button class="icon-button fetch-logs" data-id="${task.id}" title="Fetch latest logs (2000 lines)" aria-label="Fetch latest logs (2000 lines)">Fetch</button>
-                <button class="icon-button copy-logs" data-id="${task.id}" title="Copy Application Logs" aria-label="Copy Application Logs">${icon('copy')}</button>
-              </div>
-            </div>
-            <pre class="expandable-pre">${logState.loading ? 'Loading...' : (logState.serverLog || logState.error || 'No server log yet.')}</pre>
-            <button class="ghost refresh-logs" data-id="${task.id}">Refresh</button>
           </div>
         ` : ''}
       </div>
@@ -2460,22 +2697,14 @@ class AppShell extends HTMLElement {
   renderSession(session, isDev) {
     const tasks = state.tasks.filter((t) => t.session_id === session.id);
     const tasksHtml = tasks.map((task) => this.renderTask(task, false, session.id)).join('') || '<p class="notice">No tasks in this session.</p>';
-    const label = session.message.length > 40 ? `${session.message.slice(0, 40)}...` : session.message;
     const isLive = session.merge_commit && session.merge_commit === state.deployedCommit[state.environment] && state.buildStatus[state.environment] === 'live';
     const isDeploying = session.merge_commit && session.merge_commit === state.pendingDeployCommit[state.environment] && ['building', 'canceling'].includes(state.buildStatus[state.environment]);
-    const canViewLogs = isLive || isDeploying;
-    const logState = state.taskLogs[session.id] || { open: false };
-    const logLineCount = logState.lines || 400;
     const detailsState = state.sessionDetails[session.id] || { open: false };
     const latestBuild = state.latestBuild[state.environment];
     const buildMatchesSession = latestBuild?.ref_commit
       ? latestBuild.ref_commit === session.merge_commit
       : false;
-    const healthFailure = buildMatchesSession ? parseHealthcheckFailure(latestBuild) : null;
-    const healthText = healthFailure
-      ? [healthFailure.message, healthFailure.podLogs].filter(Boolean).join('\n\n')
-      : '';
-    const projectName = state.projects.find((p) => p.id === state.projectId)?.name || 'Project';
+    const isFailed = Boolean(buildMatchesSession && latestBuild?.status === 'failed');
     return `
       <div class="session" data-session-id="${session.id}">
         <div class="session-header">
@@ -2484,11 +2713,10 @@ class AppShell extends HTMLElement {
             <strong>${session.message}</strong>
             ${isDeploying ? '<span class="badge building">deploying</span>' : ''}
             ${isLive ? '<span class="badge live">live</span>' : ''}
-            ${healthFailure ? '<span class="badge failed">healthcheck failed</span>' : ''}
+            ${isFailed ? '<span class="badge failed">failed</span>' : ''}
           </div>
           <div class="task-actions">
             <button class="icon-button deploy-button" data-commit="${session.merge_commit || ''}" title="View app from this saved session" aria-label="View app from this saved session">${icon('launch')}</button>
-            ${canViewLogs ? `<button class="icon-button logs-button" data-scope="session" data-id="${session.id}" title="Logs" aria-label="Logs">${icon('logs')}</button>` : ''}
           </div>
         </div>
         ${isDev && detailsState.open ? `
@@ -2497,28 +2725,6 @@ class AppShell extends HTMLElement {
               <div class="detail-item"><span class="meta"></span><span>${formatDate(session.created_at)}</span></div>
             </div> 
             <div class="grid">${tasksHtml}</div>
-            ${healthFailure ? `
-              <div class="detail-block" data-field="healthcheck">
-                <div class="detail-block-header">
-                  <span class="meta">Health check failed</span>
-                  <button class="icon-button copy-task" data-field="healthcheck" title="Copy logs" aria-label="Copy logs">${icon('copy')}</button>
-                </div>
-                <pre class="expandable-pre">${healthText || 'No logs captured.'}</pre>
-              </div>
-            ` : ''}
-          </div>
-        ` : ''}
-        ${logState.open ? `
-          <div class="log-panel">
-            <div class="log-header">
-              <span>${projectName} Application Logs <span class="meta">Last ${logLineCount} lines</span></span>
-              <div class="log-actions">
-                <button class="icon-button fetch-logs" data-id="${session.id}" title="Fetch latest logs (2000 lines)" aria-label="Fetch latest logs (2000 lines)">Fetch</button>
-                <button class="icon-button copy-logs" data-id="${session.id}" title="Copy Application Logs" aria-label="Copy Application Logs">${icon('copy')}</button>
-              </div>
-            </div>
-            <pre class="expandable-pre">${logState.loading ? 'Loading...' : (logState.serverLog || logState.error || 'No server log yet.')}</pre>
-            <button class="ghost refresh-logs" data-id="${session.id}">Refresh</button>
           </div>
         ` : ''}
       </div>
@@ -2935,6 +3141,7 @@ class AppShell extends HTMLElement {
         socketProjectId = null;
       }
       stopRuntimeUsagePolling();
+      stopAppLogPolling();
       setState({
         token: '',
         user: null,
@@ -2947,6 +3154,12 @@ class AppShell extends HTMLElement {
         runtimeUsage: { month: '', plan: '', usage: {} },
         runtimeUsageLoading: false,
         runtimeUsageError: '',
+        appLogsVisible: false,
+        appLogsByEnv: blankEnvMap(''),
+        appLogSnapshotByEnv: blankEnvMap(''),
+        appLogLoading: blankEnvMap(false),
+        appLogError: blankEnvMap(''),
+        appLogFrozenByEnv: blankEnvMap(false),
         runtimeQuotaNotice: {}
       });
     });
@@ -3151,6 +3364,7 @@ class AppShell extends HTMLElement {
     this.querySelector('#projectSelect')?.addEventListener('change', async (e) => {
       const projectId = e.target.value;
       if (projectId === '__new__') {
+        stopAppLogPolling();
         setState({
           projectId: null,
           environment: 'development',
@@ -3161,6 +3375,12 @@ class AppShell extends HTMLElement {
           failedBuildLogLoading: { development: false, testing: false, production: false },
           failedBuildLogError: { development: '', testing: '', production: '' },
           failedBuildLogLines: { development: 200, testing: 200, production: 200 },
+          appLogsVisible: false,
+          appLogsByEnv: blankEnvMap(''),
+          appLogSnapshotByEnv: blankEnvMap(''),
+          appLogLoading: blankEnvMap(false),
+          appLogError: blankEnvMap(''),
+          appLogFrozenByEnv: blankEnvMap(false),
           deployWebhookUrl: '',
           deployWebhookMessage: ''
         });
@@ -3171,6 +3391,7 @@ class AppShell extends HTMLElement {
       }
       const storedEnv = loadStoredEnv(state.user?.id, projectId);
       storeProject(state.user?.id, projectId);
+      stopAppLogPolling();
       setState({
         projectId,
         environment: storedEnv || state.environment,
@@ -3181,6 +3402,11 @@ class AppShell extends HTMLElement {
         failedBuildLogLoading: { development: false, testing: false, production: false },
         failedBuildLogError: { development: '', testing: '', production: '' },
         failedBuildLogLines: { development: 200, testing: 200, production: 200 },
+        appLogsByEnv: blankEnvMap(''),
+        appLogSnapshotByEnv: blankEnvMap(''),
+        appLogLoading: blankEnvMap(false),
+        appLogError: blankEnvMap(''),
+        appLogFrozenByEnv: blankEnvMap(false),
         deployWebhookMessage: ''
       });
       await loadTasks(projectId);
@@ -3213,7 +3439,18 @@ class AppShell extends HTMLElement {
         });
         await loadProjects();
         storeEnv(state.user?.id, project.id, 'development');
-        setState({ projectId: project.id, environment: 'development', nerdLevel: 'beginner', createProjectName: '' });
+        stopAppLogPolling();
+        setState({
+          projectId: project.id,
+          environment: 'development',
+          nerdLevel: 'beginner',
+          createProjectName: '',
+          appLogsByEnv: blankEnvMap(''),
+          appLogSnapshotByEnv: blankEnvMap(''),
+          appLogLoading: blankEnvMap(false),
+          appLogError: blankEnvMap(''),
+          appLogFrozenByEnv: blankEnvMap(false)
+        });
         localStorage.setItem('vibes_nerd_level', 'beginner');
         connectSocket(project.id);
         if (DESKTOP_BRIDGE && project.id) {
@@ -3319,6 +3556,7 @@ class AppShell extends HTMLElement {
           envMessage: ''
         });
         if (!nextProjectId) {
+          stopAppLogPolling();
           setState({
             tasks: [],
             sessions: [],
@@ -3328,6 +3566,12 @@ class AppShell extends HTMLElement {
             pendingDeployCommit: { development: '', testing: '', production: '' },
             progressVisibleUntil: { development: 0, testing: 0, production: 0 },
             updatedAt: { development: '', testing: '', production: '' },
+            appLogsVisible: false,
+            appLogsByEnv: blankEnvMap(''),
+            appLogSnapshotByEnv: blankEnvMap(''),
+            appLogLoading: blankEnvMap(false),
+            appLogError: blankEnvMap(''),
+            appLogFrozenByEnv: blankEnvMap(false),
             environment: 'development',
             nerdLevel: 'beginner'
           });
@@ -3394,6 +3638,12 @@ class AppShell extends HTMLElement {
         if (state.projectId) {
           loadEnvVars(state.projectId, env);
           loadLatestBuild(state.projectId, env);
+          if (state.appLogsVisible && !state.appLogFrozenByEnv[env]) {
+            fetchApplicationLogs({ force: true });
+          } else if (state.appLogsVisible) {
+            updateAppLogPanel();
+          }
+          ensureAppLogPolling();
         }
       });
     });
@@ -3411,6 +3661,12 @@ class AppShell extends HTMLElement {
         if (state.projectId) {
           loadEnvVars(state.projectId, env);
           loadLatestBuild(state.projectId, env);
+          if (state.appLogsVisible && !state.appLogFrozenByEnv[env]) {
+            fetchApplicationLogs({ force: true });
+          } else if (state.appLogsVisible) {
+            updateAppLogPanel();
+          }
+          ensureAppLogPolling();
         }
       });
     });
@@ -3458,6 +3714,11 @@ class AppShell extends HTMLElement {
     this.querySelector('#submitTask')?.addEventListener('click', async () => {
       const prompt = this.querySelector('#taskPrompt').value;
       if (!prompt) return setTaskStatus('Enter a task prompt', { autoHide: true });
+      prepareAppLogsForDeploy(state.environment);
+      if (state.appLogsVisible) {
+        fetchApplicationLogs({ force: true });
+        ensureAppLogPolling();
+      }
       setTaskStatus('Reading Request', { persistent: true });
       try {
         const task = await api(`/projects/${state.projectId}/tasks`, {
@@ -3490,9 +3751,37 @@ class AppShell extends HTMLElement {
       }
     });
 
-    this.querySelector('#refreshBuildLog')?.addEventListener('click', async () => {
-      if (!state.projectId) return;
-      await loadLatestBuild(state.projectId, state.environment);
+    this.querySelector('#toggleAppLogs')?.addEventListener('change', async (event) => {
+      const enabled = Boolean(event.target?.checked);
+      setState({ appLogsVisible: enabled });
+      if (enabled) {
+        if (state.appLogFrozenByEnv[state.environment]) {
+          updateAppLogPanel({ forceScroll: true });
+        } else {
+          await fetchApplicationLogs({ force: true });
+        }
+      }
+      ensureAppLogPolling();
+    });
+
+    this.querySelector('#copyAppLogs')?.addEventListener('click', async () => {
+      const text = state.appLogsByEnv[state.environment] || '';
+      if (!text) {
+        setTaskStatus('No application logs to copy yet.', { autoHide: true });
+        return;
+      }
+      try {
+        await navigator.clipboard.writeText(text);
+        setTaskStatus('Copied application logs', { autoHide: true });
+      } catch {
+        const temp = document.createElement('textarea');
+        temp.value = text;
+        document.body.appendChild(temp);
+        temp.select();
+        document.execCommand('copy');
+        temp.remove();
+        setTaskStatus('Copied application logs', { autoHide: true });
+      }
     });
 
     this.querySelector('#saveSession')?.addEventListener('click', () => {
@@ -4015,6 +4304,11 @@ class AppShell extends HTMLElement {
       btn.addEventListener('click', async () => {
         const commitHash = btn.getAttribute('data-commit');
         if (!commitHash) return setTaskStatus('No commit hash available', { autoHide: true });
+        prepareAppLogsForDeploy(state.environment);
+        if (state.appLogsVisible) {
+          fetchApplicationLogs({ force: true });
+          ensureAppLogPolling();
+        }
         state.pendingDeployCommit[state.environment] = commitHash;
         state.buildStatus[state.environment] = 'building';
         state.progressVisibleUntil[state.environment] = 0;
@@ -4030,54 +4324,6 @@ class AppShell extends HTMLElement {
           });
         } catch (err) {
           showError(err);
-        }
-      });
-    });
-
-    this.querySelectorAll('.logs-button').forEach((btn) => {
-      btn.addEventListener('click', async () => {
-        const id = btn.getAttribute('data-id');
-        const current = state.taskLogs[id] || { open: false };
-        const nextOpen = !current.open;
-        state.taskLogs[id] = { ...current, open: nextOpen };
-        setState({ taskLogs: { ...state.taskLogs } });
-        if (nextOpen) {
-          await fetchRuntimeLogs(id);
-        }
-      });
-    });
-
-    this.querySelectorAll('.refresh-logs').forEach((btn) => {
-      btn.addEventListener('click', async () => {
-        const id = btn.getAttribute('data-id');
-        await fetchRuntimeLogs(id);
-      });
-    });
-
-    this.querySelectorAll('.fetch-logs').forEach((btn) => {
-      btn.addEventListener('click', async () => {
-        const id = btn.getAttribute('data-id');
-        await fetchRuntimeLogs(id, 2000);
-      });
-    });
-
-    this.querySelectorAll('.copy-logs').forEach((btn) => {
-      btn.addEventListener('click', async () => {
-        const id = btn.getAttribute('data-id');
-        if (!id) return;
-        const log = state.taskLogs[id]?.serverLog || '';
-        if (!log) return setTaskStatus('No logs to copy yet.', { autoHide: true });
-        try {
-          await navigator.clipboard.writeText(log);
-          setTaskStatus('Copied application logs', { autoHide: true });
-        } catch {
-          const temp = document.createElement('textarea');
-          temp.value = log;
-          document.body.appendChild(temp);
-          temp.select();
-          document.execCommand('copy');
-          temp.remove();
-          setTaskStatus('Copied application logs', { autoHide: true });
         }
       });
     });
@@ -4104,31 +4350,8 @@ class AppShell extends HTMLElement {
       });
     });
 
-    this.querySelector('#toggleFailedBuildLog')?.addEventListener('click', async () => {
-      const env = state.environment;
-      if (state.failedBuildLogVisible[env]) {
-        state.failedBuildLogVisible[env] = false;
-        setState({ failedBuildLogVisible: { ...state.failedBuildLogVisible } });
-        return;
-      }
-      await loadFailedBuildLog(state.projectId, env, { force: true });
-    });
-
-    this.querySelector('#openFailedBuildLog')?.addEventListener('click', async () => {
-      const env = state.environment;
-      if (state.failedBuildLogVisible[env]) return;
-      await loadFailedBuildLog(state.projectId, env, { force: true });
-    });
-
-    this.querySelector('#refreshFailedBuildLog')?.addEventListener('click', async () => {
-      const env = state.environment;
-      await loadFailedBuildLog(state.projectId, env, { force: true });
-    });
-
-    this.querySelector('#expandFailedBuildLog')?.addEventListener('click', async () => {
-      const env = state.environment;
-      await loadFailedBuildLog(state.projectId, env, { force: true, lines: 2000 });
-    });
+    ensureAppLogPolling();
+    updateAppLogPanel();
   }
 }
 

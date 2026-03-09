@@ -86,7 +86,26 @@ podman run --name "$INSTALL_NAME" --rm \
   -v "$WORKDIR":/app \
   -w /app \
   node:20 \
-  sh -lc "if [ -f package-lock.json ]; then npm install; elif [ -f yarn.lock ]; then yarn install; elif [ -f pnpm-lock.yaml ]; then npm i -g pnpm && pnpm i; else npm install; fi"
+  sh -lc "set -eu; \
+    if [ -f package-lock.json ]; then npm ci; elif [ -f yarn.lock ]; then yarn install; elif [ -f pnpm-lock.yaml ]; then npm i -g pnpm && pnpm i; elif [ -f package.json ]; then npm install; fi; \
+    if [ -f scripts/start-all.js ] && [ -f server/package.json ] && [ -f web/package.json ]; then \
+      if [ -f server/package-lock.json ]; then (cd server && npm ci); elif [ -f server/yarn.lock ]; then (cd server && yarn install); else (cd server && npm install); fi; \
+      if [ -f web/package-lock.json ]; then (cd web && npm ci); elif [ -f web/yarn.lock ]; then (cd web && yarn install); else (cd web && npm install); fi; \
+      (cd server && npm run prisma:generate --if-present && npm run build --if-present); \
+      (cd web && npm run build --if-present); \
+    fi"
+
+RUNTIME_COMMAND="${START_COMMAND:-}"
+if [ -z "$RUNTIME_COMMAND" ]; then
+  if [ -f "$WORKDIR/scripts/start-all.js" ] && [ -f "$WORKDIR/server/dist/index.js" ]; then
+    RUNTIME_COMMAND="node server/dist/index.js"
+  elif [ -f "$WORKDIR/scripts/start-all.js" ] && [ -f "$WORKDIR/server/index.js" ]; then
+    RUNTIME_COMMAND="node server/index.js"
+  else
+    RUNTIME_COMMAND="npm start"
+  fi
+fi
+echo "dev deploy runtime command: $RUNTIME_COMMAND"
 
 # Run app container using repo snapshot and env file
 podman run -d --name "$CONTAINER_NAME" \
@@ -96,7 +115,7 @@ podman run -d --name "$CONTAINER_NAME" \
   -v "$WORKDIR":/app \
   -w /app \
   node:20 \
-  sh -lc "${START_COMMAND:-npm start}"
+  sh -lc "$RUNTIME_COMMAND"
 
 # Update nginx routing for host -> container
 if [ -n "${APP_HOST:-}" ]; then

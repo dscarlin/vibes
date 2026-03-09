@@ -101,13 +101,15 @@ function formatPercent(value) {
 function buildMetricsSummary(metrics) {
   const totals = metrics.nodes?.totals || {};
   const podTotals = metrics.pods?.totals || {};
+  const podIssues = metrics.pods?.issues || {};
   const podTotalCount = Object.values(podTotals).reduce((sum, value) => sum + Number(value || 0), 0);
+  const loopingPods = Number(podIssues.crash_loop || 0) + Number(podIssues.restart_loop || 0);
   const envs = metrics.projects?.environments || {};
   return [
     { label: 'Nodes', value: totals.nodes ?? 0 },
     { label: 'Nodegroups', value: metrics.nodes?.by_nodegroup?.length ?? 0 },
     { label: 'Pods', value: podTotalCount },
-    { label: 'CrashLoop', value: metrics.pods?.issues?.crash_loop ?? 0 },
+    { label: 'Looping Pods', value: loopingPods },
     { label: 'Pending', value: podTotals.Pending ?? 0 },
     { label: 'CPU %', value: formatPercent(metrics.capacity?.cpu_percent) },
     { label: 'Mem %', value: formatPercent(metrics.capacity?.mem_percent) },
@@ -336,9 +338,9 @@ function metricsToCsv(metrics, exportMeta = {}) {
   });
 
   lines.push('');
-  push(['section', 'namespace', 'name', 'node', 'restarts']);
+  push(['section', 'namespace', 'name', 'node', 'reason', 'restarts']);
   (metrics.pods?.top_crashloops || []).forEach((pod) => {
-    push(['crashloop', pod.namespace, pod.name, pod.node, pod.restarts ?? 0]);
+    push(['crashloop', pod.namespace, pod.name, pod.node, pod.reason || '', pod.restarts ?? 0]);
   });
 
   return lines.join('\n');
@@ -759,17 +761,19 @@ async function loadDashboard() {
     { label: 'Pending', value: metrics.pods.totals.Pending || 0 },
     { label: 'Failed', value: metrics.pods.totals.Failed || 0 },
     { label: 'CrashLoopBackOff', value: metrics.pods.issues.crash_loop || 0 },
+    { label: 'Restart Loop', value: metrics.pods.issues.restart_loop || 0 },
     { label: 'ImagePullBackOff', value: metrics.pods.issues.image_pull_backoff || 0 }
   ]);
   const crashLoops = metrics.pods.top_crashloops || [];
-  crashLoopList.innerHTML = '<h3 class="subtle" style="margin-top:12px;">Top CrashLoop Pods</h3>';
+  crashLoopList.innerHTML = '<h3 class="subtle" style="margin-top:12px;">Top Looping Pods</h3>';
   if (!crashLoops.length) {
     crashLoopList.innerHTML += '<div class="log-item">None</div>';
   } else {
     crashLoops.forEach((pod) => {
       const item = document.createElement('div');
       item.className = 'log-item';
-      item.textContent = `${pod.namespace}/${pod.name} (restarts: ${pod.restarts || 0})`;
+      const reason = pod.reason || 'CrashLoopBackOff';
+      item.textContent = `${pod.namespace}/${pod.name} (${reason}, restarts: ${pod.restarts || 0})`;
       crashLoopList.appendChild(item);
     });
   }

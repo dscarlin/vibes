@@ -2,7 +2,99 @@
 
 This checklist is scoped to the current VibesPlatform stack and focuses on the minimum needed to charge customers. Each item is actionable and maps to existing tooling.
 
-## Status (2026-03-07)
+## Launch Rule
+
+Do not take the first customer payment until every item in `Must Complete Before First Payment` is checked off and has evidence recorded.
+
+Tracking convention:
+- `Status`: `[ ]` not done, `[~]` in progress, `[x]` done
+- `Evidence`: link to PR, command output, screenshot, ticket, or short operator note
+
+## Tracked Checklist (2026-03-08)
+
+### Must Complete Before First Payment
+
+| Track | Status | Owner | Target Date | Evidence |
+| --- | --- | --- | --- | --- |
+| Day 1: Align plans, quotas, and billing behavior | [ ] |  |  |  |
+| Day 2: Reconcile deployment and data integrity | [ ] |  |  |  |
+| Day 3: Prove backup and restore | [ ] |  |  |  |
+| Day 4: Close security baseline | [ ] |  |  |  |
+| Day 5: Verify failure handling and support workflow | [ ] |  |  |  |
+| Day 6: Pass end-to-end customer journeys | [ ] |  |  |  |
+| Day 7: Payment, legal, and launch packaging ready | [ ] |  |  |  |
+
+#### Day 1: Align Plans, Quotas, and Billing Behavior
+- [ ] `Starter`, `Builder`, and `Business` limits match across docs, env files, UI copy, and server/worker enforcement.
+- [ ] Project-count limit is verified with test users.
+- [ ] Environment gating is verified for development, testing, and production.
+- [ ] Mobile gating is verified for Builder and Business.
+- [ ] Runtime quota values are verified against actual API responses.
+- [ ] Build-limit, DB-limit, and bandwidth-limit behavior is explicitly marked as either enforced or deferred.
+- [ ] Upgrade and downgrade handling is documented, including any manual operator steps.
+
+#### Day 2: Reconcile Deployment and Data Integrity
+- [ ] Every live environment has the correct `deployed_commit`.
+- [ ] Legacy live builds with null `ref_commit` are reconciled or intentionally documented.
+- [ ] Snapshot, task/session history, and deployed commit agree for a sampled set of active projects.
+- [ ] Repo upload/download flow is validated against current branch/session rules.
+- [ ] A rollback/redeploy check is run on at least one active project.
+
+#### Day 3: Prove Backup and Restore
+- [ ] RDS automated backups are enabled with the intended retention period.
+- [ ] A real restore drill is completed and timed.
+- [ ] The restore runbook is updated with exact commands and operator notes.
+- [ ] Snapshot blob recovery is tested for at least one project.
+- [ ] Minimum RPO/RTO is documented, even if informal.
+
+#### Day 4: Close Security Baseline
+- [ ] Shared credentials are rotated.
+- [ ] Any credentials exposed in local terminals, shell history, screenshots, or chat logs are rotated.
+- [ ] Secrets remain only in Kubernetes or untracked local env files.
+- [ ] Build logs, runtime logs, and repo snapshots are checked for secret leakage.
+- [ ] Public rate limits are validated on `/health`, `/downloads/desktop`, and `/admin`.
+- [ ] IAM permissions are reviewed for least privilege.
+
+#### Day 5: Verify Failure Handling and Support Workflow
+- [ ] Failed health check path is tested and produces actionable logs.
+- [ ] Crash loop path is tested and visible in logs/admin tooling.
+- [ ] Queued build cancel is tested.
+- [ ] Running build cancel is tested.
+- [ ] Stop-environment flow is tested.
+- [ ] Runtime quota auto-stop is tested.
+- [ ] `docs/SUPPORT_WORKFLOWS.md` is sufficient for a non-author operator to use.
+
+#### Day 6: Pass End-to-End Customer Journeys
+- [ ] Register and login flow works cleanly.
+- [ ] Create-project flow works for web-only.
+- [ ] Create-project flow works for mobile-enabled plans if mobile is part of launch.
+- [ ] Initial starter deployment succeeds.
+- [ ] AI task -> commit -> deploy path succeeds.
+- [ ] Save-session flow succeeds.
+- [ ] Repo upload and repo download succeed.
+- [ ] Runtime logs and build logs are retrievable for a deployed project.
+
+#### Day 7: Payment, Legal, and Launch Packaging Ready
+- [ ] Payment collection flow is live enough to take first payments.
+- [ ] Upgrade path shown to users is correct.
+- [ ] Terms of service and privacy policy are published.
+- [ ] Support contact path is published.
+- [ ] Launch-day operator checklist exists for deploy, rollback, incident triage, and customer comms.
+- [ ] Desktop signing/notarization is complete if desktop is part of onboarding; otherwise desktop is not part of the initial paid funnel.
+
+### Safe To Defer Until After Launch
+
+| Item | Status | Notes |
+| --- | --- | --- |
+| Autoscaling policies / HPA | [ ] | Safe to defer if manual capacity checks are in place |
+| Retention policy for snapshots and artifacts | [ ] | Important, not launch-blocking |
+| Audit trail exports | [ ] | Admin visibility exists already |
+| Agency plan / orgs / IAM | [ ] | Deferred in pricing doc |
+| Overage billing automation | [ ] | Hard-block behavior is acceptable for MVP |
+| Full CI / automated test suite | [ ] | Manual launch matrix required if deferred |
+| Desktop signing | [ ] | Only launch-blocking if desktop is core to onboarding |
+
+## Repo Status Snapshot (2026-03-07)
 
 ### Launch-Blocking
 1. Scale-to-zero timers (dev/test): **Set; RBAC updated to allow deployments/scale (verified via can-i, no new Forbidden logs)**

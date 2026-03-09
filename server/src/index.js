@@ -130,6 +130,11 @@ const RATE_LIMIT_PUBLIC_MAX = Number(process.env.RATE_LIMIT_PUBLIC_MAX || 120);
 const KUBECTL_TIMEOUT_MS = Number(process.env.KUBECTL_TIMEOUT_MS || 8000);
 const ADMIN_METRICS_CACHE_TTL_MS = Number(process.env.ADMIN_METRICS_CACHE_TTL_MS || 15000);
 const ADMIN_METRICS_CACHE_STALE_TTL_MS = Number(process.env.ADMIN_METRICS_CACHE_STALE_TTL_MS || 5 * 60 * 1000);
+const ADMIN_RESTART_LOOP_THRESHOLD = (() => {
+  const raw = Number(process.env.ADMIN_RESTART_LOOP_THRESHOLD || 2);
+  if (!Number.isFinite(raw) || raw < 1) return 2;
+  return Math.floor(raw);
+})();
 
 const PLAN_DEFINITIONS = {
   starter: {
@@ -1096,6 +1101,7 @@ app.get('/admin/metrics', requireAdminAccess, async (req, res) => {
       const podStatuses = {};
       const podIssues = {
         crash_loop: 0,
+        restart_loop: 0,
         image_pull_backoff: 0,
         pending: 0,
         failed: 0
@@ -1117,14 +1123,24 @@ app.get('/admin/metrics', requireAdminAccess, async (req, res) => {
 
         const statuses = pod.status?.containerStatuses || [];
         let isCrashLoop = false;
+        let hasCrashLoopBackoff = false;
+        let hasImagePullIssue = false;
         let restartCount = 0;
         for (const status of statuses) {
           const reason = status.state?.waiting?.reason || '';
-          if (reason === 'CrashLoopBackOff') podIssues.crash_loop += 1;
-          if (reason === 'ImagePullBackOff' || reason === 'ErrImagePull') podIssues.image_pull_backoff += 1;
-          if (reason === 'CrashLoopBackOff') isCrashLoop = true;
+          if (reason === 'CrashLoopBackOff') hasCrashLoopBackoff = true;
+          if (reason === 'ImagePullBackOff' || reason === 'ErrImagePull') hasImagePullIssue = true;
           restartCount += Number(status.restartCount || 0);
         }
+        if (hasCrashLoopBackoff) podIssues.crash_loop += 1;
+        if (hasImagePullIssue) podIssues.image_pull_backoff += 1;
+        const hasUnreadyContainer = statuses.some((status) => !status.ready);
+        const isRestartLoop =
+          !hasCrashLoopBackoff &&
+          hasUnreadyContainer &&
+          restartCount >= ADMIN_RESTART_LOOP_THRESHOLD;
+        if (isRestartLoop) podIssues.restart_loop += 1;
+        isCrashLoop = hasCrashLoopBackoff || isRestartLoop;
 
         const containers = pod.spec?.containers || [];
         let podReqCpu = 0;
@@ -1153,7 +1169,8 @@ app.get('/admin/metrics', requireAdminAccess, async (req, res) => {
             namespace: pod.metadata?.namespace || 'default',
             name: pod.metadata?.name || '',
             node: nodeName || '',
-            restarts: restartCount
+            restarts: restartCount,
+            reason: hasCrashLoopBackoff ? 'CrashLoopBackOff' : 'RestartLoop'
           });
         }
       }
@@ -1722,6 +1739,10 @@ app.post('/projects/:projectId/tasks', requireAuth, async (req, res) => {
      returning *`,
     [req.params.projectId, env, prompt]
   );
+  await taskQueue.add('stop-environment', {
+    projectId: req.params.projectId,
+    environment: env
+  });
   await taskQueue.add('codex-task', { taskId: result.rows[0].id });
   res.json(result.rows[0]);
 });
@@ -2002,6 +2023,16 @@ function summarizePodStatus(pod) {
     if (status?.state?.running) {
       const ready = status?.ready ? 'ready' : 'not ready';
       lines.push(`- ${cname}: running (${ready})${restartCount ? `, restarts ${restartCount}` : ''}`);
+      const lastTerminated = status?.lastState?.terminated;
+      if (lastTerminated) {
+        const lastReason = lastTerminated.reason || 'terminated';
+        const lastExit = Number(lastTerminated.exitCode ?? -1);
+        const lastSignal = Number(lastTerminated.signal ?? 0);
+        const lastMsg = String(lastTerminated.message || '').trim();
+        const signalSuffix = lastSignal > 0 ? ` signal ${lastSignal}` : '';
+        lines.push(`  last termination: ${lastReason} exit ${lastExit}${signalSuffix}`);
+        if (lastMsg) lines.push(`  ${lastMsg}`);
+      }
       continue;
     }
   }
@@ -2020,23 +2051,168 @@ async function getPodStatusSummary(namespace, appName) {
   }
 }
 
+function truthyQueryFlag(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  return normalized === '1' || normalized === 'true' || normalized === 'yes' || normalized === 'on';
+}
+
+async function listPodsForApp(namespace, appName) {
+  const { stdout } = await exec('kubectl', ['-n', namespace, 'get', 'pods', '-l', `app=${appName}`, '-o', 'json']);
+  const data = JSON.parse(stdout || '{}');
+  const pods = Array.isArray(data.items) ? data.items : [];
+  pods.sort((a, b) => {
+    const aTime = new Date(a?.metadata?.creationTimestamp || 0).getTime() || 0;
+    const bTime = new Date(b?.metadata?.creationTimestamp || 0).getTime() || 0;
+    return bTime - aTime;
+  });
+  return pods;
+}
+
+async function collectPreviousRestartLogs(namespace, appName, lines) {
+  try {
+    const pods = await listPodsForApp(namespace, appName);
+    if (!pods.length) return { logs: '', restartDetected: false };
+    const tail = Math.max(20, Math.min(Number(lines || 200), 400));
+    const sections = [];
+    const maxSections = 4;
+    let restartDetected = false;
+    for (const pod of pods) {
+      const podName = pod?.metadata?.name || '';
+      if (!podName) continue;
+      const statuses = Array.isArray(pod?.status?.containerStatuses) ? pod.status.containerStatuses : [];
+      for (const status of statuses) {
+        const restartCount = Number(status?.restartCount || 0);
+        if (restartCount <= 0) continue;
+        restartDetected = true;
+        const containerName = status?.name || '';
+        if (!containerName) continue;
+        try {
+          const { stdout, stderr } = await exec('kubectl', [
+            '-n',
+            namespace,
+            'logs',
+            podName,
+            '-c',
+            containerName,
+            '--previous',
+            `--tail=${tail}`
+          ]);
+          const text = `${stdout || ''}${stderr || ''}`.trim();
+          if (!text) continue;
+          sections.push(`[previous ${podName}/${containerName}]\n${text}`);
+          if (sections.length >= maxSections) break;
+        } catch {
+          // best effort
+        }
+      }
+      if (sections.length >= maxSections) break;
+    }
+    return { logs: sections.join('\n\n'), restartDetected };
+  } catch {
+    return { logs: '', restartDetected: false };
+  }
+}
+
+async function getStoredRuntimeLog(projectId, environment) {
+  try {
+    const result = await query(
+      `select latest_runtime_log, latest_runtime_log_updated_at, latest_runtime_log_attempt_id
+       from environments
+       where project_id = $1 and name = $2
+       limit 1`,
+      [projectId, environment]
+    );
+    if (result.rowCount === 0) return null;
+    return {
+      logs: result.rows[0]?.latest_runtime_log || '',
+      updatedAt: result.rows[0]?.latest_runtime_log_updated_at || null,
+      attemptId: result.rows[0]?.latest_runtime_log_attempt_id || null
+    };
+  } catch (err) {
+    const msg = String(err?.message || '').toLowerCase();
+    if (msg.includes('latest_runtime_log')) return null;
+    throw err;
+  }
+}
+
+function tailLogLines(text, lines) {
+  const source = String(text || '');
+  if (!source) return '';
+  const limit = Math.max(1, Math.min(Number(lines || 200), 2000));
+  const parts = source.split('\n');
+  if (parts.length <= limit) return source;
+  return parts.slice(-limit).join('\n');
+}
+
 app.get('/projects/:projectId/runtime-logs', requireAuth, async (req, res) => {
   const env = normalizeEnv(req.query.environment);
   if (!env) return res.status(400).json({ error: 'invalid environment' });
   const ok = await ensureProjectOwner(req.params.projectId, req.user.userId);
   if (!ok) return res.status(404).json({ error: 'project not found' });
   if (!(await ensurePlanEnvAllowed(req, res, env))) return;
-  const cmd = logCommandForEnv(env);
-  if (!cmd) return res.status(400).json({ error: 'log command not configured' });
   const lines = Math.min(Number(req.query.lines || 200), 2000);
+  const includePrevious =
+    truthyQueryFlag(req.query.includePrevious) || truthyQueryFlag(req.query.include_previous);
+  const previousOnly =
+    truthyQueryFlag(req.query.previousOnly) || truthyQueryFlag(req.query.previous_only);
+  const canReadPrevious = (includePrevious || previousOnly) && (process.env.PLATFORM_ENV || 'local') !== 'local';
+  const namespace = `vibes-${env}`;
+  const appName = `vibes-app-${req.params.projectId}`;
+  const stored = await getStoredRuntimeLog(req.params.projectId, env);
+  if (stored && String(stored.logs || '').length > 0) {
+    const storedTail = tailLogLines(stored.logs, lines);
+    if (!canReadPrevious) {
+      return res.json({
+        logs: storedTail,
+        source: 'stored',
+        updated_at: stored.updatedAt,
+        attempt_id: stored.attemptId
+      });
+    }
+    const previous = await collectPreviousRestartLogs(namespace, appName, lines);
+    const statusSummary = (previousOnly || previous.restartDetected)
+      ? await getPodStatusSummary(namespace, appName)
+      : '';
+    if (previousOnly) {
+      const sections = [previous.logs || storedTail];
+      if (statusSummary) sections.push(`Pod status:\n${statusSummary}`);
+      return res.json({
+        logs: sections.filter(Boolean).join('\n\n'),
+        source: previous.logs ? 'stored+previous' : 'stored',
+        updated_at: stored.updatedAt,
+        attempt_id: stored.attemptId
+      });
+    }
+    let logs = storedTail;
+    if (previous.logs) logs = `${previous.logs}\n\n${logs}`;
+    if (statusSummary) logs = [logs, `Pod status:\n${statusSummary}`].filter(Boolean).join('\n\n');
+    return res.json({
+      logs,
+      source: previous.logs ? 'stored+previous' : 'stored',
+      updated_at: stored.updatedAt,
+      attempt_id: stored.attemptId
+    });
+  }
+  const cmd = logCommandForEnv(env);
+  if (!cmd) {
+    if (stored) {
+      return res.json({
+        logs: tailLogLines(stored.logs || '', lines),
+        source: 'stored',
+        updated_at: stored.updatedAt,
+        attempt_id: stored.attemptId
+      });
+    }
+    return res.status(400).json({ error: 'log command not configured' });
+  }
   const envVars = {
     ...process.env,
     PROJECT_ID: req.params.projectId,
     PROJECT_SHORT_ID: null,
     ENVIRONMENT: env,
     LOG_LINES: String(lines),
-    NAMESPACE: `vibes-${env}`,
-    APP_NAME: `vibes-app-${req.params.projectId}`
+    NAMESPACE: namespace,
+    APP_NAME: appName
   };
   try {
     const shortRes = await query('select short_id from projects where id = $1', [req.params.projectId]);
@@ -2044,12 +2220,40 @@ app.get('/projects/:projectId/runtime-logs', requireAuth, async (req, res) => {
   } catch {}
   try {
     const { stdout, stderr } = await exec('sh', ['-lc', cmd], { env: envVars });
-    res.json({ logs: `${stdout || ''}${stderr || ''}` });
+    let logs = `${stdout || ''}${stderr || ''}`;
+    let previous = { logs: '', restartDetected: false };
+    let statusSummary = '';
+    if (canReadPrevious) {
+      previous = await collectPreviousRestartLogs(envVars.NAMESPACE, envVars.APP_NAME, lines);
+      if (previousOnly || previous.restartDetected) {
+        statusSummary = await getPodStatusSummary(envVars.NAMESPACE, envVars.APP_NAME);
+      }
+      if (previousOnly) {
+        const sections = [previous.logs];
+        if (statusSummary) sections.push(`Pod status:\n${statusSummary}`);
+        logs = sections.filter(Boolean).join('\n\n');
+      } else if (previous.logs) {
+        logs = logs ? `${previous.logs}\n\n${logs}` : previous.logs;
+      }
+      if (!previousOnly && statusSummary) {
+        logs = [logs, `Pod status:\n${statusSummary}`].filter(Boolean).join('\n\n');
+      }
+    }
+    res.json({ logs });
   } catch (err) {
     const errOutput = `${err?.stdout || ''}${err?.stderr || ''}`.trim();
+    const previous = canReadPrevious
+      ? await collectPreviousRestartLogs(envVars.NAMESPACE, envVars.APP_NAME, lines)
+      : { logs: '', restartDetected: false };
     const statusSummary = await getPodStatusSummary(envVars.NAMESPACE, envVars.APP_NAME);
+    if (previousOnly) {
+      const sections = [previous.logs];
+      if (statusSummary) sections.push(`Pod status:\n${statusSummary}`);
+      return res.json({ logs: sections.filter(Boolean).join('\n\n'), error: err?.message || 'log_failed' });
+    }
     const details = [
       errOutput ? errOutput : `Log command failed: ${err?.message || 'unknown error'}`,
+      previous.logs ? `Previous container logs:\n${previous.logs}` : '',
       statusSummary ? `Pod status:\n${statusSummary}` : ''
     ]
       .filter(Boolean)
