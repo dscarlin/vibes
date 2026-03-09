@@ -208,15 +208,15 @@ case "$ENVIRONMENT_KEY" in
   production) APP_PROBE_PATH_DEFAULT="${APP_PROBE_PATH_PROD:-$APP_PROBE_PATH_DEFAULT}" ;;
 esac
 
-READINESS_PROBE_PERIOD_SECONDS="${READINESS_PROBE_PERIOD_SECONDS:-3}"
+READINESS_PROBE_PERIOD_SECONDS="${READINESS_PROBE_PERIOD_SECONDS:-10}"
 READINESS_PROBE_TIMEOUT_SECONDS="${READINESS_PROBE_TIMEOUT_SECONDS:-2}"
 READINESS_PROBE_FAILURE_THRESHOLD="${READINESS_PROBE_FAILURE_THRESHOLD:-2}"
 READINESS_PROBE_SUCCESS_THRESHOLD="${READINESS_PROBE_SUCCESS_THRESHOLD:-1}"
-STARTUP_PROBE_PERIOD_SECONDS="${STARTUP_PROBE_PERIOD_SECONDS:-3}"
+STARTUP_PROBE_PERIOD_SECONDS="${STARTUP_PROBE_PERIOD_SECONDS:-5}"
 STARTUP_PROBE_TIMEOUT_SECONDS="${STARTUP_PROBE_TIMEOUT_SECONDS:-2}"
 STARTUP_PROBE_FAILURE_THRESHOLD="${STARTUP_PROBE_FAILURE_THRESHOLD:-40}"
-ALB_HEALTHCHECK_INTERVAL_SECONDS="${ALB_HEALTHCHECK_INTERVAL_SECONDS:-5}"
-ALB_HEALTHCHECK_TIMEOUT_SECONDS="${ALB_HEALTHCHECK_TIMEOUT_SECONDS:-4}"
+ALB_HEALTHCHECK_INTERVAL_SECONDS="${ALB_HEALTHCHECK_INTERVAL_SECONDS:-15}"
+ALB_HEALTHCHECK_TIMEOUT_SECONDS="${ALB_HEALTHCHECK_TIMEOUT_SECONDS:-5}"
 ALB_HEALTHY_THRESHOLD_COUNT="${ALB_HEALTHY_THRESHOLD_COUNT:-2}"
 ALB_UNHEALTHY_THRESHOLD_COUNT="${ALB_UNHEALTHY_THRESHOLD_COUNT:-2}"
 
@@ -258,12 +258,12 @@ WORKDIR /app
 COPY . .
 
 # Base/root dependency install.
-RUN if [ -f package-lock.json ]; then npm ci; elif [ -f pnpm-lock.yaml ]; then npm i -g pnpm && pnpm i; elif [ -f yarn.lock ]; then yarn install; elif [ -f package.json ]; then npm install; fi
+RUN if [ -f package-lock.json ]; then npm install; elif [ -f pnpm-lock.yaml ]; then npm i -g pnpm && pnpm i; elif [ -f yarn.lock ]; then yarn install; elif [ -f package.json ]; then npm install; fi
 
 # Starter-layout optimization: do expensive setup once at image build, not on every container boot.
 RUN if [ -f scripts/start-all.js ] && [ -f server/package.json ] && [ -f web/package.json ]; then \
-      if [ -f server/package-lock.json ]; then (cd server && npm ci); elif [ -f server/yarn.lock ]; then (cd server && yarn install); else (cd server && npm install); fi && \
-      if [ -f web/package-lock.json ]; then (cd web && npm ci); elif [ -f web/yarn.lock ]; then (cd web && yarn install); else (cd web && npm install); fi && \
+      if [ -f server/package-lock.json ]; then (cd server && npm install); elif [ -f server/yarn.lock ]; then (cd server && yarn install); else (cd server && npm install); fi && \
+      if [ -f web/package-lock.json ]; then (cd web && npm install); elif [ -f web/yarn.lock ]; then (cd web && yarn install); else (cd web && npm install); fi && \
       (cd server && npm run prisma:generate --if-present && npm run build --if-present) && \
       (cd web && npm run build --if-present); \
     fi

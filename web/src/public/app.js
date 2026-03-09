@@ -3714,10 +3714,12 @@ class AppShell extends HTMLElement {
     this.querySelector('#submitTask')?.addEventListener('click', async () => {
       const prompt = this.querySelector('#taskPrompt').value;
       if (!prompt) return setTaskStatus('Enter a task prompt', { autoHide: true });
-      prepareAppLogsForDeploy(state.environment);
+      const submitEnv = state.environment;
+      prepareAppLogsForDeploy(submitEnv);
       if (state.appLogsVisible) {
-        fetchApplicationLogs({ force: true });
-        ensureAppLogPolling();
+        // Keep the panel cleared while waiting for the next build to start.
+        stopAppLogPolling();
+        updateAppLogPanel({ forceScroll: true });
       }
       setTaskStatus('Reading Request', { persistent: true });
       try {

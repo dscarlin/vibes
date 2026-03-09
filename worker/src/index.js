@@ -410,6 +410,10 @@ const EXTERNAL_HEALTHCHECK_POLL_BACKOFF_AFTER_MS = Math.max(
   10000,
   Number(process.env.EXTERNAL_HEALTHCHECK_POLL_BACKOFF_AFTER_MS || 60000)
 );
+const EXTERNAL_HEALTHCHECK_MAX_ATTEMPTS = Math.max(
+  1,
+  Number(process.env.EXTERNAL_HEALTHCHECK_MAX_ATTEMPTS || 2)
+);
 const HEALTHCHECK_LOG_LINES = Math.max(50, Math.min(Number(process.env.HEALTHCHECK_LOG_LINES || 1200), 2000));
 const CRASHLOOP_RESTART_THRESHOLD = Number(process.env.CRASHLOOP_RESTART_THRESHOLD || 5);
 const DEV_SCALE_TO_ZERO_AFTER_MS = Number(process.env.DEV_SCALE_TO_ZERO_AFTER_MS || 15 * 60 * 1000);
@@ -1229,15 +1233,21 @@ async function detectFastFail(projectId, environment) {
   return health.fastFail || null;
 }
 
-async function checkHealthOnce(projectId, environment, host, appPort) {
-  const url = healthcheckUrl(environment, host);
+async function checkUrlHealthy(url, timeoutMs = 5000) {
   try {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 5000);
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
     const res = await fetch(url, { signal: controller.signal });
     clearTimeout(timeout);
-    if (res.status >= 200 && res.status < 400) return true;
-  } catch { }
+    return res.status >= 200 && res.status < 400;
+  } catch {
+    return false;
+  }
+}
+
+async function checkHealthOnce(projectId, environment, host, appPort) {
+  const url = healthcheckUrl(environment, host);
+  if (await checkUrlHealthy(url, 5000)) return true;
   if (isLocalPlatform()) {
     const container = `vibes-app-${projectId}-${environment}`;
     const path = healthcheckPathForEnv(environment);
@@ -1253,9 +1263,17 @@ async function checkHealthOnce(projectId, environment, host, appPort) {
 async function waitForHealth(projectId, environment, host, appPort, buildId = null, options = {}) {
   const timeoutMs = Number(options.timeoutMs || HEALTHCHECK_DEFAULTS.timeoutMs);
   const url = healthcheckUrl(environment, host);
+  const internalHost = String(options.internalHost || '').trim();
+  const internalUrl = internalHost ? healthcheckUrl(environment, internalHost) : '';
   const start = Date.now();
   const deadline = start + timeoutMs;
   const externalTarget = !isLocalPlatform() && !host.endsWith('.svc.cluster.local');
+  const configuredAttemptLimit = Number(options.externalAttemptLimit || EXTERNAL_HEALTHCHECK_MAX_ATTEMPTS);
+  const externalAttemptLimit = externalTarget
+    ? Math.max(1, Number.isFinite(configuredAttemptLimit) ? Math.floor(configuredAttemptLimit) : EXTERNAL_HEALTHCHECK_MAX_ATTEMPTS)
+    : 0;
+  let externalAttempts = 0;
+  let useInternalFallback = false;
   let readyAt = null;
 
   const stopOnPodFailure = async () => {
@@ -1286,7 +1304,7 @@ async function waitForHealth(projectId, environment, host, appPort, buildId = nu
             readyAt = Date.now();
             const podLabel = podState.newestPodName ? ` (${podState.newestPodName})` : '';
             console.log(
-              `Newest pod is ready${podLabel} for ${projectId}/${environment}; starting external health checks (${url}).`
+              `Newest pod is ready${podLabel} for ${projectId}/${environment}; starting external health checks (${url}, max attempts=${externalAttemptLimit}).`
             );
           }
         } else {
@@ -1299,14 +1317,28 @@ async function waitForHealth(projectId, environment, host, appPort, buildId = nu
       }
     }
 
-    try {
+    if (externalTarget) {
+      if (!useInternalFallback) {
+        externalAttempts += 1;
+        console.log(`Checking external health for ${url} (${externalAttempts}/${externalAttemptLimit})...`);
+        if (await checkUrlHealthy(url, 5000)) return { ok: true };
+        if (externalAttempts >= externalAttemptLimit && internalUrl) {
+          useInternalFallback = true;
+          console.log(
+            `External health did not pass after ${externalAttempts} attempt(s); falling back to internal health checks (${internalUrl}).`
+          );
+        }
+      }
+    } else {
       console.log(`Checking health for ${url}...`);
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 5000);
-      const res = await fetch(url, { signal: controller.signal });
-      clearTimeout(timeout);
-      if (res.status >= 200 && res.status < 400) return { ok: true };
-    } catch { }
+      if (await checkUrlHealthy(url, 5000)) return { ok: true };
+    }
+
+    if (useInternalFallback && internalUrl) {
+      console.log(`Checking internal health for ${internalUrl}...`);
+      if (await checkUrlHealthy(internalUrl, 5000)) return { ok: true };
+    }
+
     if (isLocalPlatform()) {
       const container = `vibes-app-${projectId}-${environment}`;
       const path = healthcheckPathForEnv(environment);
@@ -1317,8 +1349,10 @@ async function waitForHealth(projectId, environment, host, appPort, buildId = nu
       } catch { }
     }
     let delay = healthcheckDelayForElapsed(elapsed);
-    if (externalTarget && readyAt) {
+    if (externalTarget && readyAt && !useInternalFallback) {
       delay = externalHealthcheckDelayForReadyElapsed(Date.now() - readyAt);
+    } else if (useInternalFallback) {
+      delay = podReadinessDelayForElapsed(elapsed);
     }
     delay = Math.min(delay, Math.max(0, deadline - Date.now()));
     if (delay > 0) {
@@ -1985,7 +2019,8 @@ async function fastResumeEnvironment(projectId, environment, commitHash, buildId
   const appPort = Number(envVars.PORT || process.env.PORT || 3000);
   await ensureBuildNotCancelled(buildId);
   const health = await waitForHealth(projectId, environment, healthHost, appPort, buildId, {
-    timeoutMs: healthTimeoutMs
+    timeoutMs: healthTimeoutMs,
+    internalHost
   });
   if (!health.ok) {
     if (health.fastFail) {
@@ -2512,7 +2547,8 @@ async function deployEnvironment(projectId, environment, commitHash, buildId = n
     );
   }
   const health = await waitForHealth(projectId, environment, healthHost, appPort, buildId, {
-    timeoutMs: healthTimeoutMs
+    timeoutMs: healthTimeoutMs,
+    internalHost
   });
   if (!health.ok) {
     if (health.fastFail) {
