@@ -444,32 +444,6 @@ main {
   }
 }
 
-@media (max-width: 1100px) {
-  .project-env {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    grid-template-areas:
-      "env env"
-      "project nerd";
-  }
-
-  .project-env .env-badges {
-    justify-content: flex-start;
-  }
-}
-
-@media (max-width: 640px) {
-  .project-env {
-    grid-template-columns: 1fr;
-    grid-template-areas:
-      "env"
-      "project"
-      "nerd";
-  }
-
-  .project-env .nerd-level {
-    justify-self: start;
-  }
-}
 header .brand {
   display: flex;
   flex-direction: column;
@@ -507,6 +481,34 @@ header .brand strong {
 .project-env .nerd-level {
   grid-area: nerd;
   justify-self: end;
+}
+
+@media (max-width: 1000px) {
+  .project-env {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-areas:
+      "env env"
+      "project nerd";
+  }
+
+  .project-env .env-badges {
+    justify-content: flex-start;
+  }
+}
+
+@media (max-width: 640px) {
+  .project-env {
+    grid-template-columns: 1fr;
+    grid-template-areas:
+      "env"
+      "project"
+      "nerd";
+  }
+
+  .project-env .env-badges,
+  .project-env .nerd-level {
+    justify-self: start;
+  }
 }
 
 .header-actions {
@@ -554,14 +556,7 @@ body.app-dark .plan-badge {
   white-space: nowrap;
 }
 
-.runtime-bar {
-  position: absolute;
-  left: 0;
-  top: 0;
-  bottom: 0;
-  background: rgba(92, 212, 196, 0.25);
-  z-index: 0;
-}
+
 
 .runtime-badge.runtime-loading {
   opacity: 0.7;
@@ -573,9 +568,6 @@ body.app-dark .runtime-badge {
   background: rgba(106, 168, 255, 0.12);
 }
 
-body.app-dark .runtime-bar {
-  background: rgba(106, 168, 255, 0.25);
-}
 
 .control-stack {
   display: flex;
@@ -599,39 +591,11 @@ body.app-dark .runtime-bar {
   flex-wrap: nowrap;
 }
 
-.env-stop {
-  display: flex;
-  justify-content: center;
-  margin-top: 6px;
-}
-
-.env-stop-button {
-  border: 1px solid rgba(160, 37, 37, 0.5);
-  background: rgba(255, 217, 217, 0.7);
-  color: #a02525;
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  padding: 4px 12px;
-  border-radius: 999px;
-  cursor: pointer;
-}
-
-.env-stop-button:hover {
-  background: rgba(255, 217, 217, 0.9);
-}
-
-body.app-dark .env-stop-button {
-  border-color: rgba(255, 179, 179, 0.6);
-  background: rgba(215, 95, 95, 0.2);
-  color: #ffb3b3;
-}
-
 .env-pill {
+  position: relative;
   display: grid;
   gap: 4px;
-  padding: 8px 16px;
+  padding: 8px 48px 8px 12px;
   border-radius: 999px;
   border: 1px solid rgba(207, 228, 223, 0.9);
   background: #ffffff;
@@ -681,6 +645,66 @@ body.app-dark .env-pill {
 .env-pill:disabled {
   opacity: 0.55;
   cursor: not-allowed;
+}
+
+.env-pill-action {
+  position: absolute;
+  bottom: 6px;
+  right: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 10px;
+  height: 10px;
+  padding: 0;
+  font-size:.5em;
+  border-radius: 999px;
+  border: 1px solid rgba(156, 31, 31, 0.38);
+  background: rgba(255, 226, 226, 0.92);
+  color: #9c1f1f;
+  user-select: none;
+}
+
+.env-pill-action .icon {
+  position: static;
+  width: 11px;
+  height: 11px;
+  color: currentColor;
+  stroke-width: 2.1;
+}
+
+.env-pill-action:hover {
+  background: rgba(255, 207, 207, 0.96);
+}
+
+.env-pill-action.action-cancel {
+  border-color: rgba(166, 102, 0, 0.45);
+  background: rgba(255, 235, 199, 0.95);
+  color: #875f00;
+}
+
+.env-pill-action.action-cancel:hover {
+  background: rgba(255, 223, 170, 0.98);
+}
+
+body.app-dark .env-pill-action {
+  border-color: rgba(255, 166, 166, 0.5);
+  background: rgba(194, 73, 73, 0.3);
+  color: #ffb7b7;
+}
+
+body.app-dark .env-pill-action:hover {
+  background: rgba(194, 73, 73, 0.45);
+}
+
+body.app-dark .env-pill-action.action-cancel {
+  border-color: rgba(255, 214, 120, 0.58);
+  background: rgba(175, 122, 0, 0.32);
+  color: #ffd87a;
+}
+
+body.app-dark .env-pill-action.action-cancel:hover {
+  background: rgba(175, 122, 0, 0.45);
 }
 
 .status-text {

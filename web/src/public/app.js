@@ -1858,7 +1858,6 @@ class AppShell extends HTMLElement {
           <div class="project-env">
               ${this.renderProjectSelect(project)}
               ${this.renderEnvBadges()}
-              ${this.renderEnvStop()}
               ${this.renderNerdLevel()}
             </div>
             <div class="header-actions">
@@ -1911,6 +1910,9 @@ class AppShell extends HTMLElement {
         <symbol id="icon-copy" viewBox="0 0 24 24">
           <rect x="9" y="9" width="10" height="10" rx="2"></rect>
           <rect x="5" y="5" width="10" height="10" rx="2"></rect>
+        </symbol>
+        <symbol id="icon-stop-octagon" viewBox="0 0 24 24">
+          <path d="M8 2h8l6 6v8l-6 6H8l-6-6V8z"></path>
         </symbol>
       </svg>
     `;
@@ -1993,12 +1995,18 @@ class AppShell extends HTMLElement {
       if (status === 'cancelled') return 'Cancelled';
       return 'Offline';
     };
+    const actionForStatus = (status) => {
+      if (status === 'building' || status === 'canceling') return { type: 'cancel' };
+      if (status === 'live') return { type: 'stop' };
+      return null;
+    };
     return state.nerdLevel === 'beginner' ? '' : `
       <div class="env-badges">
         ${envs.map((env,idx) => {
           const status = state.buildStatus[env] || 'offline';
           const isActive = state.environment === env;
           const isLocked = state.nerdLevel === 'beginner';
+          const action = actionForStatus(status);
           const success = state.lastSuccessBuild?.[env];
           const successAt = success?.updated_at || success?.created_at || '';
           const duration = formatDurationMs(success?.duration_ms);
@@ -2008,23 +2016,13 @@ class AppShell extends HTMLElement {
             : 'No successful deploy yet';
           return `
             <button class="env-pill ${isActive ? 'active' : ''} ${idx === 0 ? 'env-left' : idx === 1 ? 'env-middle' : 'env-right'}" type="button" data-env="${env}" ${isLocked ? 'disabled' : ''} aria-pressed="${isActive}">
+              ${action ? `<span class="env-pill-action action-${action.type}" data-env="${env}" data-action="${action.type}" title="${action.type === 'cancel' ? 'Abort build' : 'Stop deployment'}">X</span>` : ''}
               <span class="tag">${env}</span>
               <span class="status-text ${status}">${statusText(status)}</span>
               <span class="env-meta">${metaText}</span>
             </button>
           `;
         }).join('')}
-      </div>
-    `;
-  }
-
-  renderEnvStop() {
-    if (!state.projectId) return '';
-    const status = state.buildStatus[state.environment] || 'offline';
-    if (status !== 'building' && status !== 'live') return '';
-    return `
-      <div class="env-stop">
-        <button class="env-stop-button" id="stopEnvironment" type="button">Stop</button>
       </div>
     `;
   }
@@ -2439,7 +2437,6 @@ class AppShell extends HTMLElement {
     const envLabel = titleCase(state.environment);
     return `
       <div class="runtime-badge" title="${envLabel} runtime this month">
-        <div class="runtime-bar" style="width:${percent}%"></div>
         <span>${envLabel} runtime: ${used}h / ${limit}h</span>
       </div>
     `;
@@ -2448,7 +2445,6 @@ class AppShell extends HTMLElement {
   renderSubmit(project) {
     const env = state.environment;
     const isBeginner = state.nerdLevel === 'beginner';
-    const canCancelBuild = ['building', 'canceling'].includes(state.buildStatus[env]);
     const appLogText = state.appLogsByEnv[env] || '';
     const appLogError = state.appLogError[env] || '';
     const appLogLoading = Boolean(state.appLogLoading[env]);
@@ -2479,7 +2475,6 @@ class AppShell extends HTMLElement {
         <div class="row m-top-sm submit-controls">
           <div class="row">
             <button id="submitTask">Submit</button>
-            ${canCancelBuild ? '<button class="ghost" id="cancelBuild">Stop build</button>' : ''}
           </div>
           <label class="toggle app-log-toggle">
             <input id="toggleAppLogs" type="checkbox" ${state.appLogsVisible ? 'checked' : ''} />
@@ -3649,7 +3644,8 @@ class AppShell extends HTMLElement {
     });
 
     this.querySelectorAll('.env-pill').forEach((btn) => {
-      btn.addEventListener('click', () => {
+      btn.addEventListener('click', (event) => {
+        if (event.target instanceof Element && event.target.closest('.env-pill-action')) return;
         const env = btn.getAttribute('data-env');
         if (!env) return;
         setState({
@@ -3671,20 +3667,54 @@ class AppShell extends HTMLElement {
       });
     });
 
-    this.querySelector('#stopEnvironment')?.addEventListener('click', async () => {
-      if (!state.projectId) return;
-      const env = state.environment;
-      const ok = await showConfirm(`Stop the ${titleCase(env)} environment?`, { confirmText: 'Stop' });
-      if (!ok) return;
-      setTaskStatus('Stopping environment…', { autoHide: true });
-      try {
-        await api(`/projects/${state.projectId}/stop`, {
-          method: 'POST',
-          body: JSON.stringify({ environment: env })
-        });
-      } catch (err) {
-        showError(err);
+    const runEnvironmentAction = async (env, action) => {
+      if (!state.projectId || !env) return;
+      if (action === 'cancel') {
+        if (state.buildStatus[env] === 'canceling') {
+          setTaskStatus('Build cancel is already in progress.', { autoHide: true });
+          return;
+        }
+        setTaskStatus('Canceling build…', { autoHide: true });
+        state.buildStatus[env] = 'canceling';
+        setState({ buildStatus: { ...state.buildStatus } });
+        try {
+          await api(`/projects/${state.projectId}/builds/cancel`, {
+            method: 'POST',
+            body: JSON.stringify({ environment: env })
+          });
+        } catch (err) {
+          showError(err);
+        } finally {
+          await loadLatestBuild(state.projectId, env);
+          ensureBuildLogPolling();
+        }
+        return;
       }
+      if (action === 'stop') {
+        const ok = await showConfirm(`Stop the ${titleCase(env)} environment?`, { confirmText: 'Stop' });
+        if (!ok) return;
+        setTaskStatus('Stopping environment…', { autoHide: true });
+        try {
+          await api(`/projects/${state.projectId}/stop`, {
+            method: 'POST',
+            body: JSON.stringify({ environment: env })
+          });
+          await loadLatestBuild(state.projectId, env);
+        } catch (err) {
+          showError(err);
+        }
+      }
+    };
+
+    this.querySelectorAll('.env-pill-action').forEach((control) => {
+      control.addEventListener('click', async (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const env = control.getAttribute('data-env');
+        const action = control.getAttribute('data-action');
+        if (!env || !action) return;
+        await runEnvironmentAction(env, action);
+      });
     });
 
     this.querySelector('#nerdLevel')?.addEventListener('change', (e) => {
@@ -3731,25 +3761,6 @@ class AppShell extends HTMLElement {
         this.querySelector('#taskPrompt').value = '';
       } catch (err) {
         showError(err);
-      }
-    });
-
-    this.querySelector('#cancelBuild')?.addEventListener('click', async () => {
-      if (!state.projectId) return;
-      const env = state.environment;
-      setTaskStatus('Canceling build…', { autoHide: true });
-      state.buildStatus[env] = 'canceling';
-      setState({ buildStatus: { ...state.buildStatus } });
-      try {
-        await api(`/projects/${state.projectId}/builds/cancel`, {
-          method: 'POST',
-          body: JSON.stringify({ environment: env })
-        });
-      } catch (err) {
-        showError(err);
-      } finally {
-        await loadLatestBuild(state.projectId, env);
-        ensureBuildLogPolling();
       }
     });
 
