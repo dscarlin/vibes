@@ -1856,8 +1856,8 @@ class AppShell extends HTMLElement {
             Vibes Platform
           </div>
           <div class="project-env">
-              ${this.renderProjectSelect(project)}
               ${this.renderEnvBadges()}
+              ${this.renderProjectSelect(project)}
               ${this.renderNerdLevel()}
             </div>
             <div class="header-actions">
