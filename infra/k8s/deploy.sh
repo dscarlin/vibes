@@ -258,18 +258,30 @@ WORKDIR /app
 COPY . .
 
 # Base/root dependency install.
-RUN if [ -f package-lock.json ]; then npm install; elif [ -f pnpm-lock.yaml ]; then npm i -g pnpm && pnpm i; elif [ -f yarn.lock ]; then yarn install; elif [ -f package.json ]; then npm install; fi
+RUN set -eux; \
+    if find . -maxdepth 3 -name pnpm-lock.yaml -not -path '*/node_modules/*' | grep -q .; then npm i -g pnpm; fi; \
+    if find . -maxdepth 3 -name yarn.lock -not -path '*/node_modules/*' | grep -q .; then corepack enable; fi; \
+    find . -maxdepth 3 -name package.json -not -path '*/node_modules/*' | sort | while read -r pkg; do \
+      dir="$(dirname "$pkg")"; \
+      if [ -f "$dir/package-lock.json" ]; then \
+        (cd "$dir" && npm install); \
+      elif [ -f "$dir/pnpm-lock.yaml" ]; then \
+        (cd "$dir" && pnpm i); \
+      elif [ -f "$dir/yarn.lock" ]; then \
+        (cd "$dir" && yarn install); \
+      else \
+        (cd "$dir" && npm install); \
+      fi; \
+    done
 
 # Starter-layout optimization: do expensive setup once at image build, not on every container boot.
 RUN if [ -f scripts/start-all.js ] && [ -f server/package.json ] && [ -f web/package.json ]; then \
-      if [ -f server/package-lock.json ]; then (cd server && npm install); elif [ -f server/yarn.lock ]; then (cd server && yarn install); else (cd server && npm install); fi && \
-      if [ -f web/package-lock.json ]; then (cd web && npm install); elif [ -f web/yarn.lock ]; then (cd web && yarn install); else (cd web && npm install); fi && \
       (cd server && npm run prisma:generate --if-present && npm run build --if-present) && \
       (cd web && npm run build --if-present); \
     fi
 
 EXPOSE 3000
-CMD ["sh", "-lc", "if [ -n \"${START_COMMAND:-}\" ]; then exec sh -lc \"${START_COMMAND}\"; elif [ -f scripts/start-all.js ] && [ -f server/dist/index.js ]; then exec node server/dist/index.js; elif [ -f scripts/start-all.js ] && [ -f server/index.js ]; then exec node server/index.js; else exec npm start; fi"]
+CMD ["sh", "-lc", "if [ -n \"${START_COMMAND:-}\" ]; then exec sh -lc \"${START_COMMAND}\"; else exec npm start; fi"]
 DOCKER
 fi
 
@@ -520,16 +532,21 @@ if [ -n "$AUTO_DNS" ] && [ "$AUTO_DNS" != "false" ]; then
   fi
 
   ROUTE53_HOSTED_ZONE_ID="${ROUTE53_HOSTED_ZONE_ID:-}"
+  ROUTE53_DOMAIN="${ROUTE53_DOMAIN:-${APP_DOMAIN:-${DOMAIN:-}}}"
+  if [ -z "$ROUTE53_DOMAIN" ] && [ -n "${APP_HOST:-}" ]; then
+    ROUTE53_DOMAIN="${APP_HOST#*.}"
+  fi
+  ROUTE53_DOMAIN="${ROUTE53_DOMAIN%.}"
   if [ -z "$ROUTE53_HOSTED_ZONE_ID" ]; then
-    if [ -z "${DOMAIN:-}" ]; then
-      echo "AUTO_DNS enabled but DOMAIN not set; skipping DNS update" >&2
+    if [ -z "$ROUTE53_DOMAIN" ]; then
+      echo "AUTO_DNS enabled but ROUTE53_DOMAIN/APP_DOMAIN/DOMAIN not set; skipping DNS update" >&2
       exit 0
     fi
-    ROUTE53_HOSTED_ZONE_ID="$("$AWS_BIN" route53 list-hosted-zones-by-name --dns-name "$DOMAIN" --max-items 1 --query 'HostedZones[0].Id' --output text)"
+    ROUTE53_HOSTED_ZONE_ID="$("$AWS_BIN" route53 list-hosted-zones-by-name --dns-name "$ROUTE53_DOMAIN" --max-items 1 --query 'HostedZones[0].Id' --output text)"
     ROUTE53_HOSTED_ZONE_ID="${ROUTE53_HOSTED_ZONE_ID#/hostedzone/}"
   fi
   if [ -z "$ROUTE53_HOSTED_ZONE_ID" ] || [ "$ROUTE53_HOSTED_ZONE_ID" = "None" ]; then
-    echo "AUTO_DNS could not resolve Route53 hosted zone for ${DOMAIN}; skipping DNS update" >&2
+    echo "AUTO_DNS could not resolve Route53 hosted zone for ${ROUTE53_DOMAIN}; skipping DNS update" >&2
     exit 0
   fi
 

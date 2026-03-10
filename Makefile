@@ -2,9 +2,9 @@
 
 AWS_REGION ?= us-east-1
 RDS_CA_FILE ?= ./rds-ca.pem
-SERVER_ENV_FILE ?= ./.env.server.local
+SERVER_ENV_FILE ?= ./.env.server
 WEB_ENV_FILE ?= ./.env.web
-WORKER_ENV_FILE ?= ./.env.worker.local
+WORKER_ENV_FILE ?= ./.env.worker
 K8S_APPLY_ENV_FILE ?= ./.env.k8s.apply
 API_URL ?= https://api.vibesplatform.ai
 DOMAIN ?= vibesplatform.ai

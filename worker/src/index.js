@@ -378,7 +378,6 @@ const DEV_DELETE_COMMAND = process.env.DEV_DELETE_COMMAND;
 const TEST_DELETE_COMMAND = process.env.TEST_DELETE_COMMAND;
 const PROD_DELETE_COMMAND = process.env.PROD_DELETE_COMMAND;
 const VIBES_WORKDIR_ROOT = process.env.VIBES_WORKDIR_ROOT || path.join(os.homedir(), '.vibes');
-const STRICT_DELETE = (process.env.STRICT_DELETE || '').toLowerCase() === 'true';
 const DEMO_MODE = (process.env.DEMO_MODE || '').toLowerCase() === 'true';
 const HEALTHCHECK_DEFAULTS = {
   path: process.env.HEALTHCHECK_PATH || '/',
@@ -667,6 +666,7 @@ async function recordAdminAlert(type, message, data, level = 'warning') {
 function alertLevelFor(type) {
   if (type === 'healthcheck_failed') return 'error';
   if (type === 'dev_restart_hard_fail') return 'error';
+  if (type === 'project_delete_cleanup_failed') return 'error';
   if (type === 'queue_backlog') return 'warning';
   return 'warning';
 }
@@ -2058,8 +2058,28 @@ function hostProjectName(name) {
   return cleaned || 'app';
 }
 
+function normalizeDomain(raw) {
+  return String(raw || '')
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//, '')
+    .replace(/\/+$/, '');
+}
+
+function appDomainForHosts() {
+  const explicit = normalizeDomain(process.env.APP_DOMAIN);
+  if (explicit) return explicit;
+  const fallback = normalizeDomain(process.env.DOMAIN);
+  if (!fallback) return 'localhost:8000';
+  // Common prod setup keeps API on api.<domain>; app hosts should use the apex wildcard.
+  if (fallback.startsWith('api.') && fallback.split('.').length >= 3) {
+    return fallback.slice(4);
+  }
+  return fallback;
+}
+
 function hostFor(project, environment) {
-  const domain = process.env.APP_DOMAIN || process.env.DOMAIN || 'localhost:8000';
+  const domain = appDomainForHosts();
   const slug = project?.project_slug || hostProjectName(project?.name);
   const suffix = project?.short_id ? `-${project.short_id}` : '';
   // Use a single-label subdomain so it matches *.vibesplatform.ai wildcard certs.
@@ -2587,9 +2607,36 @@ async function cleanupDevRuntime(projectId, shortId, environment) {
   await exec('sh', ['-lc', 'podman exec vibes-nginx nginx -s reload >/dev/null 2>&1 || true']);
 }
 
+function cleanupErrorDetails(err) {
+  const message = err?.message || String(err || 'cleanup failed');
+  const stdout = err?.stdout ? String(err.stdout) : '';
+  const stderr = err?.stderr ? String(err.stderr) : '';
+  const commandOutput = [stdout, stderr, message].filter(Boolean).join('\n').trim();
+  return {
+    message: truncateText(message, 1000),
+    stdout: truncateText(stdout, 3500),
+    stderr: truncateText(stderr, 3500),
+    command_output: truncateText(commandOutput, 7000)
+  };
+}
+
+function cleanupResourceTypesFromCommandFailure(err, options = {}) {
+  const text = `${err?.message || ''}\n${err?.stdout || ''}\n${err?.stderr || ''}`.toLowerCase();
+  const resourceTypes = new Set();
+  if (/(kubectl|ingress|deployment|service|secret|namespace|pod\b)/.test(text)) resourceTypes.add('k8s');
+  if (/(route53|dns|hosted zone|record set|auto_dns)/.test(text)) resourceTypes.add('dns');
+  if (/(ecr|batch-delete-image|list-images|repository-name|imageids|image ids)/.test(text)) resourceTypes.add('ecr');
+  if (resourceTypes.size === 0) {
+    resourceTypes.add('k8s');
+    if (options.autoDnsEnabled) resourceTypes.add('dns');
+    if (options.deleteEcrEnabled) resourceTypes.add('ecr');
+  }
+  return Array.from(resourceTypes);
+}
+
 async function processDeleteProject(projectId) {
   const projectRes = await pool.query(
-    'select id, name, short_id, project_slug from projects where id = $1',
+    'select id, owner_id, name, short_id, project_slug from projects where id = $1',
     [projectId]
   );
   if (projectRes.rowCount === 0) return;
@@ -2601,43 +2648,113 @@ async function processDeleteProject(projectId) {
   const envs = envRes.rows.length
     ? envRes.rows
     : ['development', 'testing', 'production'].map((name) => ({ name, db_name: null }));
-  const cleanupErrors = [];
-  for (const env of envs) {
-    const dbName = env.db_name || dbNameFor(project.short_id, env.name);
+  const envContexts = envs.map((env) => ({
+    name: env.name,
+    db_name: env.db_name || dbNameFor(project.short_id, env.name),
+    host: hostFor(project, env.name),
+    delete_command: deleteCommandForEnv(env.name)
+  }));
+  const cleanupFailures = [];
+  const autoDnsEnabled = Boolean(process.env.AUTO_DNS) && String(process.env.AUTO_DNS).toLowerCase() !== 'false';
+  const deleteEcrEnabled = String(process.env.DELETE_ECR_IMAGES || 'true').toLowerCase() !== 'false';
+
+  for (const env of envContexts) {
     try {
-      await dropDatabase(dbName);
-    } catch { }
-    const host = hostFor(project, env.name);
-    const cmd = deleteCommandForEnv(env.name);
+      await dropDatabase(env.db_name);
+    } catch (err) {
+      cleanupFailures.push({
+        environment: env.name,
+        host: env.host,
+        db_name: env.db_name,
+        resource_types: ['db'],
+        operation: 'drop_database',
+        ...cleanupErrorDetails(err)
+      });
+    }
+    const cmd = env.delete_command;
     if (cmd) {
       const envVars = {
         ...process.env,
         PROJECT_ID: projectId,
         PROJECT_SHORT_ID: project.short_id,
         ENVIRONMENT: env.name,
-        APP_HOST: host
+        APP_HOST: env.host
       };
       try {
         await exec('sh', ['-lc', cmd], { env: envVars });
       } catch (err) {
-        const msg = err?.message || '';
-        const stderr = err?.stderr || '';
-        const notFound = msg.includes('command not found') || stderr.includes('command not found');
-        if (notFound && !STRICT_DELETE) {
-          continue;
-        }
-        cleanupErrors.push(`env ${env.name}: ${msg || stderr || 'cleanup failed'}`);
+        cleanupFailures.push({
+          environment: env.name,
+          host: env.host,
+          db_name: env.db_name,
+          resource_types: cleanupResourceTypesFromCommandFailure(err, { autoDnsEnabled, deleteEcrEnabled }),
+          operation: 'delete_command',
+          command: cmd,
+          ...cleanupErrorDetails(err)
+        });
       }
     } else if (env.name === 'development') {
-      await cleanupDevRuntime(projectId, project.short_id, env.name);
+      try {
+        await cleanupDevRuntime(projectId, project.short_id, env.name);
+      } catch (err) {
+        cleanupFailures.push({
+          environment: env.name,
+          host: env.host,
+          db_name: env.db_name,
+          resource_types: ['k8s'],
+          operation: 'cleanup_dev_runtime',
+          ...cleanupErrorDetails(err)
+        });
+      }
+    } else {
+      cleanupFailures.push({
+        environment: env.name,
+        host: env.host,
+        db_name: env.db_name,
+        resource_types: ['k8s', 'dns', 'ecr'],
+        operation: 'delete_command',
+        command: null,
+        message: 'Delete command not configured for environment',
+        stdout: '',
+        stderr: '',
+        command_output: 'Delete command not configured for environment'
+      });
     }
   }
   await pool.query('delete from projects where id = $1', [projectId]);
   emitProjectEvent(projectId, 'projectDeleted', { projectId });
-  if (cleanupErrors.length) {
-    const message = `Delete project ${projectId} completed with warnings:\n${cleanupErrors.join('\n')}`;
-    if (STRICT_DELETE) throw new Error(message);
+  if (cleanupFailures.length) {
+    const summary = cleanupFailures
+      .map((failure) => {
+        const types = Array.isArray(failure.resource_types) ? failure.resource_types.join(', ') : 'unknown';
+        return `env ${failure.environment} [${types}] ${failure.message || 'cleanup failed'}`;
+      })
+      .join('\n');
+    const payload = {
+      project_id: project.id,
+      owner_id: project.owner_id,
+      name: project.name,
+      slug: project.project_slug || hostProjectName(project.name),
+      short_id: project.short_id,
+      environments: envContexts.map((env) => ({
+        name: env.name,
+        host: env.host,
+        db_name: env.db_name,
+        delete_command: env.delete_command || null
+      })),
+      cleanup_failure_count: cleanupFailures.length,
+      cleanup_failures: cleanupFailures,
+      summary: truncateText(summary, 3500),
+      project_row_deleted: true
+    };
+    const message = `Delete project ${projectId} completed with cleanup failures`;
     console.warn(message);
+    console.warn(JSON.stringify(payload, null, 2));
+    try {
+      await sendAlert('project_delete_cleanup_failed', message, payload, `project:${projectId}`);
+    } catch (err) {
+      console.warn('Failed to emit project delete cleanup alert', err?.message || err);
+    }
   }
 }
 

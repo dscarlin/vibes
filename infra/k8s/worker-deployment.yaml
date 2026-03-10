@@ -51,11 +51,17 @@ spec:
             - name: ECR_REPO
               value: REPLACE_WITH_ECR_REPO
             - name: DEV_DEPLOY_COMMAND
-              value: ""
+              value: /app/infra/k8s/deploy.sh
             - name: TEST_DEPLOY_COMMAND
-              value: ./infra/k8s/deploy.sh
+              value: /app/infra/k8s/deploy.sh
             - name: PROD_DEPLOY_COMMAND
-              value: ./infra/k8s/deploy.sh
+              value: /app/infra/k8s/deploy.sh
+            - name: DEV_DELETE_COMMAND
+              value: /app/infra/k8s/delete.sh
+            - name: TEST_DELETE_COMMAND
+              value: /app/infra/k8s/delete.sh
+            - name: PROD_DELETE_COMMAND
+              value: /app/infra/k8s/delete.sh
             - name: DOMAIN
               value: REPLACE_WITH_DOMAIN
             - name: HEALTHCHECK_PATH

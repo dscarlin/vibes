@@ -18,9 +18,10 @@ RUN npm install --omit=dev \
 
 COPY worker/ worker/
 COPY infra/k8s/deploy.sh /app/infra/k8s/deploy.sh
+COPY infra/k8s/delete.sh /app/infra/k8s/delete.sh
 COPY infra/k8s/*.yaml /app/infra/k8s/
 
-RUN chmod +x /app/infra/k8s/deploy.sh
+RUN chmod +x /app/infra/k8s/deploy.sh /app/infra/k8s/delete.sh
 
 COPY --from=kaniko /kaniko/executor /usr/local/bin/kaniko
 RUN curl -fsSL -o /usr/local/bin/kubectl "https://dl.k8s.io/release/v1.30.4/bin/linux/amd64/kubectl" \

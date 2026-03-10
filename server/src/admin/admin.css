@@ -107,6 +107,8 @@ button {
   font-weight: 600;
 }
 
+
+
 button.ghost {
   background: transparent;
   border: 1px solid #2b3447;

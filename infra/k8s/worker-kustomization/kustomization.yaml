@@ -20,9 +20,12 @@ configMapGenerator:
       - AWS_REGION=REPLACE_WITH_AWS_REGION
       - AWS_ACCOUNT_ID=REPLACE_WITH_AWS_ACCOUNT_ID
       - ECR_REPO=REPLACE_WITH_ECR_REPO
-      - DEV_DEPLOY_COMMAND=./infra/k8s/deploy.sh
-      - TEST_DEPLOY_COMMAND=./infra/k8s/deploy.sh
-      - PROD_DEPLOY_COMMAND=./infra/k8s/deploy.sh
+      - DEV_DEPLOY_COMMAND=/app/infra/k8s/deploy.sh
+      - TEST_DEPLOY_COMMAND=/app/infra/k8s/deploy.sh
+      - PROD_DEPLOY_COMMAND=/app/infra/k8s/deploy.sh
+      - DEV_DELETE_COMMAND=/app/infra/k8s/delete.sh
+      - TEST_DELETE_COMMAND=/app/infra/k8s/delete.sh
+      - PROD_DELETE_COMMAND=/app/infra/k8s/delete.sh
       - DOMAIN=REPLACE_WITH_DOMAIN
       - HEALTHCHECK_PATH=/health
       - HEALTHCHECK_TIMEOUT_MS=60000
@@ -140,6 +143,21 @@ patches:
               configMapKeyRef:
                 name: worker-config
                 key: PROD_DEPLOY_COMMAND
+          - name: DEV_DELETE_COMMAND
+            valueFrom:
+              configMapKeyRef:
+                name: worker-config
+                key: DEV_DELETE_COMMAND
+          - name: TEST_DELETE_COMMAND
+            valueFrom:
+              configMapKeyRef:
+                name: worker-config
+                key: TEST_DELETE_COMMAND
+          - name: PROD_DELETE_COMMAND
+            valueFrom:
+              configMapKeyRef:
+                name: worker-config
+                key: PROD_DELETE_COMMAND
           - name: DOMAIN
             valueFrom:
               configMapKeyRef:

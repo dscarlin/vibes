@@ -45,16 +45,21 @@ if [ -n "$AUTO_DNS" ] && [ "$AUTO_DNS" != "false" ]; then
     exit 0
   fi
   ROUTE53_HOSTED_ZONE_ID="${ROUTE53_HOSTED_ZONE_ID:-}"
+  ROUTE53_DOMAIN="${ROUTE53_DOMAIN:-${APP_DOMAIN:-${DOMAIN:-}}}"
+  if [ -z "$ROUTE53_DOMAIN" ] && [ -n "${APP_HOST:-}" ]; then
+    ROUTE53_DOMAIN="${APP_HOST#*.}"
+  fi
+  ROUTE53_DOMAIN="${ROUTE53_DOMAIN%.}"
   if [ -z "$ROUTE53_HOSTED_ZONE_ID" ]; then
-    if [ -z "${DOMAIN:-}" ]; then
-      echo "AUTO_DNS enabled but DOMAIN not set; skipping DNS delete" >&2
+    if [ -z "$ROUTE53_DOMAIN" ]; then
+      echo "AUTO_DNS enabled but ROUTE53_DOMAIN/APP_DOMAIN/DOMAIN not set; skipping DNS delete" >&2
       exit 0
     fi
-    ROUTE53_HOSTED_ZONE_ID="$("$AWS_BIN" route53 list-hosted-zones-by-name --dns-name "$DOMAIN" --max-items 1 --query 'HostedZones[0].Id' --output text)"
+    ROUTE53_HOSTED_ZONE_ID="$("$AWS_BIN" route53 list-hosted-zones-by-name --dns-name "$ROUTE53_DOMAIN" --max-items 1 --query 'HostedZones[0].Id' --output text)"
     ROUTE53_HOSTED_ZONE_ID="${ROUTE53_HOSTED_ZONE_ID#/hostedzone/}"
   fi
   if [ -z "$ROUTE53_HOSTED_ZONE_ID" ] || [ "$ROUTE53_HOSTED_ZONE_ID" = "None" ]; then
-    echo "AUTO_DNS could not resolve Route53 hosted zone for ${DOMAIN}; skipping DNS delete" >&2
+    echo "AUTO_DNS could not resolve Route53 hosted zone for ${ROUTE53_DOMAIN}; skipping DNS delete" >&2
     exit 0
   fi
 

@@ -2,9 +2,9 @@
 set -eu
 
 ENV_FILE=".env"
-if [ -f .env.local ]; then
-  ENV_FILE=".env.local"
-fi
+# if [ -f .env.local ]; then
+#   ENV_FILE=".env.local"
+# fi
 if [ ! -f "$ENV_FILE" ]; then
   echo "${ENV_FILE} not found" >&2
   exit 1
