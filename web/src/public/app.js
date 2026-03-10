@@ -812,6 +812,7 @@ function titleCase(value) {
 }
 
 function formatHours(value) {
+  if(!value) return '0';
   const num = Number(value);
   if (!Number.isFinite(num)) return '0';
   if (Math.abs(num - Math.round(num)) < 0.05) return String(Math.round(num));
@@ -1841,6 +1842,7 @@ class AppShell extends HTMLElement {
       ${this.renderIconSprite()}
       ${isAuthed ? `
         <header class="app-header">
+          <div class="header-container">
           <div class="header-grid">
            <div class="brand">
             <span class="brand-mark" aria-hidden="true">
@@ -1865,7 +1867,7 @@ class AppShell extends HTMLElement {
               ${this.renderAccountMenu()}
             </div>
           </div>
-
+          </div>
         ${this.renderHeaderProgress()}
         </header>
         <main>
@@ -2429,12 +2431,12 @@ class AppShell extends HTMLElement {
       return `<div class="runtime-badge runtime-loading">Runtime: …</div>`;
     }
     const usage = state.runtimeUsage?.usage?.[state.environment];
-    if (!usage) return '';
-    if (!usage.limit_hours) return '';
-    const used = formatHours(usage.used_hours || 0);
-    const limit = formatHours(usage.limit_hours);
-    const percent = Math.min(100, Math.max(0, Number(usage.percent || 0)));
-    const envLabel = titleCase(state.environment);
+    // if (!usage) return '';
+    // if (!usage?.limit_hours) return '';
+    const used = formatHours(usage?.used_hours || 0);
+    const limit = formatHours(usage?.limit_hours);
+    const percent = Math.min(100, Math.max(0, Number(usage?.percent || 0)));
+    const envLabel = titleCase(state.environment) == 'Production' ? 'Prod' : titleCase(state.environment) == 'Testing' ? 'Test' : 'Dev';
     return `
       <div class="runtime-badge" title="${envLabel} runtime this month">
         <span>${envLabel} runtime: ${used}h / ${limit}h</span>
