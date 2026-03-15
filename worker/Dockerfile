@@ -5,7 +5,7 @@ WORKDIR /app
 RUN mkdir -p /app/infra/k8s
 
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends git ca-certificates curl awscli coreutils busybox \
+  && apt-get install -y --no-install-recommends git ca-certificates curl awscli coreutils busybox ripgrep \
   && rm -rf /var/lib/apt/lists/*
 
 COPY package.json package-lock.json ./

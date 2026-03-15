@@ -25,6 +25,7 @@ if [ -z "${APP_HOST:-}" ]; then
   echo "APP_HOST required" >&2
   exit 1
 fi
+SKIP_INGRESS="$(printf '%s' "${SKIP_INGRESS:-false}" | tr '[:upper:]' '[:lower:]')"
 
 if [ -z "$NAMESPACE" ]; then
   NAMESPACE="vibes-${ENVIRONMENT}"
@@ -264,13 +265,13 @@ RUN set -eux; \
     find . -maxdepth 3 -name package.json -not -path '*/node_modules/*' | sort | while read -r pkg; do \
       dir="$(dirname "$pkg")"; \
       if [ -f "$dir/package-lock.json" ]; then \
-        (cd "$dir" && npm install); \
+        (cd "$dir" && npm install --include=dev --no-audit --no-fund); \
       elif [ -f "$dir/pnpm-lock.yaml" ]; then \
-        (cd "$dir" && pnpm i); \
+        (cd "$dir" && pnpm i --prod=false); \
       elif [ -f "$dir/yarn.lock" ]; then \
-        (cd "$dir" && yarn install); \
+        (cd "$dir" && yarn install --production=false); \
       else \
-        (cd "$dir" && npm install); \
+        (cd "$dir" && npm install --include=dev --no-audit --no-fund); \
       fi; \
     done
 
@@ -281,7 +282,7 @@ RUN if [ -f scripts/start-all.js ] && [ -f server/package.json ] && [ -f web/pac
     fi
 
 EXPOSE 3000
-CMD ["sh", "-lc", "if [ -n \"${START_COMMAND:-}\" ]; then exec sh -lc \"${START_COMMAND}\"; else exec npm start; fi"]
+CMD ["sh", "-lc", "if [ -n \"${START_COMMAND:-}\" ]; then exec sh -lc \"${START_COMMAND}\"; elif [ -f scripts/start-all.js ] && [ -f server/dist/index.js ]; then if [ -f server/package.json ] && ! node -e \"const fs=require('fs');const {createRequire}=require('module');const p=JSON.parse(fs.readFileSync('/app/server/package.json','utf8'));const deps=Object.keys(p.dependencies||{});const r=createRequire('/app/server/index.js');for(const d of deps){r.resolve(d);}\" >/dev/null 2>&1; then (cd server && npm install --include=dev --no-audit --no-fund); fi; exec node server/dist/index.js; elif [ -f scripts/start-all.js ] && [ -f server/index.js ]; then if [ -f server/package.json ] && ! node -e \"const fs=require('fs');const {createRequire}=require('module');const p=JSON.parse(fs.readFileSync('/app/server/package.json','utf8'));const deps=Object.keys(p.dependencies||{});const r=createRequire('/app/server/index.js');for(const d of deps){r.resolve(d);}\" >/dev/null 2>&1; then (cd server && npm install --include=dev --no-audit --no-fund); fi; exec node server/index.js; else exec npm start; fi"]
 DOCKER
 fi
 
@@ -470,11 +471,14 @@ echo "deploy.sh phase: kubernetes resources applied in $((APPLY_END_TS - APPLY_S
 ALB_GROUP_NAME="${ALB_GROUP_NAME:-vibes-shared}"
 ALB_GROUP_ORDER="${ALB_GROUP_ORDER:-50}"
 
-if [ -z "${ACM_CERT_ARN:-}" ]; then
-  echo "ACM_CERT_ARN required for ingress" >&2
-  exit 1
-fi
-"$KUBECTL" -n "$NAMESPACE" apply -f - <<EOF
+if [ "$SKIP_INGRESS" = "true" ]; then
+  echo "deploy.sh ingress: skipped (SKIP_INGRESS=true)"
+else
+  if [ -z "${ACM_CERT_ARN:-}" ]; then
+    echo "ACM_CERT_ARN required for ingress" >&2
+    exit 1
+  fi
+  "$KUBECTL" -n "$NAMESPACE" apply -f - <<EOF
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -507,9 +511,10 @@ spec:
                 port:
                   number: 80
 EOF
+fi
 
 AUTO_DNS="${AUTO_DNS:-}"
-if [ -n "$AUTO_DNS" ] && [ "$AUTO_DNS" != "false" ]; then
+if [ "$SKIP_INGRESS" != "true" ] && [ -n "$AUTO_DNS" ] && [ "$AUTO_DNS" != "false" ]; then
   echo "AUTO_DNS debug: AWS_BIN=${AWS_BIN:-<empty>}"
   if [ -n "${AWS_BIN:-}" ] && [ -x "$AWS_BIN" ]; then
     echo "AUTO_DNS debug: AWS_BIN is executable"

@@ -1,4 +1,4 @@
-.PHONY: setup dev certs stop logs worker-kustomize aws-dev-up aws-dev-down server-apply web-apply build-push deploy-all desktop-release status-check
+.PHONY: setup dev certs stop logs worker-kustomize aws-dev-up aws-dev-down server-apply web-apply build-push deploy-all desktop-release status-check db-tunnel stop-db-tunnel
 
 AWS_REGION ?= us-east-1
 RDS_CA_FILE ?= ./rds-ca.pem
@@ -8,6 +8,11 @@ WORKER_ENV_FILE ?= ./.env.worker
 K8S_APPLY_ENV_FILE ?= ./.env.k8s.apply
 API_URL ?= https://api.vibesplatform.ai
 DOMAIN ?= vibesplatform.ai
+DB_TUNNEL_LOCAL_PORT ?= 15432
+DB_TUNNEL_REMOTE_HOST ?=
+DB_TUNNEL_REMOTE_PORT ?=
+DB_TUNNEL_TARGET ?=
+DB_TUNNEL_DRY_RUN ?= false
 
 setup:
 	./scripts/bootstrap.sh
@@ -58,3 +63,22 @@ deploy-all: build-push
 desktop-release:
 	@echo "Building desktop release..."
 	@cd desktop && API_URL=$(API_URL) DOMAIN=$(DOMAIN) NOTARIZE_MACOS=$(NOTARIZE_MACOS) WINDOWS_SIGN=$(WINDOWS_SIGN) WINDOWS_SIGN_TARGET=$(WINDOWS_SIGN_TARGET) ./scripts/build-release.sh
+
+db-tunnel:
+	AWS_REGION=$(AWS_REGION) \
+	SERVER_ENV_FILE=$(SERVER_ENV_FILE) \
+	DB_TUNNEL_LOCAL_PORT=$(DB_TUNNEL_LOCAL_PORT) \
+	DB_TUNNEL_REMOTE_HOST=$(DB_TUNNEL_REMOTE_HOST) \
+	DB_TUNNEL_REMOTE_PORT=$(DB_TUNNEL_REMOTE_PORT) \
+	DB_TUNNEL_TARGET=$(DB_TUNNEL_TARGET) \
+	DB_TUNNEL_DRY_RUN=$(DB_TUNNEL_DRY_RUN) \
+	./scripts/aws/db-tunnel.sh
+
+stop-db-tunnel:
+	@pids=$$(pgrep -f "aws ssm start-session.*AWS-StartPortForwardingSessionToRemoteHost.*$(DB_TUNNEL_LOCAL_PORT)" || true); \
+	if [ -n "$$pids" ]; then \
+		echo "Stopping DB tunnel on local port $(DB_TUNNEL_LOCAL_PORT): $$pids"; \
+		kill $$pids; \
+	else \
+		echo "No DB tunnel found on local port $(DB_TUNNEL_LOCAL_PORT)."; \
+	fi

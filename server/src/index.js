@@ -13,7 +13,15 @@ import { runMigrations } from './migrate.js';
 import { authenticateUser, registerUser, requireAuth, signToken } from './auth.js';
 import { query } from './db.js';
 import { taskQueue } from './queue.js';
-import { archiveRepo, detectRepoRoot, ensureGitRepo, extractArchive, removeTempDir, validateRepo } from './repo.js';
+import {
+  bundleRepo,
+  detectRepoRoot,
+  ensureGitRepo,
+  extractArchive,
+  loadRepoFromBundleBuffer,
+  removeTempDir,
+  validateRepo
+} from './repo.js';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 
@@ -237,6 +245,16 @@ function runtimeQuotaMs(planName, environment) {
   const hours = Number(hoursRaw);
   if (!hours || Number.isNaN(hours) || hours <= 0) return null;
   return hours * 60 * 60 * 1000;
+}
+
+function runtimeQuotaHoursByPlan(planName) {
+  const environments = ['development', 'testing', 'production'];
+  const usage = {};
+  for (const env of environments) {
+    const quotaMs = runtimeQuotaMs(planName, env);
+    usage[env] = quotaMs ? roundHours(quotaMs / 36e5) : null;
+  }
+  return usage;
 }
 
 function currentMonthKey(date = new Date()) {
@@ -753,16 +771,39 @@ app.delete('/settings/healthcheck', requireAuth, async (req, res) => {
 app.get('/settings/demo-openai-key', requireAuth, async (req, res) => {
   const enabled = await isDemoModeEnabled();
   if (!enabled) return res.json({ enabled: false });
-  const result = await query('select openai_api_key from users where id = $1', [req.user.id]);
+  const userId = req.user?.userId || req.user?.id;
+  if (!userId) return res.status(401).json({ error: 'unauthorized' });
+  const result = await query('select openai_api_key from users where id = $1', [userId]);
   res.json({ enabled: true, openaiApiKey: result.rows[0]?.openai_api_key || '' });
 });
 
 app.put('/settings/demo-openai-key', requireAuth, async (req, res) => {
   const enabled = await isDemoModeEnabled();
   if (!enabled) return res.status(403).json({ error: 'demo mode disabled' });
+  const userId = req.user?.userId || req.user?.id;
+  if (!userId) return res.status(401).json({ error: 'unauthorized' });
   const nextKey = String(req.body?.openaiApiKey || '').trim();
-  await query('update users set openai_api_key = $1 where id = $2', [nextKey || null, req.user.id]);
+  await query('update users set openai_api_key = $1 where id = $2', [nextKey || null, userId]);
   res.json({ ok: true });
+});
+
+app.get('/settings/deployment-policy', requireAuth, async (req, res) => {
+  const result = await query('select value from settings where key = $1', ['verified_only_deploys']);
+  const raw = String(result.rows[0]?.value || '').trim().toLowerCase();
+  const verifiedOnly = raw === 'true' || raw === '1' || raw === 'yes' || raw === 'on';
+  res.json({ verifiedOnly });
+});
+
+app.put('/settings/deployment-policy', requireAuth, async (req, res) => {
+  const raw = req.body?.verifiedOnly;
+  const verifiedOnly = raw === true || raw === 'true' || raw === 1 || raw === '1' || raw === 'yes' || raw === 'on';
+  await query(
+    `insert into settings (key, value)
+     values ($1, $2)
+     on conflict (key) do update set value = excluded.value, updated_at = now()`,
+    ['verified_only_deploys', verifiedOnly ? 'true' : 'false']
+  );
+  res.json({ ok: true, verifiedOnly });
 });
 
 app.post('/auth/register', authRateLimit, async (req, res) => {
@@ -774,7 +815,14 @@ app.post('/auth/register', authRateLimit, async (req, res) => {
   if (!email) return res.status(400).json({ error: 'email required' });
   const user = await registerUser(email, password || null);
   const token = signToken({ userId: user.id, email: user.email });
-  res.json({ token, user });
+  const planName = user.plan || DEFAULT_PLAN;
+  res.json({
+    token,
+    user: {
+      ...user,
+      runtime_limits: runtimeQuotaHoursByPlan(planName)
+    }
+  });
 });
 
 app.post('/auth/login', authRateLimit, async (req, res) => {
@@ -789,7 +837,26 @@ app.post('/auth/login', authRateLimit, async (req, res) => {
       id: user.id,
       email: user.email,
       plan: user.plan || DEFAULT_PLAN,
-      is_platform_admin: Boolean(user.is_platform_admin)
+      is_platform_admin: Boolean(user.is_platform_admin),
+      runtime_limits: runtimeQuotaHoursByPlan(user.plan || DEFAULT_PLAN)
+    }
+  });
+});
+
+app.get('/auth/me', requireAuth, async (req, res) => {
+  const result = await query(
+    'select id, email, plan, is_platform_admin from users where id = $1',
+    [req.user.userId]
+  );
+  if (result.rowCount === 0) return res.status(401).json({ error: 'unauthorized' });
+  const row = result.rows[0];
+  res.json({
+    user: {
+      id: row.id,
+      email: row.email,
+      plan: row.plan || DEFAULT_PLAN,
+      is_platform_admin: Boolean(row.is_platform_admin),
+      runtime_limits: runtimeQuotaHoursByPlan(row.plan || DEFAULT_PLAN)
     }
   });
 });
@@ -1453,19 +1520,7 @@ app.get('/projects', requireAuth, async (req, res) => {
   const projects = result.rows;
   const ids = projects.map((p) => p.id);
   if (ids.length === 0) return res.json([]);
-  const envRes = await query(
-    'select project_id, name, deployed_commit, build_status, updated_at from environments where project_id = any($1)',
-    [ids]
-  );
-  const envMap = {};
-  for (const row of envRes.rows) {
-    envMap[row.project_id] = envMap[row.project_id] || {};
-    envMap[row.project_id][row.name] = {
-      deployed_commit: row.deployed_commit,
-      build_status: row.build_status,
-      updated_at: row.updated_at
-    };
-  }
+  const envMap = await loadEnvironmentStatusMap(ids);
   res.json(projects.map((p) => ({ ...p, environments: envMap[p.id] || {} })));
 });
 
@@ -1480,7 +1535,9 @@ app.post('/projects/:projectId/repo-upload', requireAuth, upload.single('file'),
   if (!req.file) return res.status(400).json({ error: 'file required' });
   const filename = (req.file.originalname || '').toLowerCase();
   const ext =
-    filename.endsWith('.zip') ? '.zip'
+    filename.endsWith('.bundle') ? '.bundle'
+    : filename.endsWith('.gitbundle') ? '.bundle'
+    : filename.endsWith('.zip') ? '.zip'
     : (filename.endsWith('.tar.gz') || filename.endsWith('.tgz')) ? '.tar.gz'
     : (filename.endsWith('.tar') ? '.tar' : '');
   if (!ext) return res.status(400).json({ error: 'invalid file type' });
@@ -1493,8 +1550,15 @@ app.post('/projects/:projectId/repo-upload', requireAuth, upload.single('file'),
 
   let extractDir;
   try {
-    extractDir = await extractArchive(req.file.buffer, ext);
-    const repoPath = await detectRepoRoot(extractDir);
+    let repoPath = '';
+    if (ext === '.bundle') {
+      const loaded = await loadRepoFromBundleBuffer(req.file.buffer);
+      extractDir = loaded.tempDir;
+      repoPath = loaded.repoPath;
+    } else {
+      extractDir = await extractArchive(req.file.buffer, ext);
+      repoPath = await detectRepoRoot(extractDir);
+    }
     await ensureGitRepo(repoPath);
     await validateRepo(repoPath);
 
@@ -1654,10 +1718,26 @@ app.post('/projects/:projectId/repo-upload', requireAuth, upload.single('file'),
     }
 
     try {
-      const snapshot = await archiveRepo(repoPath);
+      const repoBundle = await bundleRepo(repoPath);
       await query(
-        'update projects set snapshot_blob = $1, snapshot_status = $2 where id = $3',
-        [snapshot, 'ready', req.params.projectId]
+        `update projects
+            set repo_bundle_blob = $1,
+                repo_bundle_updated_at = now(),
+                snapshot_blob = null,
+                snapshot_status = $2
+          where id = $3`,
+        [repoBundle, 'ready', req.params.projectId]
+      );
+      await query(
+        `update project_workspaces
+           set state = 'stale',
+               preview_mode = 'verified',
+               workspace_dirty = true,
+               last_error = 'Workspace reset required after repository upload',
+               updated_at = now()
+         where project_id = $1
+           and environment = 'development'`,
+        [req.params.projectId]
       );
       if (transactionStarted) {
         await query('commit');
@@ -1670,6 +1750,10 @@ app.post('/projects/:projectId/repo-upload', requireAuth, upload.single('file'),
       }
       throw err;
     }
+    await taskQueue.add('reset-workspace', {
+      projectId: req.params.projectId,
+      environment: 'development'
+    });
     res.json({ ok: true });
   } finally {
     await removeTempDir(extractDir);
@@ -1678,12 +1762,19 @@ app.post('/projects/:projectId/repo-upload', requireAuth, upload.single('file'),
 
 app.get('/projects/:projectId/repo-download', requireAuth, async (req, res) => {
   const projectRes = await query(
-    'select id, name, snapshot_blob from projects where id = $1 and owner_id = $2',
+    `select id, name, repo_bundle_blob, snapshot_blob
+       from projects
+      where id = $1 and owner_id = $2`,
     [req.params.projectId, req.user.userId]
   );
   if (projectRes.rowCount === 0) return res.status(404).json({ error: 'project not found' });
   const project = projectRes.rows[0];
-  if (!project.snapshot_blob) return res.status(404).json({ error: 'snapshot missing' });
+  if (project.repo_bundle_blob) {
+    res.setHeader('Content-Type', 'application/octet-stream');
+    res.setHeader('Content-Disposition', `attachment; filename=\"${project.name}.bundle\"`);
+    return res.send(project.repo_bundle_blob);
+  }
+  if (!project.snapshot_blob) return res.status(404).json({ error: 'repo missing' });
   res.setHeader('Content-Type', 'application/gzip');
   res.setHeader('Content-Disposition', `attachment; filename=\"${project.name}.tar.gz\"`);
   res.send(project.snapshot_blob);
@@ -1733,16 +1824,16 @@ app.post('/projects/:projectId/tasks', requireAuth, async (req, res) => {
     return res.status(409).json({ error: 'task already in progress' });
   }
   if (!(await ensureRuntimeQuota(req, res, env))) return;
+  await cancelSupersededDevelopmentWork(
+    req.params.projectId,
+    '\n\n[system] Cancel requested because a newer development task was submitted.\n'
+  );
   const result = await query(
     `insert into tasks (project_id, environment, prompt, status)
      values ($1, $2, $3, 'queued')
      returning *`,
     [req.params.projectId, env, prompt]
   );
-  await taskQueue.add('stop-environment', {
-    projectId: req.params.projectId,
-    environment: env
-  });
   await taskQueue.add('codex-task', { taskId: result.rows[0].id });
   res.json(result.rows[0]);
 });
@@ -1780,6 +1871,203 @@ async function ensureProjectOwner(projectId, userId) {
     [projectId, userId]
   );
   return result.rowCount > 0;
+}
+
+async function cancelLatestBuild(projectId, environment, reason) {
+  const buildRes = await query(
+    `select id
+     from builds
+     where project_id = $1
+       and environment = $2
+       and status = 'building'
+     order by created_at desc
+     limit 1`,
+    [projectId, environment]
+  );
+  const buildId = buildRes.rows[0]?.id || null;
+  if (!buildId) return null;
+  await query(
+    `update builds
+     set cancel_requested = true,
+         build_log = coalesce(build_log, '') || $1,
+         updated_at = now()
+     where id = $2`,
+    [reason, buildId]
+  );
+  return buildId;
+}
+
+async function removeQueuedDevelopmentJobs(projectId, jobNames, environment = 'development') {
+  const allowedNames = new Set(jobNames || []);
+  const jobs = await taskQueue.getJobs(['waiting', 'delayed']);
+  let removed = 0;
+  for (const job of jobs) {
+    if (!allowedNames.has(job.name)) continue;
+    if (job.data?.projectId !== projectId) continue;
+    if (job.name === 'deploy-commit' && job.data?.environment !== environment) continue;
+    await job.remove();
+    removed += 1;
+  }
+  return removed;
+}
+
+async function cancelSupersededDevelopmentWork(projectId, reason) {
+  const [buildId, removed] = await Promise.all([
+    cancelLatestBuild(projectId, 'development', reason),
+    removeQueuedDevelopmentJobs(
+      projectId,
+      new Set(['deploy-commit', 'verify-development-preview', 'verify-development-workspace'])
+    ).catch((err) => {
+      console.warn('Failed to remove superseded development jobs', err?.message || err);
+      return 0;
+    })
+  ]);
+  return { buildId, removed };
+}
+
+function workspaceNames(projectId) {
+  const base = `vibes-workspace-${projectId}`;
+  return {
+    pvcName: `${base}-pvc`,
+    podName: base,
+    serviceName: base
+  };
+}
+
+function normalizeDevelopmentMode(value) {
+  const mode = String(value || '').trim().toLowerCase();
+  if (['preview', 'workspace'].includes(mode)) return 'workspace';
+  if (['full_build', 'full-build', 'verified'].includes(mode)) return 'verified';
+  return null;
+}
+
+async function isVerifiedOnlyDeploysEnabled() {
+  const result = await query('select value from settings where key = $1', ['verified_only_deploys']);
+  const raw = String(result.rows[0]?.value || '').trim().toLowerCase();
+  return raw === 'true' || raw === '1' || raw === 'yes' || raw === 'on';
+}
+
+async function loadDevelopmentWorkspace(projectId) {
+  const result = await query(
+    `select *
+       from project_workspaces
+      where project_id = $1
+        and environment = 'development'`,
+    [projectId]
+  );
+  return result.rows[0] || null;
+}
+
+async function upsertDevelopmentSelection(projectId, patch = {}) {
+  const existing = await loadDevelopmentWorkspace(projectId);
+  const names = workspaceNames(projectId);
+  const selectedMode =
+    patch.selected_mode !== undefined
+      ? patch.selected_mode
+      : (existing?.selected_mode || existing?.preview_mode || 'verified');
+  const selectedTaskId =
+    Object.prototype.hasOwnProperty.call(patch, 'selected_task_id')
+      ? patch.selected_task_id
+      : (existing?.selected_task_id || null);
+  const selectedCommitSha =
+    Object.prototype.hasOwnProperty.call(patch, 'selected_commit_sha')
+      ? patch.selected_commit_sha
+      : (existing?.selected_commit_sha || null);
+  await query(
+    `insert into project_workspaces (
+       project_id,
+       environment,
+       pvc_name,
+       workspace_pod_name,
+       service_name,
+       state,
+       preview_mode,
+       selected_mode,
+       selected_task_id,
+       selected_commit_sha
+     ) values (
+       $1,
+       'development',
+       $2,
+       $3,
+       $4,
+       $5,
+       $6,
+       $7,
+       $8,
+       $9
+     )
+     on conflict (project_id, environment)
+     do update set
+       selected_mode = excluded.selected_mode,
+       selected_task_id = excluded.selected_task_id,
+       selected_commit_sha = excluded.selected_commit_sha,
+       updated_at = now()`,
+    [
+      projectId,
+      existing?.pvc_name || names.pvcName,
+      existing?.workspace_pod_name || names.podName,
+      existing?.service_name || names.serviceName,
+      existing?.state || 'sleeping',
+      existing?.preview_mode || 'verified',
+      selectedMode,
+      selectedTaskId,
+      selectedCommitSha
+    ]
+  );
+}
+
+async function loadEnvironmentStatusMap(projectIds) {
+  if (!projectIds || projectIds.length === 0) return {};
+  const envRes = await query(
+    `select e.project_id,
+            e.name,
+            e.deployed_commit,
+            e.build_status,
+            e.updated_at,
+            w.preview_mode,
+            w.state as workspace_state,
+            w.current_commit_sha as commit_sha,
+            w.last_verified_commit_sha as verified_commit_sha,
+            w.selected_mode,
+            w.selected_task_id,
+            w.selected_commit_sha,
+            w.live_task_id,
+            w.live_commit_sha,
+            w.full_build_commit_sha,
+            w.full_build_built_at,
+            w.workspace_dirty,
+            w.last_preview_heartbeat_at
+       from environments e
+       left join project_workspaces w
+         on w.project_id = e.project_id
+        and w.environment = e.name
+      where e.project_id = any($1)`,
+    [projectIds]
+  );
+  const envMap = {};
+  for (const row of envRes.rows) {
+    envMap[row.project_id] = envMap[row.project_id] || {};
+    envMap[row.project_id][row.name] = {
+      deployed_commit: row.deployed_commit,
+      build_status: row.build_status,
+      updated_at: row.updated_at,
+      preview_mode: row.preview_mode || 'verified',
+      workspace_state: row.workspace_state || 'sleeping',
+      commit_sha: row.commit_sha || row.deployed_commit,
+      verified_commit_sha: row.verified_commit_sha || row.deployed_commit,
+      selected_mode: row.selected_mode || row.preview_mode || 'verified',
+      selected_task_id: row.selected_task_id || null,
+      selected_commit_sha: row.selected_commit_sha || row.commit_sha || row.deployed_commit || null,
+      live_task_id: row.live_task_id || null,
+      live_commit_sha: row.live_commit_sha || null,
+      full_build_commit_sha: row.full_build_commit_sha || row.verified_commit_sha || row.deployed_commit || null,
+      full_build_built_at: row.full_build_built_at || null,
+      workspace_dirty: row.workspace_dirty ?? false,
+      last_preview_heartbeat_at: row.last_preview_heartbeat_at || null
+    };
+  }
+  return envMap;
 }
 
 app.get('/projects/:projectId/env/:environment', requireAuth, async (req, res) => {
@@ -1838,8 +2126,306 @@ app.post('/projects/:projectId/deploy', requireAuth, async (req, res) => {
   if (!(await ensureDbStorageLimit(req, res, req.params.projectId, env))) return;
   if (!(await ensureBandwidthLimit(req, res, req.params.projectId))) return;
   if (!(await ensureRuntimeQuota(req, res, env))) return;
+  const buildingRes = await query(
+    `select id
+     from builds
+     where project_id = $1
+       and environment = $2
+       and status = 'building'
+       and coalesce(ref_commit, '') = $3
+     order by created_at desc
+     limit 1`,
+    [req.params.projectId, env, commitHash]
+  );
+  if (buildingRes.rowCount > 0) {
+    return res.json({ ok: true, status: 'already_building', buildId: buildingRes.rows[0].id });
+  }
+  const envStateRes = await query(
+    `select e.build_status,
+            e.deployed_commit,
+            w.preview_mode,
+            w.state as workspace_state,
+            w.current_commit_sha
+     from environments e
+     left join project_workspaces w
+       on w.project_id = e.project_id
+      and w.environment = 'development'
+     where e.project_id = $1
+       and e.name = $2`,
+    [req.params.projectId, env]
+  );
+  const envState = envStateRes.rows[0] || null;
+  const alreadyLiveVerified =
+    envState?.build_status === 'live' &&
+    envState?.deployed_commit === commitHash;
+  const alreadyLiveWorkspace =
+    env === 'development' &&
+    envState?.build_status === 'live' &&
+    envState?.preview_mode === 'workspace' &&
+    envState?.workspace_state === 'ready' &&
+    envState?.current_commit_sha === commitHash;
+  if (alreadyLiveVerified || alreadyLiveWorkspace) {
+    return res.json({ ok: true, status: 'already_live' });
+  }
   await taskQueue.add('deploy-commit', { projectId: req.params.projectId, environment: env, commitHash });
-  res.json({ ok: true });
+  res.json({ ok: true, status: 'queued' });
+});
+
+app.post('/projects/:projectId/development/resume-preview', requireAuth, async (req, res) => {
+  const env = 'development';
+  const ok = await ensureProjectOwner(req.params.projectId, req.user.userId);
+  if (!ok) return res.status(404).json({ error: 'project not found' });
+  if (!(await ensurePlanEnvAllowed(req, res, env))) return;
+  if (!(await ensureRuntimeQuota(req, res, env))) return;
+  const policyRes = await query('select value from settings where key = $1', ['verified_only_deploys']);
+  const rawPolicy = String(policyRes.rows[0]?.value || '').trim().toLowerCase();
+  const verifiedOnly = rawPolicy === 'true' || rawPolicy === '1' || rawPolicy === 'yes' || rawPolicy === 'on';
+  if (verifiedOnly) {
+    return res.status(409).json({ error: 'preview_disabled', message: 'Development preview is disabled by verified-only deploys.' });
+  }
+  const envStateRes = await query(
+    `select e.build_status,
+            w.preview_mode,
+            w.state as workspace_state,
+            w.current_commit_sha
+     from environments e
+     left join project_workspaces w
+       on w.project_id = e.project_id
+      and w.environment = 'development'
+     where e.project_id = $1
+       and e.name = $2`,
+    [req.params.projectId, env]
+  );
+  const envState = envStateRes.rows[0] || null;
+  if (
+    envState?.build_status === 'live' &&
+    envState?.preview_mode === 'workspace' &&
+    envState?.workspace_state === 'ready'
+  ) {
+    return res.json({ ok: true, status: 'already_live', commitHash: envState.current_commit_sha || null });
+  }
+  const resumeJobId = `resume-development-preview-${req.params.projectId}`;
+  const existingResumeJob = await taskQueue.getJob(resumeJobId);
+  if (existingResumeJob) {
+    const state = await existingResumeJob.getState();
+    if (['waiting', 'active', 'delayed', 'prioritized'].includes(state)) {
+      return res.json({ ok: true, status: 'already_starting' });
+    }
+    try {
+      await existingResumeJob.remove();
+    } catch {}
+  }
+  await taskQueue.add(
+    'resume-development-preview',
+    { projectId: req.params.projectId },
+    { jobId: resumeJobId, removeOnComplete: true, removeOnFail: 50 }
+  );
+  res.json({ ok: true, status: 'queued' });
+});
+
+app.put('/projects/:projectId/development/selection', requireAuth, async (req, res) => {
+  const env = 'development';
+  const ok = await ensureProjectOwner(req.params.projectId, req.user.userId);
+  if (!ok) return res.status(404).json({ error: 'project not found' });
+  if (!(await ensurePlanEnvAllowed(req, res, env))) return;
+  const mode = normalizeDevelopmentMode(req.body?.mode);
+  if (!mode) return res.status(400).json({ error: 'invalid_mode' });
+  if (mode === 'workspace' && await isVerifiedOnlyDeploysEnabled()) {
+    return res.status(409).json({
+      error: 'preview_disabled',
+      message: 'Development preview is disabled by verified-only deploys.'
+    });
+  }
+  let taskId = Object.prototype.hasOwnProperty.call(req.body || {}, 'taskId')
+    ? (req.body?.taskId || null)
+    : undefined;
+  let commitHash = Object.prototype.hasOwnProperty.call(req.body || {}, 'commitHash')
+    ? String(req.body?.commitHash || '').trim() || null
+    : undefined;
+  if (taskId) {
+    const taskRes = await query(
+      `select id, commit_hash
+         from tasks
+        where id = $1
+          and project_id = $2`,
+      [taskId, req.params.projectId]
+    );
+    if (taskRes.rowCount === 0) {
+      return res.status(404).json({ error: 'task_not_found' });
+    }
+    if (!taskRes.rows[0].commit_hash) {
+      return res.status(409).json({ error: 'task_commit_unavailable' });
+    }
+    commitHash = commitHash || taskRes.rows[0].commit_hash;
+  }
+  await upsertDevelopmentSelection(req.params.projectId, {
+    selected_mode: mode,
+    ...(taskId !== undefined ? { selected_task_id: taskId } : {}),
+    ...(commitHash !== undefined ? { selected_commit_sha: commitHash } : {})
+  });
+  res.json({
+    ok: true,
+    selected_mode: mode,
+    selected_task_id: taskId === undefined ? undefined : taskId,
+    selected_commit_sha: commitHash === undefined ? undefined : commitHash
+  });
+});
+
+app.post('/projects/:projectId/development/wake', requireAuth, async (req, res) => {
+  const env = 'development';
+  const ok = await ensureProjectOwner(req.params.projectId, req.user.userId);
+  if (!ok) return res.status(404).json({ error: 'project not found' });
+  if (!(await ensurePlanEnvAllowed(req, res, env))) return;
+  if (!(await ensureRuntimeQuota(req, res, env))) return;
+
+  const modeInput = Object.prototype.hasOwnProperty.call(req.body || {}, 'mode')
+    ? normalizeDevelopmentMode(req.body?.mode)
+    : null;
+  if (Object.prototype.hasOwnProperty.call(req.body || {}, 'mode') && !modeInput) {
+    return res.status(400).json({ error: 'invalid_mode' });
+  }
+
+  let taskId = Object.prototype.hasOwnProperty.call(req.body || {}, 'taskId')
+    ? (req.body?.taskId || null)
+    : undefined;
+  let commitHash = Object.prototype.hasOwnProperty.call(req.body || {}, 'commitHash')
+    ? String(req.body?.commitHash || '').trim() || null
+    : undefined;
+  if (taskId) {
+    const taskRes = await query(
+      `select id, commit_hash
+         from tasks
+        where id = $1
+          and project_id = $2`,
+      [taskId, req.params.projectId]
+    );
+    if (taskRes.rowCount === 0) {
+      return res.status(404).json({ error: 'task_not_found' });
+    }
+    if (!taskRes.rows[0].commit_hash) {
+      return res.status(409).json({ error: 'task_commit_unavailable' });
+    }
+    commitHash = commitHash || taskRes.rows[0].commit_hash;
+  }
+
+  if (modeInput || taskId !== undefined || commitHash !== undefined) {
+    await upsertDevelopmentSelection(req.params.projectId, {
+      ...(modeInput ? { selected_mode: modeInput } : {}),
+      ...(taskId !== undefined ? { selected_task_id: taskId } : {}),
+      ...(commitHash !== undefined ? { selected_commit_sha: commitHash } : {})
+    });
+  }
+
+  const workspace = await loadDevelopmentWorkspace(req.params.projectId);
+  const targetMode = workspace?.selected_mode || modeInput || workspace?.preview_mode || 'verified';
+  if (normalizeDevelopmentMode(targetMode) === 'workspace' && await isVerifiedOnlyDeploysEnabled()) {
+    return res.status(409).json({
+      error: 'preview_disabled',
+      message: 'Development preview is disabled by verified-only deploys.'
+    });
+  }
+  const targetCommit = workspace?.selected_commit_sha || commitHash || null;
+  const targetTaskId = workspace?.selected_task_id || null;
+  const envStateRes = await query(
+    `select e.build_status,
+            w.preview_mode,
+            w.live_task_id,
+            w.live_commit_sha
+       from environments e
+       left join project_workspaces w
+         on w.project_id = e.project_id
+        and w.environment = 'development'
+      where e.project_id = $1
+        and e.name = 'development'`,
+    [req.params.projectId]
+  );
+  const envState = envStateRes.rows[0] || null;
+  if (
+    envState?.build_status === 'live' &&
+    envState?.preview_mode === targetMode &&
+    envState?.live_commit_sha &&
+    targetCommit &&
+    envState.live_commit_sha === targetCommit &&
+    String(envState.live_task_id || '') === String(targetTaskId || '')
+  ) {
+    return res.json({ ok: true, status: 'already_live', mode: targetMode, commitHash: targetCommit });
+  }
+
+  const wakeJobId = `activate-development-selection-${req.params.projectId}`;
+  const existingWakeJob = await taskQueue.getJob(wakeJobId);
+  if (existingWakeJob) {
+    const state = await existingWakeJob.getState();
+    if (['waiting', 'active', 'delayed', 'prioritized'].includes(state)) {
+      return res.json({ ok: true, status: 'already_starting' });
+    }
+    try {
+      await existingWakeJob.remove();
+    } catch {}
+  }
+
+  await taskQueue.add(
+    'activate-development-selection',
+    {
+      projectId: req.params.projectId,
+      mode: targetMode,
+      taskId: targetTaskId,
+      commitHash: targetCommit
+    },
+    { jobId: wakeJobId, removeOnComplete: true, removeOnFail: 50 }
+  );
+  res.json({ ok: true, status: 'queued', mode: targetMode, commitHash: targetCommit });
+});
+
+app.post('/projects/:projectId/development/verify', requireAuth, async (req, res) => {
+  const env = 'development';
+  const ok = await ensureProjectOwner(req.params.projectId, req.user.userId);
+  if (!ok) return res.status(404).json({ error: 'project not found' });
+  if (!(await ensurePlanEnvAllowed(req, res, env))) return;
+  if (!(await ensureBuildLimit(req, res, req.params.projectId))) return;
+  if (!(await ensureDbStorageLimit(req, res, req.params.projectId, env))) return;
+  if (!(await ensureBandwidthLimit(req, res, req.params.projectId))) return;
+  if (!(await ensureRuntimeQuota(req, res, env))) return;
+  const stateRes = await query(
+    `select w.current_commit_sha,
+            w.last_verified_commit_sha,
+            w.workspace_dirty
+     from project_workspaces w
+     where w.project_id = $1
+       and w.environment = 'development'`,
+    [req.params.projectId]
+  );
+  const workspace = stateRes.rows[0] || null;
+  const commitHash = workspace?.current_commit_sha || null;
+  if (!commitHash) {
+    return res.status(409).json({ error: 'workspace_commit_unavailable' });
+  }
+  if (
+    workspace?.last_verified_commit_sha === commitHash &&
+    workspace?.workspace_dirty === false
+  ) {
+    return res.json({ ok: true, status: 'already_verified', commitHash });
+  }
+  const buildingRes = await query(
+    `select id
+     from builds
+     where project_id = $1
+       and environment = $2
+       and status = 'building'
+       and coalesce(ref_commit, '') = $3
+     order by created_at desc
+     limit 1`,
+    [req.params.projectId, env, commitHash]
+  );
+  if (buildingRes.rowCount > 0) {
+    return res.json({ ok: true, status: 'already_building', buildId: buildingRes.rows[0].id, commitHash });
+  }
+  await removeQueuedDevelopmentJobs(req.params.projectId, new Set(['verify-development-workspace']));
+  await taskQueue.add(
+    'verify-development-preview',
+    { projectId: req.params.projectId },
+    { jobId: `verify-development-preview-${req.params.projectId}-${commitHash}` }
+  );
+  res.json({ ok: true, status: 'queued', commitHash });
 });
 
 app.post('/projects/:projectId/builds/cancel', requireAuth, async (req, res) => {
@@ -1848,41 +2434,23 @@ app.post('/projects/:projectId/builds/cancel', requireAuth, async (req, res) => 
   const ok = await ensureProjectOwner(req.params.projectId, req.user.userId);
   if (!ok) return res.status(404).json({ error: 'project not found' });
   if (!(await ensurePlanEnvAllowed(req, res, env))) return;
-  const buildRes = await query(
-    `select id
-     from builds
-     where project_id = $1
-       and environment = $2
-       and status = 'building'
-     order by created_at desc
-     limit 1`,
-    [req.params.projectId, env]
-  );
   let buildId = null;
-  if (buildRes.rowCount > 0) {
-    buildId = buildRes.rows[0].id;
-    await query(
-      `update builds
-       set cancel_requested = true,
-           build_log = coalesce(build_log, '') || $1,
-           updated_at = now()
-       where id = $2`,
-      ['\n\n[system] Cancel requested by user.\n', buildId]
-    );
-  }
+  let removed = 0;
   try {
-    const jobs = await taskQueue.getJobs(['waiting', 'delayed']);
-    const removed = await Promise.all(
-      jobs
-        .filter(
-          (job) =>
-            job.name === 'deploy-commit' &&
-            job.data?.projectId === req.params.projectId &&
-            job.data?.environment === env
-        )
-        .map((job) => job.remove())
-    );
-    if (!buildId && removed.length === 0) {
+    if (env === 'development') {
+      ({ buildId, removed } = await cancelSupersededDevelopmentWork(
+        req.params.projectId,
+        '\n\n[system] Cancel requested by user.\n'
+      ));
+    } else {
+      buildId = await cancelLatestBuild(req.params.projectId, env, '\n\n[system] Cancel requested by user.\n');
+      removed = await removeQueuedDevelopmentJobs(
+        req.params.projectId,
+        new Set(['deploy-commit']),
+        env
+      );
+    }
+    if (!buildId && removed === 0) {
       return res.json({ ok: true, status: 'noop' });
     }
   } catch (err) {
@@ -1897,6 +2465,18 @@ app.post('/projects/:projectId/stop', requireAuth, async (req, res) => {
   const ok = await ensureProjectOwner(req.params.projectId, req.user.userId);
   if (!ok) return res.status(404).json({ error: 'project not found' });
   if (!(await ensurePlanEnvAllowed(req, res, env))) return;
+  if (env === 'development') {
+    await cancelSupersededDevelopmentWork(
+      req.params.projectId,
+      '\n\n[system] Cancel requested because the development environment was stopped.\n'
+    );
+  } else {
+    await cancelLatestBuild(
+      req.params.projectId,
+      env,
+      '\n\n[system] Cancel requested because the environment was stopped.\n'
+    );
+  }
   await taskQueue.add('stop-environment', { projectId: req.params.projectId, environment: env });
   res.json({ ok: true });
 });
@@ -2303,18 +2883,8 @@ const io = new SocketIOServer(server, {
 
 io.on('connection', (socket) => {
   const emitProjectStatus = async (projectId, target = null) => {
-    const envRes = await query(
-      'select name, deployed_commit, build_status, updated_at from environments where project_id = $1',
-      [projectId]
-    );
-    const environments = {};
-    for (const row of envRes.rows) {
-      environments[row.name] = {
-        deployed_commit: row.deployed_commit,
-        build_status: row.build_status,
-        updated_at: row.updated_at
-      };
-    }
+    const envMap = await loadEnvironmentStatusMap([projectId]);
+    const environments = envMap[projectId] || {};
     if (target) {
       target.emit('projectStatus', { projectId, environments });
     } else {
@@ -2339,7 +2909,7 @@ io.on('connection', (socket) => {
   socket.on('projectEvent', ({ projectId, event, payload }) => {
     if (!projectId || !event) return;
     io.to(`project:${projectId}`).emit(event, payload);
-    if (event === 'buildUpdated') {
+    if (['buildUpdated', 'projectUpdated', 'workspaceUpdated'].includes(event)) {
       emitProjectStatus(projectId).catch((err) => {
         console.error('Failed to emit project status', err);
       });

@@ -2,6 +2,12 @@ const API_URL = window.__API_URL__ || 'http://localhost:8000';
 const DOMAIN = window.__DOMAIN__ || 'localhost:8000';
 const UPGRADE_URL = window.__UPGRADE_URL__ || '';
 const DESKTOP_BRIDGE = Boolean(window.__TAURI__?.core);
+const RUNTIME_LIMITS_FALLBACK = {
+  starter: { development: 60 },
+  builder: { development: 100, testing: 60 },
+  business: { development: 200, testing: 100, production: 750 },
+  agency: { development: 500, testing: 250, production: 750 }
+};
 
 const state = {
   token: localStorage.getItem('vibes_token') || '',
@@ -106,12 +112,18 @@ const state = {
   },
   demoMode: false,
   demoOpenAiKey: '',
+  demoOpenAiKeyDraft: null,
+  deploymentPolicy: {
+    verifiedOnly: false
+  },
   settingsBusy: false,
   settingsMessage: '',
   confirmOpen: false,
+  confirmTitle: 'Confirm',
   confirmMessage: '',
   confirmConfirmText: 'Confirm',
   confirmCancelText: 'Cancel',
+  confirmAltText: '',
   promptOpen: false,
   promptMessage: '',
   promptPlaceholder: '',
@@ -524,6 +536,124 @@ function parseIsoTime(value) {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
+function currentProjectState() {
+  return state.projects.find((p) => p.id === state.projectId) || null;
+}
+
+function projectEnvironmentState(projectOrId, environment) {
+  const project =
+    typeof projectOrId === 'string'
+      ? state.projects.find((p) => p.id === projectOrId) || null
+      : projectOrId || null;
+  return project?.environments?.[environment] || null;
+}
+
+function isDevelopmentPreviewActive(envState = projectEnvironmentState(state.projectId, 'development')) {
+  return Boolean(
+    envState &&
+    envState.preview_mode === 'workspace' &&
+    envState.workspace_state === 'ready' &&
+    envState.build_status === 'live'
+  );
+}
+
+function isBackgroundDevelopmentVerifyStatus(status, envState = projectEnvironmentState(state.projectId, 'development')) {
+  if (!isDevelopmentPreviewActive(envState)) return false;
+  return ['building', 'failed', 'cancelled', 'live'].includes(String(status || '').toLowerCase());
+}
+
+function normalizeDevelopmentModeValue(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (['workspace', 'preview'].includes(normalized)) return 'workspace';
+  return 'verified';
+}
+
+function developmentModeText(mode) {
+  return normalizeDevelopmentModeValue(mode) === 'workspace' ? 'Preview Mode' : 'Full Build Mode';
+}
+
+function developmentSelectedMode(project) {
+  const envState = projectEnvironmentState(project, 'development');
+  return normalizeDevelopmentModeValue(envState?.selected_mode || envState?.preview_mode || 'verified');
+}
+
+function developmentLiveMode(project) {
+  const envState = projectEnvironmentState(project, 'development');
+  return normalizeDevelopmentModeValue(envState?.preview_mode || envState?.selected_mode || 'verified');
+}
+
+function isDevelopmentAwake(envState = projectEnvironmentState(state.projectId, 'development')) {
+  if (!envState) return false;
+  const buildStatus = String(envState.build_status || '').toLowerCase();
+  const workspaceState = String(envState.workspace_state || '').toLowerCase();
+  return buildStatus !== 'offline' || (workspaceState && workspaceState !== 'sleeping');
+}
+
+function isDevelopmentOpenable(envState = projectEnvironmentState(state.projectId, 'development')) {
+  if (!envState) return false;
+  const buildStatus = String(envState.build_status || '').toLowerCase();
+  const liveMode = normalizeDevelopmentModeValue(envState.preview_mode || envState.selected_mode || 'verified');
+  if (buildStatus !== 'live') return false;
+  if (liveMode === 'verified') return true;
+  return String(envState.workspace_state || '').toLowerCase() === 'ready';
+}
+
+function isDevelopmentTransitioning(envState = projectEnvironmentState(state.projectId, 'development')) {
+  if (!envState) return false;
+  const buildStatus = String(envState.build_status || '').toLowerCase();
+  const workspaceState = String(envState.workspace_state || '').toLowerCase();
+  return buildStatus === 'building' || buildStatus === 'canceling' || workspaceState === 'starting';
+}
+
+function developmentPrimaryStatus(project, status) {
+  const envState = projectEnvironmentState(project, 'development');
+  if (envState?.workspace_state === 'starting') return 'preview_starting';
+  if (envState?.workspace_state === 'failed' && envState?.preview_mode === 'workspace') return 'preview_failed';
+  if (envState?.workspace_state === 'sleeping' || status === 'offline') return 'preview_sleeping';
+  if (envState?.preview_mode === 'workspace' && status === 'live') return 'preview_live';
+  if (envState?.preview_mode === 'verified' && status === 'live') return 'verified_live';
+  return status;
+}
+
+function developmentModeLabel(project, source = 'selected') {
+  if (state.deploymentPolicy?.verifiedOnly) return 'Full Build Mode';
+  const mode = source === 'live' ? developmentLiveMode(project) : developmentSelectedMode(project);
+  return developmentModeText(mode);
+}
+
+function developmentVerificationStatus(project) {
+  const envState = projectEnvironmentState(project, 'development');
+  if (!envState) return '';
+  const buildStatus = String(envState.build_status || '').toLowerCase();
+  const workspaceState = String(envState.workspace_state || '').toLowerCase();
+  if (workspaceState === 'failed') return 'Failed';
+  if (!isDevelopmentAwake(envState)) return 'Sleeping';
+  if (buildStatus === 'canceling') return 'Stopping';
+  if (buildStatus === 'building' && developmentSelectedMode(project) === 'verified') return 'Building';
+  if (isDevelopmentTransitioning(envState)) return 'Starting';
+  if (buildStatus === 'live') return 'Live';
+  return '';
+}
+
+function developmentSecondaryBadgeClass(text = '') {
+  const normalized = String(text || '').trim().toLowerCase();
+  if (!normalized) return 'offline';
+  if (normalized.includes('failed')) return 'failed';
+  if (normalized.includes('build') || normalized.includes('start') || normalized.includes('stop')) return 'building';
+  if (normalized.includes('live')) return 'live';
+  if (normalized.includes('sleep')) return 'offline';
+  return 'offline';
+}
+
+function developmentVerificationStatusForCommit(commitHash, latestBuild = state.latestBuild.development) {
+  if (!commitHash || !latestBuild?.ref_commit || latestBuild.ref_commit !== commitHash) return '';
+  const status = String(latestBuild.status || '').toLowerCase();
+  if (status === 'building') return 'verifying';
+  if (status === 'live') return 'verified';
+  if (status === 'failed') return 'verify failed';
+  return '';
+}
+
 function latestRemoteActivity(tasks = [], sessions = []) {
   let latest = 0;
   for (const task of Array.isArray(tasks) ? tasks : []) {
@@ -741,7 +871,7 @@ function setTaskStatus(message, { autoHide = false, persistent = false } = {}) {
   if (autoHide) {
     taskStatusTimer = setTimeout(() => {
       setState({ taskStatusMessage: '', taskStatusPersistent: false });
-    }, 2500);
+    }, 3000);
   }
 }
 
@@ -751,16 +881,27 @@ function showError(err, { autoHide = true, persistent = false } = {}) {
   setTaskStatus(message, { autoHide: !isPlanError && autoHide, persistent: isPlanError || persistent });
 }
 
-function showConfirm(message, { confirmText = 'Confirm', cancelText = 'Cancel' } = {}) {
+function showConfirmChoices(message, {
+  title = 'Confirm',
+  confirmText = 'Confirm',
+  cancelText = 'Cancel',
+  altText = ''
+} = {}) {
   return new Promise((resolve) => {
     confirmResolver = resolve;
     setState({
       confirmOpen: true,
+      confirmTitle: title,
       confirmMessage: message,
       confirmConfirmText: confirmText,
-      confirmCancelText: cancelText
+      confirmCancelText: cancelText,
+      confirmAltText: altText
     });
   });
+}
+
+function showConfirm(message, { title = 'Confirm', confirmText = 'Confirm', cancelText = 'Cancel' } = {}) {
+  return showConfirmChoices(message, { title, confirmText, cancelText }).then((choice) => choice === 'confirm');
 }
 
 function showPrompt(message, {
@@ -817,6 +958,15 @@ function formatHours(value) {
   if (!Number.isFinite(num)) return '0';
   if (Math.abs(num - Math.round(num)) < 0.05) return String(Math.round(num));
   return num.toFixed(1).replace(/\.0$/, '');
+}
+
+function runtimeLimitHoursForCurrentEnv() {
+  const usage = state.runtimeUsage?.usage?.[state.environment];
+  if (usage?.limit_hours != null) return usage.limit_hours;
+  const explicitLimit = state.user?.runtime_limits?.[state.environment];
+  if (explicitLimit != null) return explicitLimit;
+  const planKey = String(state.user?.plan || state.runtimeUsage?.plan || '').toLowerCase();
+  return RUNTIME_LIMITS_FALLBACK[planKey]?.[state.environment] ?? null;
 }
 
 function formatRuntimeQuotaNotice(details = {}) {
@@ -1024,10 +1174,29 @@ async function loadRuntimeUsage() {
   setState({ runtimeUsageLoading: true, runtimeUsageError: '' });
   try {
     const data = await api('/usage/runtime', { timeoutMs: 15000 });
-    setState({ runtimeUsage: data, runtimeUsageLoading: false });
+    const nextUser = data?.plan && state.user ? { ...state.user, plan: data.plan } : state.user;
+    setState({ runtimeUsage: data, runtimeUsageLoading: false, ...(nextUser ? { user: nextUser } : {}) });
   } catch (err) {
     setState({ runtimeUsageLoading: false, runtimeUsageError: err.message || 'Failed to load runtime usage.' });
   }
+}
+
+async function loadCurrentUser() {
+  if (!state.token) return null;
+  try {
+    const data = await api('/auth/me', { timeoutMs: 15000 });
+    if (data?.user) {
+      setState({ user: data.user, desktopSettings: loadDesktopSettings(data.user?.id) });
+      return data.user;
+    }
+  } catch (err) {
+    if ((err?.message || '').toLowerCase().includes('unauthorized')) {
+      localStorage.removeItem('vibes_token');
+      setState({ token: '', user: null, desktopSettings: loadDesktopSettings(null) });
+      return null;
+    }
+  }
+  return null;
 }
 
 function startRuntimeUsagePolling() {
@@ -1368,7 +1537,15 @@ async function loadLatestBuild(projectId, environment, options = {}) {
   const build = await api(`/projects/${projectId}/builds/latest?environment=${environment}`);
   const prevStatus = state.buildStatus[environment];
   state.latestBuild[environment] = build;
-  if (build?.status) {
+  if (build?.status !== 'failed') {
+    state.failedBuildLogVisible[environment] = false;
+    state.failedBuildLogError[environment] = '';
+  }
+  const envState = projectEnvironmentState(projectId, environment);
+  const keepPreviewState =
+    environment === 'development' &&
+    isBackgroundDevelopmentVerifyStatus(build?.status, envState);
+  if (build?.status && !keepPreviewState) {
     state.buildStatus[environment] = build.status;
   }
   const nextStatus = state.buildStatus[environment];
@@ -1413,6 +1590,44 @@ async function loadLastSuccessBuilds(projectId) {
   }
 }
 
+async function loadBuildLog(environment, { status = 'failed', commitHash = '', lines } = {}) {
+  if (!state.projectId || !state.token) return;
+  const lineCount = Math.max(50, Math.min(Number(lines || state.failedBuildLogLines[environment] || 200), 2000));
+  state.failedBuildLogLoading[environment] = true;
+  state.failedBuildLogError[environment] = '';
+  setState({
+    failedBuildLogLoading: { ...state.failedBuildLogLoading },
+    failedBuildLogError: { ...state.failedBuildLogError }
+  });
+  try {
+    const params = new URLSearchParams({
+      environment,
+      status,
+      lines: String(lineCount)
+    });
+    if (commitHash) params.set('commitHash', commitHash);
+    const data = await api(`/projects/${state.projectId}/builds/log?${params.toString()}`);
+    state.failedBuildLog[environment] = data?.build_log || 'No full build logs available.';
+    state.failedBuildLogLines[environment] = lineCount;
+    state.failedBuildLogVisible[environment] = true;
+    setState({
+      failedBuildLog: { ...state.failedBuildLog },
+      failedBuildLogLines: { ...state.failedBuildLogLines },
+      failedBuildLogVisible: { ...state.failedBuildLogVisible }
+    });
+  } catch (err) {
+    state.failedBuildLogError[environment] = err?.message || 'Failed to load full build logs.';
+    setState({
+      failedBuildLogError: { ...state.failedBuildLogError }
+    });
+  } finally {
+    state.failedBuildLogLoading[environment] = false;
+    setState({
+      failedBuildLogLoading: { ...state.failedBuildLogLoading }
+    });
+  }
+}
+
 async function loadDeployWebhook(projectId) {
   if (!projectId) return;
   try {
@@ -1442,10 +1657,29 @@ async function loadHealthSettings() {
 
 async function loadDemoSettings() {
   const data = await api('/settings/demo-openai-key');
+  const nextKey = data?.openaiApiKey || '';
   setState({
     demoMode: Boolean(data?.enabled),
-    demoOpenAiKey: data?.openaiApiKey || ''
+    demoOpenAiKey: nextKey,
+    demoOpenAiKeyDraft: nextKey
   });
+}
+
+async function loadDeploymentPolicy() {
+  try {
+    const data = await api('/settings/deployment-policy');
+    setState({
+      deploymentPolicy: {
+        verifiedOnly: Boolean(data?.verifiedOnly)
+      }
+    });
+  } catch {
+    setState({
+      deploymentPolicy: {
+        verifiedOnly: false
+      }
+    });
+  }
 }
 
 async function loadEnvVars(projectId, environment) {
@@ -1489,6 +1723,54 @@ function formatDurationMs(ms) {
 
 function icon(name) {
   return `<svg class="icon" aria-hidden="true"><use href="#icon-${name}"></use></svg>`;
+}
+
+function closeEnvActionMenus(root = document) {
+  root.querySelectorAll('.env-pill-menu[open]').forEach((menu) => {
+    menu.removeAttribute('open');
+  });
+}
+
+function closeTaskActionMenus(root = document) {
+  root.querySelectorAll('[data-task-menu][open]').forEach((menu) => {
+    menu.removeAttribute('open');
+  });
+}
+
+function renderDevelopmentActionMenu({ commitHash, taskId = '', label = 'Development actions' } = {}) {
+  if (!commitHash) return '';
+  return `
+    <details class="task-action-menu" data-task-menu>
+      <summary class="icon-button action-menu-button" aria-label="${escapeHtml(label)}">${icon('more-vertical')}</summary>
+      <div class="menu">
+        <button class="menu-item task-menu-item" type="button" data-task-action="start-preview" data-task-id="${taskId || ''}" data-commit="${commitHash}">Start Preview</button>
+        <button class="menu-item task-menu-item" type="button" data-task-action="start-full-build" data-task-id="${taskId || ''}" data-commit="${commitHash}">Start Full Build</button>
+      </div>
+    </details>
+  `;
+}
+
+function renderDevelopmentTaskStateBadge(item, project) {
+  const envState = projectEnvironmentState(project, 'development');
+  if (!envState || !item?.id || !item?.commit_hash) return '';
+  const liveTaskMatches =
+    String(envState.live_task_id || '') === String(item.id) &&
+    String(envState.live_commit_sha || '') === String(item.commit_hash || '');
+  if (String(envState.build_status || '').toLowerCase() === 'live' && liveTaskMatches) {
+    const liveMode = developmentLiveMode(project);
+    return `
+      <span class="badge live ${liveMode === 'verified' ? 'full-build-live' : ''}">
+        ${liveMode === 'verified' ? `${icon('check')} ` : ''}Live
+      </span>
+    `;
+  }
+  const selectedTaskMatches =
+    String(envState.selected_task_id || '') === String(item.id) &&
+    String(envState.selected_commit_sha || '') === String(item.commit_hash || '');
+  if (selectedTaskMatches && isDevelopmentTransitioning(envState)) {
+    return '<span class="badge building">Starting</span>';
+  }
+  return '';
 }
 
 function hostProjectName(name) {
@@ -1714,7 +1996,13 @@ function connectSocket(projectId) {
     socketClient.on('buildUpdated', (payload) => {
       const env = payload.environment;
       const prevStatus = state.buildStatus[env] || 'offline';
-      state.buildStatus[env] = payload.status;
+      const envState = projectEnvironmentState(state.projectId, env);
+      const keepPreviewState =
+        env === 'development' &&
+        isBackgroundDevelopmentVerifyStatus(payload.status, envState);
+      if (!keepPreviewState) {
+        state.buildStatus[env] = payload.status;
+      }
       if (payload.refCommit) {
         state.deployedCommit[env] = payload.refCommit;
       }
@@ -1727,7 +2015,7 @@ function connectSocket(projectId) {
       if (payload.status === 'offline') {
         state.pendingDeployCommit[env] = '';
       }
-      if (payload.status === 'building') {
+      if (payload.status === 'building' && !keepPreviewState) {
         state.progressVisibleUntil[env] = 0;
         if (payload.refCommit) {
           state.pendingDeployCommit[env] = payload.refCommit;
@@ -1743,20 +2031,23 @@ function connectSocket(projectId) {
       ) {
         fetchApplicationLogs({ force: true, allowFrozen: true, freezeAfterFetch: true });
       }
-      if (prevStatus === 'building' && (payload.status === 'live' || payload.status === 'failed' || payload.status === 'cancelled')) {
+      if (!keepPreviewState && prevStatus === 'building' && (payload.status === 'live' || payload.status === 'failed' || payload.status === 'cancelled')) {
         state.progressVisibleUntil[env] = Date.now() + 3000;
         scheduleHeaderProgressRefresh();
       }
       if (env === state.environment && state.taskStatusPersistent) {
-        if (payload.status === 'building') {
+        if (payload.status === 'building' && !keepPreviewState) {
           setTaskStatus('Deploying your update', { persistent: true });
         }
-        if (payload.status === 'live') {
+        if (payload.status === 'live' && !keepPreviewState) {
           setTaskStatus('Your application is ready to view at the link to the left', { autoHide: true });
           setState({ activeTaskId: null });
         }
         if (payload.status === 'cancelled') {
           setTaskStatus('Build cancelled', { autoHide: true });
+        }
+        if (keepPreviewState && payload.status === 'building') {
+          setTaskStatus('Preview live. Verifying in background', { persistent: true });
         }
       }
       if (env === state.environment && (payload.status === 'failed' || payload.status === 'live' || payload.status === 'cancelled' || payload.status === 'building')) {
@@ -1913,8 +2204,16 @@ class AppShell extends HTMLElement {
           <rect x="9" y="9" width="10" height="10" rx="2"></rect>
           <rect x="5" y="5" width="10" height="10" rx="2"></rect>
         </symbol>
+        <symbol id="icon-check" viewBox="0 0 24 24">
+          <path d="M20 6L9 17l-5-5"></path>
+        </symbol>
         <symbol id="icon-stop-octagon" viewBox="0 0 24 24">
           <path d="M8 2h8l6 6v8l-6 6H8l-6-6V8z"></path>
+        </symbol>
+        <symbol id="icon-more-vertical" viewBox="0 0 24 24">
+          <circle cx="12" cy="5" r="1.8"></circle>
+          <circle cx="12" cy="12" r="1.8"></circle>
+          <circle cx="12" cy="19" r="1.8"></circle>
         </symbol>
       </svg>
     `;
@@ -1988,6 +2287,7 @@ class AppShell extends HTMLElement {
   }
 
   renderEnvBadges() {
+    const project = currentProjectState();
     const envs = ['development', 'testing', 'production'];
     const statusText = (status) => {
       if (status === 'live') return 'Live';
@@ -1996,6 +2296,23 @@ class AppShell extends HTMLElement {
       if (status === 'canceling') return 'Canceling';
       if (status === 'cancelled') return 'Cancelled';
       return 'Offline';
+    };
+    const statusClass = (status) => {
+      if (['preview_live', 'verified_live', 'live'].includes(status)) return 'live';
+      if (['preview_starting', 'building', 'canceling'].includes(status)) return 'building';
+      if (['preview_failed', 'failed', 'cancelled', 'offline', 'preview_sleeping'].includes(status)) return 'offline';
+      return 'offline';
+    };
+    const statusLabel = (env, status) => {
+      if (env !== 'development') return statusText(status);
+      const projectEnv = projectEnvironmentState(project, env);
+      const primary = developmentPrimaryStatus(project, status);
+      if (primary === 'preview_live' || primary === 'verified_live') return 'Live';
+      if (primary === 'preview_starting') return 'Starting';
+      if (primary === 'preview_sleeping') return 'Sleeping';
+      if (primary === 'preview_failed') return 'Failed';
+      if (primary === 'building' && projectEnv?.preview_mode === 'workspace') return 'Verifying';
+      return statusText(status);
     };
     const actionForStatus = (status) => {
       if (status === 'building' || status === 'canceling') return { type: 'cancel' };
@@ -2006,23 +2323,80 @@ class AppShell extends HTMLElement {
       <div class="env-badges">
         ${envs.map((env,idx) => {
           const status = state.buildStatus[env] || 'offline';
+          const envState = projectEnvironmentState(project, env);
           const isActive = state.environment === env;
-          const isLocked = state.nerdLevel === 'beginner';
-          const action = actionForStatus(status);
+          const action = env === 'development' ? null : actionForStatus(status);
           const success = state.lastSuccessBuild?.[env];
           const successAt = success?.updated_at || success?.created_at || '';
           const duration = formatDurationMs(success?.duration_ms);
           const durationText = duration && duration !== 'n/a' ? ` · ${duration}` : '';
-          const metaText = successAt
-            ? `Last success ${formatRelative(successAt)}${durationText}`
-            : 'No successful deploy yet';
+          const metaText = env === 'development'
+            ? developmentModeLabel(project)
+            : (successAt
+                ? `Last success ${formatRelative(successAt)}${durationText}`
+                : 'No successful deploy yet');
+          const devMenu = env === 'development' ? (() => {
+            const awake = isDevelopmentAwake(envState);
+            const openable = isDevelopmentOpenable(envState);
+            const selectedMode = developmentSelectedMode(project);
+            const wakeLabel = selectedMode === 'workspace' ? 'Wake Preview' : 'Wake Full Build';
+            const verifiedOnly = Boolean(state.deploymentPolicy?.verifiedOnly);
+            return `
+              <details class="env-pill-menu" data-env-menu="${env}">
+                <summary class="env-pill-action env-pill-action-menu" aria-label="Development actions">${icon('more-vertical')}</summary>
+                <div class="menu">
+                  ${openable ? `<button class="menu-item env-menu-item" type="button" data-env="${env}" data-action="open-development">Open Development</button>` : ''}
+                  <div class="env-mode-toggle-group">
+                    <label class="env-mode-toggle-row ${selectedMode === 'workspace' ? 'is-active' : ''} ${verifiedOnly ? 'is-disabled' : ''}">
+                      <span class="env-mode-toggle-label">Preview Mode</span>
+                      <span class="toggle env-mode-toggle">
+                        <input
+                          class="env-mode-toggle-input"
+                          type="checkbox"
+                          data-env="${env}"
+                          data-mode="workspace"
+                          ${selectedMode === 'workspace' ? 'checked' : ''}
+                          ${verifiedOnly ? 'disabled' : ''}
+                        />
+                        <span class="toggle-track"><span class="toggle-thumb"></span></span>
+                      </span>
+                    </label>
+                    <label class="env-mode-toggle-row ${selectedMode === 'verified' ? 'is-active' : ''}">
+                      <span class="env-mode-toggle-label">Full Build Mode</span>
+                      <span class="toggle env-mode-toggle">
+                        <input
+                          class="env-mode-toggle-input"
+                          type="checkbox"
+                          data-env="${env}"
+                          data-mode="verified"
+                          ${selectedMode === 'verified' ? 'checked' : ''}
+                        />
+                        <span class="toggle-track"><span class="toggle-thumb"></span></span>
+                      </span>
+                    </label>
+                  </div>
+                  <div class="menu-info-row">
+                    <span>Mode controls what Wake Development launches.</span>
+                    <div class="info-popover">
+                      <button class="info-icon" type="button" aria-label="Development mode info" aria-expanded="false">i</button>
+                      <div class="info-tooltip" role="tooltip">
+                        Preview Mode runs the development workspace for fast testing and can reflect multiple task changes. Full Build Mode runs the clean built version of a selected task commit and is closer to QA behavior.
+                      </div>
+                    </div>
+                  </div>
+                  <button class="menu-item env-menu-item" type="button" data-env="${env}" data-action="${awake ? 'sleep-development' : 'wake-development'}">${awake ? 'Sleep Development' : wakeLabel}</button>
+                </div>
+              </details>
+            `;
+          })() : '';
           return `
-            <button class="env-pill ${isActive ? 'active' : ''} ${idx === 0 ? 'env-left' : idx === 1 ? 'env-middle' : 'env-right'}" type="button" data-env="${env}" ${isLocked ? 'disabled' : ''} aria-pressed="${isActive}">
+            <div class="env-pill ${isActive ? 'active' : ''} ${idx === 0 ? 'env-left' : idx === 1 ? 'env-middle' : 'env-right'}" data-env="${env}" role="button" tabindex="0" aria-pressed="${isActive}">
+              ${devMenu}
               ${action ? `<span class="env-pill-action action-${action.type}" data-env="${env}" data-action="${action.type}" title="${action.type === 'cancel' ? 'Abort build' : 'Stop deployment'}">X</span>` : ''}
               <span class="tag">${env}</span>
-              <span class="status-text ${status}">${statusText(status)}</span>
+              <span class="status-text ${statusClass(env === 'development' ? developmentPrimaryStatus(project, status) : status)}">${statusLabel(env, status)}</span>
               <span class="env-meta">${metaText}</span>
-            </button>
+            </div>
           `;
         }).join('')}
       </div>
@@ -2421,7 +2795,7 @@ class AppShell extends HTMLElement {
   }
 
   renderPlanBadge() {
-    const plan = state.user?.plan;
+    const plan = state.user?.plan || state.runtimeUsage?.plan;
     if (!plan) return '';
     return `<div class="plan-badge">Plan: ${titleCase(plan)}</div>`;
   }
@@ -2431,15 +2805,16 @@ class AppShell extends HTMLElement {
       return `<div class="runtime-badge runtime-loading">Runtime: …</div>`;
     }
     const usage = state.runtimeUsage?.usage?.[state.environment];
-    // if (!usage) return '';
-    // if (!usage?.limit_hours) return '';
+    if (!usage && state.runtimeUsageError) {
+      return `<div class="runtime-badge runtime-loading" title="${escapeHtml(state.runtimeUsageError)}">Runtime: …</div>`;
+    }
     const used = formatHours(usage?.used_hours || 0);
-    const limit = formatHours(usage?.limit_hours);
-    const percent = Math.min(100, Math.max(0, Number(usage?.percent || 0)));
+    const limitHours = runtimeLimitHoursForCurrentEnv();
+    const limit = limitHours == null ? 'Unlimited' : `${formatHours(limitHours)}h`;
     const envLabel = titleCase(state.environment) == 'Production' ? 'Prod' : titleCase(state.environment) == 'Testing' ? 'Test' : 'Dev';
     return `
       <div class="runtime-badge" title="${envLabel} runtime this month">
-        <span>${envLabel} runtime: ${used}h / ${limit}h</span>
+        <span>${envLabel} runtime: ${used}h / ${limit}</span>
       </div>
     `;
   }
@@ -2447,6 +2822,26 @@ class AppShell extends HTMLElement {
   renderSubmit(project) {
     const env = state.environment;
     const isBeginner = state.nerdLevel === 'beginner';
+    const isDevelopment = env === 'development';
+    const envState = isDevelopment ? projectEnvironmentState(project, env) : null;
+    const latestBuild = isDevelopment ? state.latestBuild.development : null;
+    const developmentMode = isDevelopment ? developmentModeLabel(project) : '';
+    const verificationSummary = isDevelopment ? developmentVerificationStatus(project) : '';
+    const verificationBadgeClass = developmentSecondaryBadgeClass(verificationSummary);
+    const verificationFailed = Boolean(isDevelopment && latestBuild?.status === 'failed');
+    const verificationRunning = Boolean(isDevelopment && latestBuild?.status === 'building');
+    const verificationVerified = Boolean(
+      isDevelopment &&
+      envState?.verified_commit_sha &&
+      envState?.commit_sha &&
+      envState.verified_commit_sha === envState.commit_sha &&
+      envState.workspace_dirty === false
+    );
+    const verifyLogText = state.failedBuildLog[env] || '';
+    const verifyLogError = state.failedBuildLogError[env] || '';
+    const verifyLogLoading = Boolean(state.failedBuildLogLoading[env]);
+    const verifyLogVisible = Boolean(state.failedBuildLogVisible[env]);
+    const verifyLogPreview = verifyLogText || (verifyLogLoading ? 'Loading full build logs...' : (verifyLogError || 'No full build logs available.'));
     const appLogText = state.appLogsByEnv[env] || '';
     const appLogError = state.appLogError[env] || '';
     const appLogLoading = Boolean(state.appLogLoading[env]);
@@ -2472,7 +2867,44 @@ class AppShell extends HTMLElement {
             <div class="status-text">${state.taskStatusMessage}</div>
           </div>
         ` : ''}
-        <p class="notice"><a class="tag view-project-link" href="${projectProtocol()}://${projectUrl(project, env)}" target="_blank" rel="noreferrer">View your project</a></p>
+        <p class="notice"><a class="tag view-project-link" href="${projectProtocol()}://${projectUrl(project, env)}" target="_blank" rel="noreferrer">${isDevelopment ? 'Open Development' : 'View your project'}</a></p>
+        ${isDevelopment ? `
+          <div class="submit-mode-note">
+            <div class="submit-mode-copy">
+              <div class="submit-mode-header">
+                <span class="tag">${escapeHtml(developmentMode || 'Development')}</span>
+                ${verificationSummary ? `<span class="badge ${verificationBadgeClass}">${verificationSummary}</span>` : ''}
+              </div>
+              <p class="notice">Development uses one URL and two modes. Preview Mode runs the workspace directly for fast iteration. It can reflect multiple task changes and may differ from a clean build. Full Build Mode runs a clean built version of the selected task commit, closer to QA behavior.</p>
+              ${verificationRunning ? '<p class="notice">A clean full build is running for Development.</p>' : ''}
+              ${verificationVerified ? '<p class="notice">The current Development URL is serving a clean full build.</p>' : ''}
+            </div>
+            <div class="info-popover">
+              <button class="info-icon" type="button" aria-label="Development preview info" aria-expanded="false">i</button>
+              <div class="info-tooltip" role="tooltip">
+                Development has one URL. Preview Mode runs the current workspace for fast feedback and may include multiple task changes. Full Build Mode serves a clean built version of a selected task commit. Testing and Production always run full builds.
+              </div>
+            </div>
+          </div>
+          ${verificationFailed ? `
+            <div class="verification-state verification-state-failed">
+              <div>
+                <strong>Full build failed.</strong>
+                <span class="notice">Your live preview can still run, but this code did not build or start cleanly in a deployment-style runtime.</span>
+              </div>
+              <button class="ghost" id="toggleVerifyLogs">${verifyLogVisible ? 'Hide' : 'View'} full build logs</button>
+            </div>
+            ${verifyLogVisible ? `
+              <div class="app-log-stream-wrap verification-log-panel">
+                <div class="log-header">
+                  <span>Full Build Logs <span class="meta">${verifyLogLoading ? 'loading...' : 'latest failed full build'}</span></span>
+                  <button class="icon-button" id="copyVerifyLogs" title="Copy Full Build Logs" aria-label="Copy Full Build Logs">${icon('copy')}</button>
+                </div>
+                <pre class="app-log-stream" data-verify-log-stream="true">${escapeHtml(verifyLogPreview)}</pre>
+              </div>
+            ` : ''}
+          ` : ''}
+        ` : ''}
         <textarea id="taskPrompt" placeholder="A good title for the feature or fix you want to make...\n\nDescribe exactly what you want to see, what you expect \nto happen when you click somewhere etc...\n\nWatch your ideas come to life!\nIn moments you will be viewing the updates${isBeginner ? '.' : '\nand reading a summary of what we have done!'}">${state.taskPromptDraft || ''}</textarea>
         <div class="row m-top-sm submit-controls">
           <div class="row">
@@ -2520,7 +2952,7 @@ class AppShell extends HTMLElement {
       <div class="card grid two">
         <div>
           <h3>Repo Upload / Download</h3>
-          <input id="repoFile" class="file-input" type="file" accept=".zip,.tar,.tar.gz,.tgz,application/zip,application/gzip,application/x-gtar,application/x-tar" />
+          <input id="repoFile" class="file-input" type="file" accept=".bundle,.gitbundle,.zip,.tar,.tar.gz,.tgz,application/octet-stream,application/zip,application/gzip,application/x-gtar,application/x-tar" />
           <div class="row">
             <button id="uploadRepo" class="file-button" ${state.uploadBusy ? 'disabled' : ''}>${state.uploadBusy ? 'Uploading...' : 'Upload Repo'}</button>
             <button class="ghost" id="downloadRepo" ${state.downloadBusy ? 'disabled' : ''}>${state.downloadBusy ? 'Downloading...' : 'Download'}</button>
@@ -2618,8 +3050,11 @@ class AppShell extends HTMLElement {
 
   renderTask(task, canDelete, sessionId = null) {
     const detailState = state.taskDetails[task.id] || { open: false };
-    const isLive = task.commit_hash && task.commit_hash === state.deployedCommit[state.environment] && state.buildStatus[state.environment] === 'live';
-    const isDeploying = task.commit_hash && task.commit_hash === state.pendingDeployCommit[state.environment] && ['building', 'canceling'].includes(state.buildStatus[state.environment]);
+    const isDevelopment = state.environment === 'development';
+    const project = currentProjectState();
+    const developmentTaskStateBadge = isDevelopment ? renderDevelopmentTaskStateBadge(task, project) : '';
+    const isLive = !isDevelopment && task.commit_hash && task.commit_hash === state.deployedCommit[state.environment] && state.buildStatus[state.environment] === 'live';
+    const isDeploying = !isDevelopment && task.commit_hash && task.commit_hash === state.pendingDeployCommit[state.environment] && ['building', 'canceling'].includes(state.buildStatus[state.environment]);
     const latestBuild = state.latestBuild[state.environment];
     const buildMatchesTask = latestBuild?.ref_commit
       ? latestBuild.ref_commit === task.commit_hash
@@ -2632,20 +3067,27 @@ class AppShell extends HTMLElement {
           <strong class="task-prompt">${task.prompt}</strong>
           <div class="row">
             <div class="badges deploy-status">
-              ${isDeploying ? '<span class="badge building">deploying</span>' : ''}
-               ${isLive ? '<span class="badge live">live</span>' : ''}
-              ${isFailed && !isDeploying ? '<span class="badge failed">failed</span>' : ''}
+              ${isDevelopment ? developmentTaskStateBadge : `
+                ${isDeploying ? '<span class="badge building">deploying</span>' : ''}
+                ${isLive ? '<span class="badge live">live</span>' : ''}
+                ${isFailed && !isDeploying ? '<span class="badge failed">failed</span>' : ''}
+              `}
             </div>
             <div class="badges status"> 
-            <span class="badge ${badgeClass(task.status)}">${task.status}</span>
-
-              </div>
-        
+              <span class="badge ${badgeClass(task.status)}">${task.status}</span>
+            </div>
           </div>
         </div>
         <div class="task-actions">
-         
-          <button class="icon-button deploy-button" data-commit="${task.commit_hash || ''}" title="View app from this task" aria-label="View app from this task">${icon('launch')}</button>
+          ${isDevelopment ? `
+            ${renderDevelopmentActionMenu({
+              commitHash: task.commit_hash || '',
+              taskId: task.id,
+              label: 'Task development actions'
+            })}
+          ` : `
+            <button class="icon-button deploy-button" data-commit="${task.commit_hash || ''}" title="Deploy this commit to ${titleCase(state.environment)}" aria-label="Deploy this commit to ${titleCase(state.environment)}">${icon('launch')}</button>
+          `}
         </div>
         ${detailState.open ? `
           <div class="task-details">
@@ -2694,8 +3136,8 @@ class AppShell extends HTMLElement {
   renderSession(session, isDev) {
     const tasks = state.tasks.filter((t) => t.session_id === session.id);
     const tasksHtml = tasks.map((task) => this.renderTask(task, false, session.id)).join('') || '<p class="notice">No tasks in this session.</p>';
-    const isLive = session.merge_commit && session.merge_commit === state.deployedCommit[state.environment] && state.buildStatus[state.environment] === 'live';
-    const isDeploying = session.merge_commit && session.merge_commit === state.pendingDeployCommit[state.environment] && ['building', 'canceling'].includes(state.buildStatus[state.environment]);
+    const isLive = !isDev && session.merge_commit && session.merge_commit === state.deployedCommit[state.environment] && state.buildStatus[state.environment] === 'live';
+    const isDeploying = !isDev && session.merge_commit && session.merge_commit === state.pendingDeployCommit[state.environment] && ['building', 'canceling'].includes(state.buildStatus[state.environment]);
     const detailsState = state.sessionDetails[session.id] || { open: false };
     const latestBuild = state.latestBuild[state.environment];
     const buildMatchesSession = latestBuild?.ref_commit
@@ -2708,12 +3150,21 @@ class AppShell extends HTMLElement {
           <div>
             <div class="meta" data-rel-time="${session.created_at || ''}">${formatRelative(session.created_at)}</div>
             <strong>${session.message}</strong>
-            ${isDeploying ? '<span class="badge building">deploying</span>' : ''}
-            ${isLive ? '<span class="badge live">live</span>' : ''}
-            ${isFailed ? '<span class="badge failed">failed</span>' : ''}
+            ${isDev ? '' : `
+              ${isDeploying ? '<span class="badge building">deploying</span>' : ''}
+              ${isLive ? '<span class="badge live">live</span>' : ''}
+              ${isFailed ? '<span class="badge failed">failed</span>' : ''}
+            `}
           </div>
           <div class="task-actions">
-            <button class="icon-button deploy-button" data-commit="${session.merge_commit || ''}" title="View app from this saved session" aria-label="View app from this saved session">${icon('launch')}</button>
+            ${isDev ? `
+              ${renderDevelopmentActionMenu({
+                commitHash: session.merge_commit || '',
+                label: 'Saved session development actions'
+              })}
+            ` : `
+              <button class="icon-button deploy-button" data-commit="${session.merge_commit || ''}" title="Deploy this saved session to ${titleCase(state.environment)}" aria-label="Deploy this saved session to ${titleCase(state.environment)}">${icon('launch')}</button>
+            `}
           </div>
         </div>
         ${isDev && detailsState.open ? `
@@ -2747,9 +3198,10 @@ class AppShell extends HTMLElement {
     return `
       <div class="modal ${state.confirmOpen ? 'open' : ''}" id="confirmModal">
         <div class="modal-content">
-          <h3>Confirm</h3>
+          <h3>${state.confirmTitle || 'Confirm'}</h3>
           <p class="notice">${state.confirmMessage || ''}</p>
           <div class="row">
+            ${state.confirmAltText ? `<button class="ghost" id="confirmModalAlt">${state.confirmAltText}</button>` : ''}
             <button id="confirmModalConfirm">${state.confirmConfirmText || 'Confirm'}</button>
             <button class="ghost" id="confirmModalCancel">${state.confirmCancelText || 'Cancel'}</button>
           </div>
@@ -2969,6 +3421,9 @@ class AppShell extends HTMLElement {
     const mobileEnabled = Boolean(project?.interface_mobile);
     const mobileStackType = project?.mobile_stack_type || 'expo';
     const desktopSettings = state.desktopSettings || {};
+    const demoOpenAiKeyValue = state.demoOpenAiKeyDraft == null
+      ? (state.demoOpenAiKey || '')
+      : state.demoOpenAiKeyDraft;
     return `
       <div class="modal ${state.settingsOpen ? 'open' : ''}" id="settingsModal">
         <div class="modal-content">
@@ -3024,12 +3479,30 @@ class AppShell extends HTMLElement {
               <span class="toggle-label">Dark mode</span>
             </label>
           </div>
+          <h3>Deployment</h3>
+          <div class="setting-row toggle-row">
+            <span class="tag">Verified-only deploys</span>
+            <label class="toggle">
+              <input id="verifiedOnlyToggle" type="checkbox" ${state.deploymentPolicy?.verifiedOnly ? 'checked' : ''} />
+              <span class="toggle-track"><span class="toggle-thumb"></span></span>
+              <span class="toggle-label">Require full verified builds</span>
+            </label>
+          </div>
+          <div class="setting-row setting-info-row">
+            <span class="notice">When enabled, development changes wait for a full verified build before showing as live.</span>
+            <div class="info-popover">
+              <button class="info-icon" type="button" aria-label="Verified-only deploys info" aria-expanded="false">i</button>
+              <div class="info-tooltip" role="tooltip">
+                Verified-only mode prioritizes release-accurate previews. Fast update previews are skipped so what you see always comes from a complete image build and deploy. This is slower but most reliable.
+              </div>
+            </div>
+          </div>
           ${state.demoMode ? `
           <h3>OpenAI API Key</h3>
           <p class="notice">Used for tasks while demo mode is enabled.</p>
           <div class="setting-row">
             <span class="tag">OpenAI API Key</span>
-            <input id="demoOpenAiKey" type="password" placeholder="sk-..." value="${state.demoOpenAiKey || ''}" autocomplete="new-password" autocorrect="off" autocapitalize="off" spellcheck="false" />
+            <input id="demoOpenAiKey" type="password" placeholder="sk-..." value="${escapeHtml(demoOpenAiKeyValue)}" autocomplete="new-password" autocorrect="off" autocapitalize="off" spellcheck="false" />
           </div>
           ` : ''}
           ${DESKTOP_BRIDGE ? `
@@ -3162,13 +3635,21 @@ class AppShell extends HTMLElement {
     });
 
     this.querySelector('#openSettings')?.addEventListener('click', async () => {
-      setState({ settingsOpen: true, settingsMessage: '' });
+      setState({
+        settingsOpen: true,
+        settingsMessage: '',
+        demoOpenAiKeyDraft: state.demoOpenAiKey || ''
+      });
       await loadHealthSettings();
       await loadDemoSettings();
+      await loadDeploymentPolicy();
     });
 
     this.querySelector('#closeSettings')?.addEventListener('click', () => {
-      setState({ settingsOpen: false });
+      setState({
+        settingsOpen: false,
+        demoOpenAiKeyDraft: null
+      });
     });
 
     this.querySelector('#retryProjects')?.addEventListener('click', async () => {
@@ -3192,6 +3673,7 @@ class AppShell extends HTMLElement {
       const desktopLocalApiUrl = this.querySelector('#desktopLocalApiUrl');
       const desktopIosCommand = this.querySelector('#desktopIosCommand');
       const desktopAndroidCommand = this.querySelector('#desktopAndroidCommand');
+      const verifiedOnlyToggle = this.querySelector('#verifiedOnlyToggle');
       if (hcPath) payload.healthcheck_path = hcPath.value;
       if (hcPathDev) payload.healthcheck_path_dev = hcPathDev.value;
       if (hcPathTest) payload.healthcheck_path_test = hcPathTest.value;
@@ -3211,13 +3693,31 @@ class AppShell extends HTMLElement {
       if (demoKeyEl) {
         saveCalls.push(api('/settings/demo-openai-key', { method: 'PUT', body: JSON.stringify({ openaiApiKey: demoKey }) }));
       }
+      if (verifiedOnlyToggle) {
+        saveCalls.push(
+          api('/settings/deployment-policy', {
+            method: 'PUT',
+            body: JSON.stringify({ verifiedOnly: Boolean(verifiedOnlyToggle.checked) })
+          })
+        );
+      }
       setState({ settingsBusy: true, settingsMessage: 'Saving...' });
       try {
         if (saveCalls.length > 0) {
           await Promise.all(saveCalls);
         }
         if (demoKeyEl) {
-          setState({ demoOpenAiKey: demoKey });
+          setState({
+            demoOpenAiKey: demoKey,
+            demoOpenAiKeyDraft: demoKey
+          });
+        }
+        if (verifiedOnlyToggle) {
+          setState({
+            deploymentPolicy: {
+              verifiedOnly: Boolean(verifiedOnlyToggle.checked)
+            }
+          });
         }
         if (DESKTOP_BRIDGE) {
           const nextDesktopSettings = {
@@ -3243,16 +3743,21 @@ class AppShell extends HTMLElement {
       }
     });
 
+    this.querySelector('#demoOpenAiKey')?.addEventListener('input', (event) => {
+      state.demoOpenAiKeyDraft = event.target.value;
+    });
+
     const confirmModal = this.querySelector('#confirmModal');
-    const closeConfirm = (confirmed) => {
-      if (confirmResolver) confirmResolver(Boolean(confirmed));
+    const closeConfirm = (choice = 'cancel') => {
+      if (confirmResolver) confirmResolver(choice);
       confirmResolver = null;
-      setState({ confirmOpen: false });
+      setState({ confirmOpen: false, confirmAltText: '' });
     };
-    this.querySelector('#confirmModalConfirm')?.addEventListener('click', () => closeConfirm(true));
-    this.querySelector('#confirmModalCancel')?.addEventListener('click', () => closeConfirm(false));
+    this.querySelector('#confirmModalConfirm')?.addEventListener('click', () => closeConfirm('confirm'));
+    this.querySelector('#confirmModalAlt')?.addEventListener('click', () => closeConfirm('alt'));
+    this.querySelector('#confirmModalCancel')?.addEventListener('click', () => closeConfirm('cancel'));
     confirmModal?.addEventListener('click', (event) => {
-      if (event.target === confirmModal) closeConfirm(false);
+      if (event.target === confirmModal) closeConfirm('cancel');
     });
 
     const promptModal = this.querySelector('#promptModal');
@@ -3489,7 +3994,16 @@ class AppShell extends HTMLElement {
     });
 
     this.querySelector('.content')?.addEventListener('click', (e) => {
-      if (e.target.closest('button') || e.target.closest('pre') || e.target.closest('a') || e.target.closest('input') || e.target.closest('textarea') || e.target.closest('select')) {
+      if (
+        e.target.closest('button') ||
+        e.target.closest('pre') ||
+        e.target.closest('a') ||
+        e.target.closest('input') ||
+        e.target.closest('textarea') ||
+        e.target.closest('select') ||
+        e.target.closest('.task-action-menu') ||
+        e.target.closest('summary')
+      ) {
         return;
       }
 
@@ -3645,32 +4159,234 @@ class AppShell extends HTMLElement {
       });
     });
 
+    const selectEnvironmentFromPill = (btn) => {
+      const env = btn.getAttribute('data-env');
+      if (!env) return;
+      closeEnvActionMenus(this);
+      closeTaskActionMenus(this);
+      setState({
+        environment: env,
+        envEditing: { ...state.envEditing, [env]: false },
+        envMessage: ''
+      });
+      storeEnv(state.user?.id, state.projectId, env);
+      if (state.projectId) {
+        loadEnvVars(state.projectId, env);
+        loadLatestBuild(state.projectId, env);
+        if (state.appLogsVisible && !state.appLogFrozenByEnv[env]) {
+          fetchApplicationLogs({ force: true });
+        } else if (state.appLogsVisible) {
+          updateAppLogPanel();
+        }
+        ensureAppLogPolling();
+      }
+    };
+
     this.querySelectorAll('.env-pill').forEach((btn) => {
       btn.addEventListener('click', (event) => {
-        if (event.target instanceof Element && event.target.closest('.env-pill-action')) return;
-        const env = btn.getAttribute('data-env');
-        if (!env) return;
-        setState({
-          environment: env,
-          envEditing: { ...state.envEditing, [env]: false },
-          envMessage: ''
-        });
-        storeEnv(state.user?.id, state.projectId, env);
-        if (state.projectId) {
-          loadEnvVars(state.projectId, env);
-          loadLatestBuild(state.projectId, env);
-          if (state.appLogsVisible && !state.appLogFrozenByEnv[env]) {
-            fetchApplicationLogs({ force: true });
-          } else if (state.appLogsVisible) {
-            updateAppLogPanel();
-          }
-          ensureAppLogPolling();
-        }
+        if (event.target instanceof Element && event.target.closest('.env-pill-action, .env-pill-menu, .env-menu-item, .menu')) return;
+        selectEnvironmentFromPill(btn);
+      });
+      btn.addEventListener('keydown', (event) => {
+        if (event.key !== 'Enter' && event.key !== ' ') return;
+        if (event.target instanceof Element && event.target.closest('.env-pill-action, .env-pill-menu, .env-menu-item, .menu')) return;
+        event.preventDefault();
+        selectEnvironmentFromPill(btn);
       });
     });
 
+    const patchCurrentEnvironmentState = (env, patch = {}) => {
+      const nextProjects = state.projects.map((project) => {
+        if (project.id !== state.projectId) return project;
+        return {
+          ...project,
+          environments: {
+            ...(project.environments || {}),
+            [env]: {
+              ...(project.environments?.[env] || {}),
+              ...patch
+            }
+          }
+        };
+      });
+      setState({ projects: nextProjects });
+    };
+
+    const patchDevelopmentState = (patch = {}) => {
+      patchCurrentEnvironmentState('development', patch);
+    };
+
+    const currentDevelopmentUrl = () => {
+      const project = currentProjectState();
+      return project ? `${projectProtocol()}://${projectUrl(project, 'development')}` : '';
+    };
+
+    const openDevelopment = async () => {
+      const url = currentDevelopmentUrl();
+      if (!url) return;
+      await openExternalLink(url);
+    };
+
+    const saveDevelopmentSelection = async ({ mode, taskId, commitHash } = {}) => {
+      const body = {};
+      const modeKey = mode ? normalizeDevelopmentModeValue(mode) : null;
+      if (modeKey) body.mode = modeKey;
+      if (taskId !== undefined) body.taskId = taskId || null;
+      if (commitHash !== undefined) body.commitHash = commitHash || null;
+      const response = await api(`/projects/${state.projectId}/development/selection`, {
+        method: 'PUT',
+        body: JSON.stringify(body)
+      });
+      patchDevelopmentState({
+        ...(modeKey ? { selected_mode: modeKey } : {}),
+        ...(taskId !== undefined ? { selected_task_id: taskId || null } : {}),
+        ...(commitHash !== undefined ? { selected_commit_sha: commitHash || null } : {})
+      });
+      return response;
+    };
+
+    const wakeDevelopment = async ({ mode, taskId, commitHash } = {}) => {
+      const envState = projectEnvironmentState(state.projectId, 'development') || {};
+      const wasAwake = isDevelopmentAwake(envState);
+      const modeKey = normalizeDevelopmentModeValue(mode || envState.selected_mode || envState.preview_mode || 'verified');
+      const modeLabel = developmentModeText(modeKey);
+      patchDevelopmentState({
+        ...(mode !== undefined ? { selected_mode: modeKey } : {}),
+        ...(taskId !== undefined ? { selected_task_id: taskId || null } : {}),
+        ...(commitHash !== undefined ? { selected_commit_sha: commitHash || null } : {}),
+        preview_mode: modeKey,
+        workspace_state: 'starting',
+        live_task_id: null,
+        live_commit_sha: null,
+        ...(modeKey === 'verified' ? { build_status: 'building' } : {})
+      });
+      const body = {};
+      if (mode !== undefined) body.mode = modeKey;
+      if (taskId !== undefined) body.taskId = taskId || null;
+      if (commitHash !== undefined) body.commitHash = commitHash || null;
+      const response = await api(`/projects/${state.projectId}/development/wake`, {
+        method: 'POST',
+        body: JSON.stringify(body)
+      });
+      if (response?.status === 'already_live') {
+        setTaskStatus(`${modeLabel} is already live`, { autoHide: true });
+      } else if (response?.status === 'already_starting') {
+        setTaskStatus(`Development is already starting in ${modeLabel}`, { autoHide: true });
+      } else {
+        setTaskStatus(`${wasAwake ? 'Switching Development to' : 'Waking Development in'} ${modeLabel}`, { autoHide: true });
+      }
+      return response;
+    };
+
+    const runDevelopmentTaskAction = async (mode, commitHash, taskId) => {
+      if (!commitHash) {
+        setTaskStatus('No commit hash available', { autoHide: true });
+        return;
+      }
+      const modeLabel = developmentModeText(mode);
+      closeTaskActionMenus(this);
+      try {
+        await wakeDevelopment({
+          mode,
+          taskId: taskId || null,
+          commitHash
+        });
+        setTaskStatus(`Starting ${modeLabel}`, { autoHide: true });
+      } catch (err) {
+        showError(err);
+        loadProjects();
+      }
+    };
+
     const runEnvironmentAction = async (env, action) => {
       if (!state.projectId || !env) return;
+      closeEnvActionMenus(this);
+      if (action === 'open-development') {
+        await openDevelopment();
+        return;
+      }
+      if (env === 'development' && (action === 'select-preview' || action === 'select-full-build')) {
+        const project = currentProjectState();
+        const envState = projectEnvironmentState(project, env);
+        const modeKey = action === 'select-preview' ? 'workspace' : 'verified';
+        const modeLabel = developmentModeText(modeKey);
+        if (state.deploymentPolicy?.verifiedOnly && modeKey === 'workspace') {
+          setTaskStatus('Preview Mode is disabled by verified-only deploys', { autoHide: true });
+          return;
+        }
+        if (developmentSelectedMode(project) === modeKey) return;
+        if (!isDevelopmentAwake(envState)) {
+          try {
+            await saveDevelopmentSelection({ mode: modeKey });
+            setTaskStatus(`${modeLabel} selected`, { autoHide: true });
+          } catch (err) {
+            showError(err);
+          }
+          return;
+        }
+        const choice = await showConfirmChoices(
+          `This will stop the currently running Development environment and switch to ${modeLabel}.`,
+          {
+            title: 'Switch Development Mode?',
+            confirmText: 'Confirm',
+            altText: 'Confirm and Wake',
+            cancelText: 'Cancel'
+          }
+        );
+        if (choice === 'cancel') return;
+        try {
+          await saveDevelopmentSelection({ mode: modeKey });
+          if (choice === 'alt') {
+            await wakeDevelopment({ mode: modeKey });
+          } else {
+            await api(`/projects/${state.projectId}/stop`, {
+              method: 'POST',
+              body: JSON.stringify({ environment: env })
+            });
+            patchDevelopmentState({
+              build_status: 'offline',
+              workspace_state: 'sleeping',
+              live_task_id: null,
+              live_commit_sha: null
+            });
+            setTaskStatus(`${modeLabel} selected`, { autoHide: true });
+          }
+        } catch (err) {
+          showError(err);
+          loadProjects();
+        }
+        return;
+      }
+      if (env === 'development' && action === 'wake-development') {
+        try {
+          const selectedMode = developmentSelectedMode(currentProjectState());
+          await wakeDevelopment({ mode: selectedMode });
+        } catch (err) {
+          showError(err);
+          loadProjects();
+        }
+        return;
+      }
+      if (env === 'development' && action === 'sleep-development') {
+        const ok = await showConfirm('Sleep Development?', { confirmText: 'Sleep' });
+        if (!ok) return;
+        setTaskStatus('Sleeping Development…', { autoHide: true });
+        try {
+          await api(`/projects/${state.projectId}/stop`, {
+            method: 'POST',
+            body: JSON.stringify({ environment: env })
+          });
+          patchDevelopmentState({
+            build_status: 'offline',
+            workspace_state: 'sleeping',
+            live_task_id: null,
+            live_commit_sha: null
+          });
+        } catch (err) {
+          showError(err);
+        }
+        return;
+      }
       if (action === 'cancel') {
         if (state.buildStatus[env] === 'canceling') {
           setTaskStatus('Build cancel is already in progress.', { autoHide: true });
@@ -3708,7 +4424,7 @@ class AppShell extends HTMLElement {
       }
     };
 
-    this.querySelectorAll('.env-pill-action').forEach((control) => {
+    this.querySelectorAll('.env-pill-action[data-action]').forEach((control) => {
       control.addEventListener('click', async (event) => {
         event.preventDefault();
         event.stopPropagation();
@@ -3718,6 +4434,71 @@ class AppShell extends HTMLElement {
         await runEnvironmentAction(env, action);
       });
     });
+
+    this.querySelectorAll('.env-menu-item').forEach((control) => {
+      control.addEventListener('click', async (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (control.disabled) return;
+        const env = control.getAttribute('data-env');
+        const action = control.getAttribute('data-action');
+        if (!env || !action) return;
+        await runEnvironmentAction(env, action);
+      });
+    });
+
+    this.querySelectorAll('.env-mode-toggle-input').forEach((control) => {
+      control.addEventListener('change', async (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (control.disabled) return;
+        const env = control.getAttribute('data-env');
+        const mode = normalizeDevelopmentModeValue(control.getAttribute('data-mode'));
+        if (!env || env !== 'development') return;
+        const nextMode = control.checked ? mode : (mode === 'workspace' ? 'verified' : 'workspace');
+        const action = nextMode === 'workspace' ? 'select-preview' : 'select-full-build';
+        await runEnvironmentAction(env, action);
+      });
+    });
+
+    this.querySelectorAll('.env-pill-menu summary').forEach((summary) => {
+      summary.addEventListener('click', (event) => {
+        event.stopPropagation();
+      });
+    });
+
+    this.querySelectorAll('.task-action-menu summary').forEach((summary) => {
+      summary.addEventListener('click', (event) => {
+        event.stopPropagation();
+      });
+    });
+
+    this.querySelectorAll('.task-menu-item').forEach((control) => {
+      control.addEventListener('click', async (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const action = control.getAttribute('data-task-action');
+        const commitHash = control.getAttribute('data-commit') || '';
+        const taskId = control.getAttribute('data-task-id') || null;
+        if (action === 'start-preview') {
+          await runDevelopmentTaskAction('workspace', commitHash, taskId);
+          return;
+        }
+        if (action === 'start-full-build') {
+          await runDevelopmentTaskAction('verified', commitHash, taskId);
+        }
+      });
+    });
+
+    if (!this._envMenuBound) {
+      this._envMenuBound = true;
+      document.addEventListener('click', (event) => {
+        if (!this.isConnected) return;
+        if (event.target instanceof Element && event.target.closest('.env-pill-menu')) return;
+        closeEnvActionMenus(this);
+        closeTaskActionMenus(this);
+      });
+    }
 
     this.querySelector('#nerdLevel')?.addEventListener('change', (e) => {
       const level = e.target.value;
@@ -3796,6 +4577,45 @@ class AppShell extends HTMLElement {
         document.execCommand('copy');
         temp.remove();
         setTaskStatus('Copied application logs', { autoHide: true });
+      }
+    });
+
+    this.querySelector('#toggleVerifyLogs')?.addEventListener('click', async () => {
+      const env = state.environment;
+      const nextVisible = !state.failedBuildLogVisible[env];
+      if (!nextVisible) {
+        state.failedBuildLogVisible[env] = false;
+        setState({ failedBuildLogVisible: { ...state.failedBuildLogVisible } });
+        return;
+      }
+      state.failedBuildLogVisible[env] = true;
+      setState({ failedBuildLogVisible: { ...state.failedBuildLogVisible } });
+      const latestBuild = state.latestBuild[env];
+      if (!state.failedBuildLog[env] && !state.failedBuildLogLoading[env]) {
+        await loadBuildLog(env, {
+          status: 'failed',
+          commitHash: latestBuild?.ref_commit || ''
+        });
+      }
+    });
+
+    this.querySelector('#copyVerifyLogs')?.addEventListener('click', async () => {
+      const text = state.failedBuildLog[state.environment] || '';
+      if (!text) {
+        setTaskStatus('No full build logs to copy yet.', { autoHide: true });
+        return;
+      }
+      try {
+        await navigator.clipboard.writeText(text);
+        setTaskStatus('Copied full build logs', { autoHide: true });
+      } catch {
+        const temp = document.createElement('textarea');
+        temp.value = text;
+        document.body.appendChild(temp);
+        temp.select();
+        document.execCommand('copy');
+        temp.remove();
+        setTaskStatus('Copied full build logs', { autoHide: true });
       }
     });
 
@@ -3903,12 +4723,17 @@ class AppShell extends HTMLElement {
       fetch(url, { headers: { ...authHeaders() } })
         .then((res) => {
           if (!res.ok) return res.json().then((d) => Promise.reject(new Error(d.error || 'Download failed')));
-          return res.blob();
+          const disposition = res.headers.get('content-disposition') || '';
+          const match = disposition.match(/filename="?([^"]+)"?/i);
+          return res.blob().then((blob) => ({
+            blob,
+            filename: match?.[1] || `${state.projects.find((p) => p.id === state.projectId)?.name || 'project'}.bundle`
+          }));
         })
-        .then((blob) => {
+        .then(({ blob, filename }) => {
           const link = document.createElement('a');
           link.href = URL.createObjectURL(blob);
-          link.download = `${state.projects.find((p) => p.id === state.projectId)?.name || 'project'}.tar.gz`;
+          link.download = filename;
           document.body.appendChild(link);
           link.click();
           link.remove();
@@ -4324,20 +5149,40 @@ class AppShell extends HTMLElement {
           fetchApplicationLogs({ force: true });
           ensureAppLogPolling();
         }
-        state.pendingDeployCommit[state.environment] = commitHash;
-        state.buildStatus[state.environment] = 'building';
-        state.progressVisibleUntil[state.environment] = 0;
-        setState({
-          pendingDeployCommit: { ...state.pendingDeployCommit },
-          buildStatus: { ...state.buildStatus },
-          progressVisibleUntil: { ...state.progressVisibleUntil }
-        });
         try {
-          await api(`/projects/${state.projectId}/deploy`, {
+          const response = await api(`/projects/${state.projectId}/deploy`, {
             method: 'POST',
             body: JSON.stringify({ commitHash, environment: state.environment })
           });
+          if (response?.status === 'already_live') {
+            state.pendingDeployCommit[state.environment] = '';
+            setState({
+              pendingDeployCommit: { ...state.pendingDeployCommit }
+            });
+            setTaskStatus('This commit is already live', { autoHide: true });
+            return;
+          }
+          if (response?.status === 'already_building') {
+            state.pendingDeployCommit[state.environment] = commitHash;
+            setState({
+              pendingDeployCommit: { ...state.pendingDeployCommit }
+            });
+            setTaskStatus('A deploy for this commit is already in progress', { autoHide: true });
+            return;
+          }
+          state.pendingDeployCommit[state.environment] = commitHash;
+          state.buildStatus[state.environment] = 'building';
+          state.progressVisibleUntil[state.environment] = 0;
+          setState({
+            pendingDeployCommit: { ...state.pendingDeployCommit },
+            buildStatus: { ...state.buildStatus },
+            progressVisibleUntil: { ...state.progressVisibleUntil }
+          });
         } catch (err) {
+          state.pendingDeployCommit[state.environment] = '';
+          setState({
+            pendingDeployCommit: { ...state.pendingDeployCommit }
+          });
           showError(err);
         }
       });
@@ -4377,5 +5222,7 @@ if (state.token) {
     const tokenUser = userFromToken(state.token);
     if (tokenUser) setState({ user: tokenUser, desktopSettings: loadDesktopSettings(tokenUser?.id) });
   }
-  loadProjects();
+  loadCurrentUser().finally(() => {
+    if (state.token) loadProjects();
+  });
 }

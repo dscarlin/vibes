@@ -87,10 +87,10 @@ podman run --name "$INSTALL_NAME" --rm \
   -w /app \
   node:20 \
   sh -lc "set -eu; \
-    if [ -f package-lock.json ]; then npm ci; elif [ -f yarn.lock ]; then yarn install; elif [ -f pnpm-lock.yaml ]; then npm i -g pnpm && pnpm i; elif [ -f package.json ]; then npm install; fi; \
+    if [ -f package-lock.json ]; then npm ci --include=dev --no-audit --no-fund; elif [ -f yarn.lock ]; then yarn install --production=false; elif [ -f pnpm-lock.yaml ]; then npm i -g pnpm && pnpm i --prod=false; elif [ -f package.json ]; then npm install --include=dev --no-audit --no-fund; fi; \
     if [ -f scripts/start-all.js ] && [ -f server/package.json ] && [ -f web/package.json ]; then \
-      if [ -f server/package-lock.json ]; then (cd server && npm ci); elif [ -f server/yarn.lock ]; then (cd server && yarn install); else (cd server && npm install); fi; \
-      if [ -f web/package-lock.json ]; then (cd web && npm ci); elif [ -f web/yarn.lock ]; then (cd web && yarn install); else (cd web && npm install); fi; \
+      if [ -f server/package-lock.json ]; then (cd server && npm ci --include=dev --no-audit --no-fund); elif [ -f server/yarn.lock ]; then (cd server && yarn install --production=false); elif [ -f server/pnpm-lock.yaml ]; then (cd server && npm i -g pnpm && pnpm i --prod=false); else (cd server && npm install --include=dev --no-audit --no-fund); fi; \
+      if [ -f web/package-lock.json ]; then (cd web && npm ci --include=dev --no-audit --no-fund); elif [ -f web/yarn.lock ]; then (cd web && yarn install --production=false); elif [ -f web/pnpm-lock.yaml ]; then (cd web && npm i -g pnpm && pnpm i --prod=false); else (cd web && npm install --include=dev --no-audit --no-fund); fi; \
       (cd server && npm run prisma:generate --if-present && npm run build --if-present); \
       (cd web && npm run build --if-present); \
     fi"
@@ -98,9 +98,9 @@ podman run --name "$INSTALL_NAME" --rm \
 RUNTIME_COMMAND="${START_COMMAND:-}"
 if [ -z "$RUNTIME_COMMAND" ]; then
   if [ -f "$WORKDIR/scripts/start-all.js" ] && [ -f "$WORKDIR/server/dist/index.js" ]; then
-    RUNTIME_COMMAND="node server/dist/index.js"
+    RUNTIME_COMMAND="if [ -f server/package.json ] && ! node -e \"const fs=require('fs');const {createRequire}=require('module');const p=JSON.parse(fs.readFileSync('/app/server/package.json','utf8'));const deps=Object.keys(p.dependencies||{});const r=createRequire('/app/server/index.js');for(const d of deps){r.resolve(d);}\" >/dev/null 2>&1; then (cd server && npm install --include=dev --no-audit --no-fund); fi; node server/dist/index.js"
   elif [ -f "$WORKDIR/scripts/start-all.js" ] && [ -f "$WORKDIR/server/index.js" ]; then
-    RUNTIME_COMMAND="node server/index.js"
+    RUNTIME_COMMAND="if [ -f server/package.json ] && ! node -e \"const fs=require('fs');const {createRequire}=require('module');const p=JSON.parse(fs.readFileSync('/app/server/package.json','utf8'));const deps=Object.keys(p.dependencies||{});const r=createRequire('/app/server/index.js');for(const d of deps){r.resolve(d);}\" >/dev/null 2>&1; then (cd server && npm install --include=dev --no-audit --no-fund); fi; node server/index.js"
   else
     RUNTIME_COMMAND="npm start"
   fi

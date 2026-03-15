@@ -14,7 +14,14 @@ export function requireAuth(req, res, next) {
   const [, token] = header.split(' ');
   if (!token) return res.status(401).json({ error: 'unauthorized' });
   try {
-    req.user = jwt.verify(token, config.jwtSecret);
+    const decoded = jwt.verify(token, config.jwtSecret);
+    const userId = decoded?.userId || decoded?.id || null;
+    if (!userId) return res.status(401).json({ error: 'unauthorized' });
+    req.user = {
+      ...decoded,
+      userId,
+      id: userId
+    };
     return next();
   } catch (err) {
     return res.status(401).json({ error: 'unauthorized' });

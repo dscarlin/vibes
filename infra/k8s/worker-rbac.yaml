@@ -4,8 +4,11 @@ metadata:
   name: worker-deployer
 rules:
   - apiGroups: [""]
-    resources: ["secrets","services","configmaps","namespaces","pods","pods/log","pods/status","nodes"]
+    resources: ["secrets","services","configmaps","namespaces","pods","pods/log","pods/status","nodes","persistentvolumeclaims","persistentvolumes"]
     verbs: ["get","list","watch","create","update","patch","delete"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
   - apiGroups: ["apps"]
     resources: ["deployments","deployments/scale"]
     verbs: ["get","list","watch","create","update","patch","delete"]

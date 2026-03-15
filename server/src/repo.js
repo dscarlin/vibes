@@ -55,6 +55,10 @@ async function gitOutput(args, cwd) {
   return stdout.trim();
 }
 
+async function cloneBundle(bundlePath, repoPath) {
+  await exec('git', ['clone', bundlePath, repoPath]);
+}
+
 export async function extractArchive(buffer, ext) {
   const tempDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), 'vibes-upload-'));
   const archivePath = path.join(tempDir, `upload${ext}`);
@@ -68,6 +72,16 @@ export async function extractArchive(buffer, ext) {
   }
   await fsPromises.rm(archivePath, { force: true });
   return tempDir;
+}
+
+export async function loadRepoFromBundleBuffer(buffer) {
+  const tempDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), 'vibes-bundle-'));
+  const bundlePath = path.join(tempDir, 'repo.bundle');
+  const repoPath = path.join(tempDir, 'repo');
+  await fsPromises.writeFile(bundlePath, buffer);
+  await cloneBundle(bundlePath, repoPath);
+  await fsPromises.rm(bundlePath, { force: true });
+  return { tempDir, repoPath };
 }
 
 export async function removeTempDir(dir) {
@@ -131,14 +145,29 @@ export async function validateRepo(repoPath) {
 export async function archiveRepo(repoPath) {
   const tempDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), 'vibes-archive-'));
   const outPath = path.join(tempDir, 'snapshot.tar.gz');
-  await tar.c(
-    {
-      gzip: true,
-      file: outPath,
-      cwd: repoPath,
-      filter: (entryPath) => !isExcludedPath(entryPath)
-    },
-    ['.']
-  );
-  return fsPromises.readFile(outPath);
+  try {
+    await tar.c(
+      {
+        gzip: true,
+        file: outPath,
+        cwd: repoPath,
+        filter: (entryPath) => !isExcludedPath(entryPath)
+      },
+      ['.']
+    );
+    return await fsPromises.readFile(outPath);
+  } finally {
+    await removeTempDir(tempDir);
+  }
+}
+
+export async function bundleRepo(repoPath) {
+  const tempDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), 'vibes-bundle-'));
+  const outPath = path.join(tempDir, 'repo.bundle');
+  try {
+    await runGit(['bundle', 'create', outPath, '--all'], repoPath);
+    return await fsPromises.readFile(outPath);
+  } finally {
+    await removeTempDir(tempDir);
+  }
 }

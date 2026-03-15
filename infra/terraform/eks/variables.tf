@@ -42,3 +42,8 @@ variable "node_max" {
   type    = number
   default = 4
 }
+
+variable "workspace_snapshot_bucket_name" {
+  type    = string
+  default = ""
+}

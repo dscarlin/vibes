@@ -179,7 +179,7 @@ To schedule customer apps onto a dedicated nodegroup, set:
 - `CUSTOMER_NODEGROUP_TAINT_KEY=nodegroup`
 - `CUSTOMER_NODEGROUP_TAINT_VALUE=customer`
 
-`deploy.sh` will apply `nodeSelector` + `tolerations` when enabled.
+`deploy.sh` will apply `nodeSelector` + `tolerations` when enabled. Development workspace pods created by the worker also honor these same `CUSTOMER_NODEGROUP_*` settings, with a best-effort fallback to normal scheduling if no matching customer nodes are available. Legacy workspace PVCs that are already pinned to a different availability zone will also fall back until the workspace volume is recreated in a customer-node zone.
 
 If you are using ALB, ensure the ingress manifests use `spec.ingressClassName: alb`
 and that the AWS Load Balancer Controller is installed.
