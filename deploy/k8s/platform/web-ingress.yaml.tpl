@@ -1,8 +1,8 @@
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: vibes-web
-  namespace: vibes-platform
+  name: ${PLATFORM_WEB_NAME}
+  namespace: ${PLATFORM_NAMESPACE}
   annotations:
     alb.ingress.kubernetes.io/scheme: internet-facing
     alb.ingress.kubernetes.io/certificate-arn: ${ACM_CERT_ARN}
@@ -22,7 +22,7 @@ spec:
             pathType: Prefix
             backend:
               service:
-                name: vibes-web
+                name: ${PLATFORM_WEB_NAME}
                 port:
                   number: 80
     - host: ${ROOT_HOST}
@@ -32,6 +32,6 @@ spec:
             pathType: Prefix
             backend:
               service:
-                name: vibes-web
+                name: ${PLATFORM_WEB_NAME}
                 port:
                   number: 80

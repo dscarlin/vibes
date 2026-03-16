@@ -10,6 +10,25 @@ require_cmd kubectl envsubst curl
 source_env_file "$METADATA_ENV_FILE"
 source_env_file "$IMAGES_ENV_FILE"
 
+export PLATFORM_NAMESPACE="${PLATFORM_NAMESPACE:-vibes-platform}"
+export DEVELOPMENT_NAMESPACE="${DEVELOPMENT_NAMESPACE:-vibes-development}"
+export TESTING_NAMESPACE="${TESTING_NAMESPACE:-vibes-testing}"
+export PRODUCTION_NAMESPACE="${PRODUCTION_NAMESPACE:-vibes-production}"
+export PLATFORM_SERVER_NAME="${PLATFORM_SERVER_NAME:-vibes-server}"
+export PLATFORM_WEB_NAME="${PLATFORM_WEB_NAME:-vibes-web}"
+export PLATFORM_WORKER_NAME="${PLATFORM_WORKER_NAME:-vibes-worker}"
+export PLATFORM_REDIS_NAME="${PLATFORM_REDIS_NAME:-redis}"
+export PLATFORM_SERVER_SERVICE_ACCOUNT_NAME="${PLATFORM_SERVER_SERVICE_ACCOUNT_NAME:-vibes-server-sa}"
+export PLATFORM_WORKER_SERVICE_ACCOUNT_NAME="${PLATFORM_WORKER_SERVICE_ACCOUNT_NAME:-worker-sa}"
+export PLATFORM_SERVER_ENV_SECRET_NAME="${PLATFORM_SERVER_ENV_SECRET_NAME:-${PLATFORM_SERVER_NAME}-env}"
+export PLATFORM_WEB_ENV_SECRET_NAME="${PLATFORM_WEB_ENV_SECRET_NAME:-${PLATFORM_WEB_NAME}-env}"
+export PLATFORM_WORKER_ENV_SECRET_NAME="${PLATFORM_WORKER_ENV_SECRET_NAME:-${PLATFORM_WORKER_NAME}-env}"
+export PLATFORM_RDS_CA_SECRET_NAME="${PLATFORM_RDS_CA_SECRET_NAME:-rds-ca-bundle}"
+export PLATFORM_SERVER_METRICS_CLUSTER_ROLE_NAME="${PLATFORM_SERVER_METRICS_CLUSTER_ROLE_NAME:-vibes-admin-metrics-read}"
+export PLATFORM_SERVER_METRICS_CLUSTER_ROLE_BINDING_NAME="${PLATFORM_SERVER_METRICS_CLUSTER_ROLE_BINDING_NAME:-vibes-admin-metrics-read}"
+export PLATFORM_WORKER_CLUSTER_ROLE_NAME="${PLATFORM_WORKER_CLUSTER_ROLE_NAME:-worker-deployer}"
+export PLATFORM_WORKER_CLUSTER_ROLE_BINDING_NAME="${PLATFORM_WORKER_CLUSTER_ROLE_BINDING_NAME:-worker-deployer}"
+
 hash_paths() {
   if command -v shasum >/dev/null 2>&1; then
     cat "$@" | shasum -a 256 | awk '{print $1}'
@@ -40,41 +59,45 @@ export SERVER_CONFIG_HASH="$(hash_paths "$SERVER_ENV_FILE" "$REPO_ROOT/rds-ca.pe
 export WEB_CONFIG_HASH="$(hash_paths "$WEB_ENV_FILE")"
 export WORKER_CONFIG_HASH="$(hash_paths "$WORKER_ENV_FILE" "$REPO_ROOT/rds-ca.pem")"
 
-kubectl_retry create namespace vibes-platform --dry-run=client -o yaml | kubectl_retry apply -f - >/dev/null
+apply_manifest() {
+  envsubst <"$1" | kubectl_retry apply -f -
+}
 
-kubectl_retry -n vibes-platform create secret generic vibes-server-env \
+kubectl_retry create namespace "$PLATFORM_NAMESPACE" --dry-run=client -o yaml | kubectl_retry apply -f - >/dev/null
+
+kubectl_retry -n "$PLATFORM_NAMESPACE" create secret generic "$PLATFORM_SERVER_ENV_SECRET_NAME" \
   --from-env-file="$SERVER_ENV_FILE" \
   --dry-run=client -o yaml | kubectl_retry apply -f -
 
-kubectl_retry -n vibes-platform create secret generic vibes-web-env \
+kubectl_retry -n "$PLATFORM_NAMESPACE" create secret generic "$PLATFORM_WEB_ENV_SECRET_NAME" \
   --from-env-file="$WEB_ENV_FILE" \
   --dry-run=client -o yaml | kubectl_retry apply -f -
 
-kubectl_retry -n vibes-platform create secret generic vibes-worker-env \
+kubectl_retry -n "$PLATFORM_NAMESPACE" create secret generic "$PLATFORM_WORKER_ENV_SECRET_NAME" \
   --from-env-file="$WORKER_ENV_FILE" \
   --dry-run=client -o yaml | kubectl_retry apply -f -
 
-kubectl_retry -n vibes-platform create secret generic rds-ca-bundle \
+kubectl_retry -n "$PLATFORM_NAMESPACE" create secret generic "$PLATFORM_RDS_CA_SECRET_NAME" \
   --from-file=rds-ca.pem="$REPO_ROOT/rds-ca.pem" \
   --dry-run=client -o yaml | kubectl_retry apply -f -
 
-kubectl_retry apply -f "$REPO_ROOT/deploy/k8s/platform/server-service-account.yaml"
-kubectl_retry apply -f "$REPO_ROOT/deploy/k8s/platform/server-rbac.yaml"
-envsubst <"$REPO_ROOT/deploy/k8s/platform/worker-service-account.yaml.tpl" | kubectl_retry apply -f -
-kubectl_retry apply -f "$REPO_ROOT/deploy/k8s/platform/worker-rbac.yaml"
-kubectl_retry apply -f "$REPO_ROOT/deploy/k8s/platform/redis.yaml"
-kubectl_retry apply -f "$REPO_ROOT/deploy/k8s/platform/server-service.yaml"
-kubectl_retry apply -f "$REPO_ROOT/deploy/k8s/platform/web-service.yaml"
-envsubst <"$REPO_ROOT/deploy/k8s/platform/server-deployment.yaml.tpl" | kubectl_retry apply -f -
-envsubst <"$REPO_ROOT/deploy/k8s/platform/web-deployment.yaml.tpl" | kubectl_retry apply -f -
-envsubst <"$REPO_ROOT/deploy/k8s/platform/worker-deployment.yaml.tpl" | kubectl_retry apply -f -
-envsubst <"$REPO_ROOT/deploy/k8s/platform/server-ingress.yaml.tpl" | kubectl_retry apply -f -
-envsubst <"$REPO_ROOT/deploy/k8s/platform/web-ingress.yaml.tpl" | kubectl_retry apply -f -
+apply_manifest "$REPO_ROOT/deploy/k8s/platform/server-service-account.yaml"
+apply_manifest "$REPO_ROOT/deploy/k8s/platform/server-rbac.yaml"
+apply_manifest "$REPO_ROOT/deploy/k8s/platform/worker-service-account.yaml.tpl"
+apply_manifest "$REPO_ROOT/deploy/k8s/platform/worker-rbac.yaml"
+apply_manifest "$REPO_ROOT/deploy/k8s/platform/redis.yaml"
+apply_manifest "$REPO_ROOT/deploy/k8s/platform/server-service.yaml"
+apply_manifest "$REPO_ROOT/deploy/k8s/platform/web-service.yaml"
+apply_manifest "$REPO_ROOT/deploy/k8s/platform/server-deployment.yaml.tpl"
+apply_manifest "$REPO_ROOT/deploy/k8s/platform/web-deployment.yaml.tpl"
+apply_manifest "$REPO_ROOT/deploy/k8s/platform/worker-deployment.yaml.tpl"
+apply_manifest "$REPO_ROOT/deploy/k8s/platform/server-ingress.yaml.tpl"
+apply_manifest "$REPO_ROOT/deploy/k8s/platform/web-ingress.yaml.tpl"
 
-kubectl_retry -n vibes-platform rollout status deploy/redis --timeout=5m
-kubectl_retry -n vibes-platform rollout status deploy/vibes-server --timeout=10m
-kubectl_retry -n vibes-platform rollout status deploy/vibes-web --timeout=10m
-kubectl_retry -n vibes-platform rollout status deploy/vibes-worker --timeout=10m
+kubectl_retry -n "$PLATFORM_NAMESPACE" rollout status "deploy/${PLATFORM_REDIS_NAME}" --timeout=5m
+kubectl_retry -n "$PLATFORM_NAMESPACE" rollout status "deploy/${PLATFORM_SERVER_NAME}" --timeout=10m
+kubectl_retry -n "$PLATFORM_NAMESPACE" rollout status "deploy/${PLATFORM_WEB_NAME}" --timeout=10m
+kubectl_retry -n "$PLATFORM_NAMESPACE" rollout status "deploy/${PLATFORM_WORKER_NAME}" --timeout=10m
 
 "$REPO_ROOT/deploy/sync-base-dns.sh"
 

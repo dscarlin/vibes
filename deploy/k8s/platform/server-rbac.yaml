@@ -1,7 +1,7 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: vibes-admin-metrics-read
+  name: ${PLATFORM_SERVER_METRICS_CLUSTER_ROLE_NAME}
 rules:
   - apiGroups: [""]
     resources: ["nodes", "pods"]
@@ -16,12 +16,12 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: vibes-admin-metrics-read
+  name: ${PLATFORM_SERVER_METRICS_CLUSTER_ROLE_BINDING_NAME}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: vibes-admin-metrics-read
+  name: ${PLATFORM_SERVER_METRICS_CLUSTER_ROLE_NAME}
 subjects:
   - kind: ServiceAccount
-    name: vibes-server-sa
-    namespace: vibes-platform
+    name: ${PLATFORM_SERVER_SERVICE_ACCOUNT_NAME}
+    namespace: ${PLATFORM_NAMESPACE}

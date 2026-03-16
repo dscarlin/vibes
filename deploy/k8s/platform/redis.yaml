@@ -1,20 +1,20 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: redis
-  namespace: vibes-platform
+  name: ${PLATFORM_REDIS_NAME}
+  namespace: ${PLATFORM_NAMESPACE}
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: redis
+      app: ${PLATFORM_REDIS_NAME}
   template:
     metadata:
       labels:
-        app: redis
+        app: ${PLATFORM_REDIS_NAME}
     spec:
       containers:
-        - name: redis
+        - name: ${PLATFORM_REDIS_NAME}
           image: redis:7-alpine
           ports:
             - containerPort: 6379
@@ -22,11 +22,11 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: redis
-  namespace: vibes-platform
+  name: ${PLATFORM_REDIS_NAME}
+  namespace: ${PLATFORM_NAMESPACE}
 spec:
   selector:
-    app: redis
+    app: ${PLATFORM_REDIS_NAME}
   ports:
     - name: redis
       port: 6379

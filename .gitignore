@@ -17,3 +17,5 @@ desktop/src-tauri/target/
 deploy/.generated/
 validation/evidence/*
 !validation/evidence/.gitkeep
+.vp-task/
+.codex-last-message.txt

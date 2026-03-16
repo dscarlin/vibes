@@ -1,7 +1,7 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: worker-deployer
+  name: ${PLATFORM_WORKER_CLUSTER_ROLE_NAME}
 rules:
   - apiGroups: [""]
     resources: ["secrets", "services", "configmaps", "namespaces", "pods", "pods/log", "pods/status", "nodes", "persistentvolumeclaims", "persistentvolumes"]
@@ -19,12 +19,12 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: worker-deployer
+  name: ${PLATFORM_WORKER_CLUSTER_ROLE_BINDING_NAME}
 subjects:
   - kind: ServiceAccount
-    name: worker-sa
-    namespace: vibes-platform
+    name: ${PLATFORM_WORKER_SERVICE_ACCOUNT_NAME}
+    namespace: ${PLATFORM_NAMESPACE}
 roleRef:
   kind: ClusterRole
-  name: worker-deployer
+  name: ${PLATFORM_WORKER_CLUSTER_ROLE_NAME}
   apiGroup: rbac.authorization.k8s.io

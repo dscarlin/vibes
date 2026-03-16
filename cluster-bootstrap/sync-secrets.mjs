@@ -116,6 +116,30 @@ const outputs = {
   workerIrsaRoleArn: await terraformOutput('worker_irsa_role_arn')
 };
 
+const platformNamespace = process.env.PLATFORM_NAMESPACE || 'vibes-platform';
+const developmentNamespace = process.env.DEVELOPMENT_NAMESPACE || 'vibes-development';
+const testingNamespace = process.env.TESTING_NAMESPACE || 'vibes-testing';
+const productionNamespace = process.env.PRODUCTION_NAMESPACE || 'vibes-production';
+const platformServerName = process.env.PLATFORM_SERVER_NAME || 'vibes-server';
+const platformWebName = process.env.PLATFORM_WEB_NAME || 'vibes-web';
+const platformWorkerName = process.env.PLATFORM_WORKER_NAME || 'vibes-worker';
+const platformRedisName = process.env.PLATFORM_REDIS_NAME || 'redis';
+const platformServerServiceAccountName = process.env.PLATFORM_SERVER_SERVICE_ACCOUNT_NAME || 'vibes-server-sa';
+const platformWorkerServiceAccountName = process.env.PLATFORM_WORKER_SERVICE_ACCOUNT_NAME || 'worker-sa';
+const platformServerMetricsClusterRoleName =
+  process.env.PLATFORM_SERVER_METRICS_CLUSTER_ROLE_NAME || 'vibes-admin-metrics-read';
+const platformServerMetricsClusterRoleBindingName =
+  process.env.PLATFORM_SERVER_METRICS_CLUSTER_ROLE_BINDING_NAME || 'vibes-admin-metrics-read';
+const platformWorkerClusterRoleName = process.env.PLATFORM_WORKER_CLUSTER_ROLE_NAME || 'worker-deployer';
+const platformWorkerClusterRoleBindingName =
+  process.env.PLATFORM_WORKER_CLUSTER_ROLE_BINDING_NAME || 'worker-deployer';
+const projectHostDomain = process.env.PROJECT_HOST_DOMAIN || outputs.rootHost;
+const projectHostSuffix = process.env.PROJECT_HOST_SUFFIX || '';
+const projectWildcardHosts = process.env.PROJECT_WILDCARD_HOSTS || projectHostDomain;
+const projectDatabasePrefix = process.env.PROJECT_DATABASE_PREFIX || 'vibes';
+const platformServerSocketUrl =
+  process.env.SERVER_SOCKET_URL || `http://${platformServerName}.${platformNamespace}.svc.cluster.local:80`;
+
 const serverSecret = await readSecret(outputs.serverSecretName);
 const webSecret = await readSecret(outputs.webSecretName);
 const workerSecret = await readSecret(outputs.workerSecretName);
@@ -145,7 +169,14 @@ const serverEnv = {
   PLAN_LIMITS: serverSecret.PLAN_LIMITS || defaultPlanLimits(),
   NODEGROUP_MONTHLY_COSTS: serverSecret.NODEGROUP_MONTHLY_COSTS || defaultNodeCosts(),
   ADMIN_API_KEY: serverSecret.ADMIN_API_KEY,
-  DESKTOP_DOWNLOAD_DIR: serverSecret.DESKTOP_DOWNLOAD_DIR || '/app/downloads'
+  DESKTOP_DOWNLOAD_DIR: serverSecret.DESKTOP_DOWNLOAD_DIR || '/app/downloads',
+  PLATFORM_NAMESPACE: platformNamespace,
+  DEVELOPMENT_NAMESPACE: developmentNamespace,
+  TESTING_NAMESPACE: testingNamespace,
+  PRODUCTION_NAMESPACE: productionNamespace,
+  RUNTIME_NAMESPACE_DEVELOPMENT: developmentNamespace,
+  RUNTIME_NAMESPACE_TESTING: testingNamespace,
+  RUNTIME_NAMESPACE_PRODUCTION: productionNamespace
 };
 
 const webEnv = {
@@ -168,10 +199,13 @@ const workerEnv = {
   STARTER_REPO_URL: workerSecret.STARTER_REPO_URL || 'https://github.com/dscarlin/vibesplatform-starter-app.git',
   STARTER_REPO_REF: workerSecret.STARTER_REPO_REF || 'main',
   GIT_TOKEN: workerSecret.GIT_TOKEN,
-  SERVER_SOCKET_URL: 'http://vibes-server.vibes-platform.svc.cluster.local:80',
+  SERVER_SOCKET_URL: platformServerSocketUrl,
   DOMAIN: outputs.apiHost,
   PLATFORM_ENV: 'k8s',
-  APP_DOMAIN: outputs.rootHost,
+  APP_DOMAIN: projectHostDomain,
+  PROJECT_HOST_DOMAIN: projectHostDomain,
+  PROJECT_HOST_SUFFIX: projectHostSuffix,
+  PROJECT_DATABASE_PREFIX: projectDatabasePrefix,
   AWS_REGION: outputs.region,
   AWS_ACCOUNT_ID: outputs.accountId,
   ECR_REPO: outputs.customerAppRepositoryName,
@@ -201,8 +235,15 @@ const workerEnv = {
   DEV_DELETE_COMMAND: '/app/infra/k8s/delete.sh',
   TEST_DELETE_COMMAND: '/app/infra/k8s/delete.sh',
   PROD_DELETE_COMMAND: '/app/infra/k8s/delete.sh',
-  WORKSPACE_POD_NAMESPACE: 'vibes-development',
-  WORKER_POD_NAMESPACE: 'vibes-platform',
+  WORKSPACE_POD_NAMESPACE: developmentNamespace,
+  WORKER_POD_NAMESPACE: platformNamespace,
+  PLATFORM_NAMESPACE: platformNamespace,
+  DEVELOPMENT_NAMESPACE: developmentNamespace,
+  TESTING_NAMESPACE: testingNamespace,
+  PRODUCTION_NAMESPACE: productionNamespace,
+  RUNTIME_NAMESPACE_DEVELOPMENT: developmentNamespace,
+  RUNTIME_NAMESPACE_TESTING: testingNamespace,
+  RUNTIME_NAMESPACE_PRODUCTION: productionNamespace,
   WORKSPACE_STORAGE_SIZE: workerSecret.WORKSPACE_STORAGE_SIZE || '10Gi',
   WORKSPACE_IDLE_TTL_MS: workerSecret.WORKSPACE_IDLE_TTL_MS || '1200000',
   WORKSPACE_PREVIEW_START_TIMEOUT_MS: workerSecret.WORKSPACE_PREVIEW_START_TIMEOUT_MS || '120000',
@@ -218,8 +259,6 @@ const workerEnv = {
   DEV_SCALE_TO_ZERO_AFTER_MS: workerSecret.DEV_SCALE_TO_ZERO_AFTER_MS || '900000',
   TEST_SCALE_TO_ZERO_AFTER_MS: workerSecret.TEST_SCALE_TO_ZERO_AFTER_MS || '10800000',
   SCALE_TO_ZERO_INTERVAL_MS: workerSecret.SCALE_TO_ZERO_INTERVAL_MS || '60000',
-  CODEX_COMMAND_TEMPLATE: 'OPENAI_API_KEY="$OPENAI_API_KEY" codex exec --skip-git-repo-check --json -o "$CODEX_RESPONSE_FILE" --yolo --ephemeral -m "$OPENAI_MODEL" -s danger-full-access "$CODEX_PROMPT"',
-  CODEX_COMMAND_TEMPLATE_RESUME: 'OPENAI_API_KEY="$OPENAI_API_KEY" codex exec --skip-git-repo-check --json -o "$CODEX_RESPONSE_FILE" --yolo --ephemeral -m "$OPENAI_MODEL" --sandbox danger-full-access resume "$CODEX_THREAD_ID" "$CODEX_PROMPT"',
   OPENAI_MODEL: workerSecret.OPENAI_MODEL,
   OPENAI_API_KEY: workerSecret.OPENAI_API_KEY,
   DEMO_MODE: 'true',
@@ -250,7 +289,22 @@ const workerEnv = {
   QUEUE_MONITOR_INTERVAL_MS: workerSecret.QUEUE_MONITOR_INTERVAL_MS || '60000',
   ALERT_COOLDOWN_MS: workerSecret.ALERT_COOLDOWN_MS || '600000',
   ALB_GROUP_NAME: outputs.albGroupName,
-  ALB_GROUP_ORDER: workerSecret.ALB_GROUP_ORDER || '50'
+  ALB_GROUP_ORDER: workerSecret.ALB_GROUP_ORDER || '50',
+  PLATFORM_SERVER_NAME: platformServerName,
+  PLATFORM_WEB_NAME: platformWebName,
+  PLATFORM_WORKER_NAME: platformWorkerName,
+  PLATFORM_REDIS_NAME: platformRedisName,
+  PLATFORM_SERVER_SERVICE_ACCOUNT_NAME: platformServerServiceAccountName,
+  PLATFORM_WORKER_SERVICE_ACCOUNT_NAME: platformWorkerServiceAccountName,
+  PLATFORM_SERVER_METRICS_CLUSTER_ROLE_NAME: platformServerMetricsClusterRoleName,
+  PLATFORM_SERVER_METRICS_CLUSTER_ROLE_BINDING_NAME: platformServerMetricsClusterRoleBindingName,
+  PLATFORM_WORKER_CLUSTER_ROLE_NAME: platformWorkerClusterRoleName,
+  PLATFORM_WORKER_CLUSTER_ROLE_BINDING_NAME: platformWorkerClusterRoleBindingName,
+  PROJECT_WILDCARD_HOSTS: projectWildcardHosts,
+  CODEX_COMMAND_TEMPLATE:
+    'OPENAI_API_KEY="$OPENAI_API_KEY" codex exec --skip-git-repo-check --json -o "$CODEX_RESPONSE_FILE" --ephemeral -m "$OPENAI_MODEL" --dangerously-bypass-approvals-and-sandbox "$CODEX_PROMPT"',
+  CODEX_COMMAND_TEMPLATE_RESUME:
+    'OPENAI_API_KEY="$OPENAI_API_KEY" codex exec --skip-git-repo-check --json -o "$CODEX_RESPONSE_FILE" --ephemeral -m "$OPENAI_MODEL" --dangerously-bypass-approvals-and-sandbox resume "$CODEX_THREAD_ID" "$CODEX_PROMPT"'
 };
 
 const metadataEnv = {
@@ -269,7 +323,25 @@ const metadataEnv = {
   WEB_REPOSITORY_URL: outputs.webRepositoryUrl,
   WORKER_REPOSITORY_URL: outputs.workerRepositoryUrl,
   CUSTOMER_APP_REPOSITORY_NAME: outputs.customerAppRepositoryName,
-  WORKER_IRSA_ROLE_ARN: outputs.workerIrsaRoleArn
+  WORKER_IRSA_ROLE_ARN: outputs.workerIrsaRoleArn,
+  PLATFORM_NAMESPACE: platformNamespace,
+  DEVELOPMENT_NAMESPACE: developmentNamespace,
+  TESTING_NAMESPACE: testingNamespace,
+  PRODUCTION_NAMESPACE: productionNamespace,
+  PLATFORM_SERVER_NAME: platformServerName,
+  PLATFORM_WEB_NAME: platformWebName,
+  PLATFORM_WORKER_NAME: platformWorkerName,
+  PLATFORM_REDIS_NAME: platformRedisName,
+  PLATFORM_SERVER_SERVICE_ACCOUNT_NAME: platformServerServiceAccountName,
+  PLATFORM_WORKER_SERVICE_ACCOUNT_NAME: platformWorkerServiceAccountName,
+  PLATFORM_SERVER_METRICS_CLUSTER_ROLE_NAME: platformServerMetricsClusterRoleName,
+  PLATFORM_SERVER_METRICS_CLUSTER_ROLE_BINDING_NAME: platformServerMetricsClusterRoleBindingName,
+  PLATFORM_WORKER_CLUSTER_ROLE_NAME: platformWorkerClusterRoleName,
+  PLATFORM_WORKER_CLUSTER_ROLE_BINDING_NAME: platformWorkerClusterRoleBindingName,
+  PROJECT_HOST_DOMAIN: projectHostDomain,
+  PROJECT_HOST_SUFFIX: projectHostSuffix,
+  PROJECT_WILDCARD_HOSTS: projectWildcardHosts,
+  PROJECT_DATABASE_PREFIX: projectDatabasePrefix
 };
 
 await Promise.all([

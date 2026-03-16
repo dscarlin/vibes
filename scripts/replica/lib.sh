@@ -10,14 +10,14 @@ BOOTSTRAP_DIR="$REPO_ROOT/infra/bootstrap/remote-state"
 REPLICA_ENV_DIR="$REPO_ROOT/infra/envs/test-replica"
 LAYER1_DIR="$REPLICA_ENV_DIR/layer1"
 LAYER2_DIR="$REPLICA_ENV_DIR/layer2"
-GENERATED_DIR="$REPO_ROOT/deploy/.generated/replica"
+GENERATED_DIR="${REPLICA_OUTPUT_DIR:-$REPO_ROOT/deploy/.generated/replica}"
 BACKEND_DIR="$GENERATED_DIR/backend"
 METADATA_ENV_FILE="$GENERATED_DIR/metadata.env"
 IMAGES_ENV_FILE="$GENERATED_DIR/images.env"
 SERVER_ENV_FILE="$GENERATED_DIR/server.env"
 WEB_ENV_FILE="$GENERATED_DIR/web.env"
 WORKER_ENV_FILE="$GENERATED_DIR/worker.env"
-VALIDATION_EVIDENCE_DIR="$REPO_ROOT/validation/evidence"
+VALIDATION_EVIDENCE_DIR="${REPLICA_VALIDATION_EVIDENCE_DIR:-$REPO_ROOT/validation/evidence}"
 TF_BIN="$REPO_ROOT/scripts/replica/terraformw.sh"
 
 REPLICA_AWS_REGION="${REPLICA_AWS_REGION:-us-east-1}"
@@ -226,8 +226,9 @@ update_kubeconfig_for_replica() {
 }
 
 shared_alb_hostname() {
-  for ingress_name in vibes-web vibes-server; do
-    hostname="$(kubectl_retry -n vibes-platform get ingress "$ingress_name" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)"
+  namespace="${PLATFORM_NAMESPACE:-vibes-platform}"
+  for ingress_name in "${PLATFORM_WEB_NAME:-vibes-web}" "${PLATFORM_SERVER_NAME:-vibes-server}"; do
+    hostname="$(kubectl_retry -n "$namespace" get ingress "$ingress_name" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)"
     if [ -n "$hostname" ]; then
       printf '%s\n' "$hostname"
       return 0

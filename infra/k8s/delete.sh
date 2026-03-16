@@ -12,7 +12,7 @@ if [ -z "${AWS_REGION:-}" ] || [ -z "${AWS_ACCOUNT_ID:-}" ] || [ -z "${ECR_REPO:
   exit 1
 fi
 
-NAMESPACE="vibes-${ENVIRONMENT}"
+NAMESPACE="${NAMESPACE:-vibes-${ENVIRONMENT}}"
 APP_NAME="vibes-app-${PROJECT_ID}"
 
 kubectl -n "$NAMESPACE" delete ingress "$APP_NAME" --ignore-not-found

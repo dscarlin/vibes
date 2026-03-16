@@ -138,6 +138,12 @@ const RATE_LIMIT_PUBLIC_MAX = Number(process.env.RATE_LIMIT_PUBLIC_MAX || 120);
 const KUBECTL_TIMEOUT_MS = Number(process.env.KUBECTL_TIMEOUT_MS || 8000);
 const ADMIN_METRICS_CACHE_TTL_MS = Number(process.env.ADMIN_METRICS_CACHE_TTL_MS || 15000);
 const ADMIN_METRICS_CACHE_STALE_TTL_MS = Number(process.env.ADMIN_METRICS_CACHE_STALE_TTL_MS || 5 * 60 * 1000);
+const RUNTIME_NAMESPACE_DEVELOPMENT =
+  process.env.RUNTIME_NAMESPACE_DEVELOPMENT || process.env.DEVELOPMENT_NAMESPACE || 'vibes-development';
+const RUNTIME_NAMESPACE_TESTING =
+  process.env.RUNTIME_NAMESPACE_TESTING || process.env.TESTING_NAMESPACE || 'vibes-testing';
+const RUNTIME_NAMESPACE_PRODUCTION =
+  process.env.RUNTIME_NAMESPACE_PRODUCTION || process.env.PRODUCTION_NAMESPACE || 'vibes-production';
 const ADMIN_RESTART_LOOP_THRESHOLD = (() => {
   const raw = Number(process.env.ADMIN_RESTART_LOOP_THRESHOLD || 2);
   if (!Number.isFinite(raw) || raw < 1) return 2;
@@ -2572,6 +2578,14 @@ function logCommandForEnv() {
   return process.env.PROD_LOG_COMMAND;
 }
 
+function runtimeNamespaceForEnv(env) {
+  const normalized = String(env || '').trim().toLowerCase();
+  if (normalized === 'development' || normalized === 'dev') return RUNTIME_NAMESPACE_DEVELOPMENT;
+  if (normalized === 'testing' || normalized === 'test') return RUNTIME_NAMESPACE_TESTING;
+  if (normalized === 'production' || normalized === 'prod') return RUNTIME_NAMESPACE_PRODUCTION;
+  return `vibes-${normalized || 'development'}`;
+}
+
 function summarizePodStatus(pod) {
   const lines = [];
   const name = pod?.metadata?.name || 'unknown';
@@ -2736,7 +2750,7 @@ app.get('/projects/:projectId/runtime-logs', requireAuth, async (req, res) => {
   const previousOnly =
     truthyQueryFlag(req.query.previousOnly) || truthyQueryFlag(req.query.previous_only);
   const canReadPrevious = (includePrevious || previousOnly) && (process.env.PLATFORM_ENV || 'local') !== 'local';
-  const namespace = `vibes-${env}`;
+  const namespace = runtimeNamespaceForEnv(env);
   const appName = `vibes-app-${req.params.projectId}`;
   const stored = await getStoredRuntimeLog(req.params.projectId, env);
   if (stored && String(stored.logs || '').length > 0) {

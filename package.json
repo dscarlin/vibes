@@ -8,7 +8,9 @@
   ],
   "scripts": {
     "dev": "node server/src/index.js",
-    "worker": "node worker/src/index.js"
+    "worker": "node worker/src/index.js",
+    "agent-task": "node ./scripts/agent-task/index.mjs run",
+    "agent-task:cleanup": "node ./scripts/agent-task/index.mjs cleanup"
   },
   "devDependencies": {
     "@openai/codex": "^0.104.0"

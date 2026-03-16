@@ -1,21 +1,21 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: vibes-web
-  namespace: vibes-platform
+  name: ${PLATFORM_WEB_NAME}
+  namespace: ${PLATFORM_NAMESPACE}
 spec:
   replicas: 1
   strategy:
     type: Recreate
   selector:
     matchLabels:
-      app: vibes-web
+      app: ${PLATFORM_WEB_NAME}
   template:
     metadata:
       annotations:
         replica.vibesplatform.ai/config-hash: ${WEB_CONFIG_HASH}
       labels:
-        app: vibes-web
+        app: ${PLATFORM_WEB_NAME}
     spec:
       containers:
         - name: web
@@ -25,7 +25,7 @@ spec:
             - containerPort: 8080
           envFrom:
             - secretRef:
-                name: vibes-web-env
+                name: ${PLATFORM_WEB_ENV_SECRET_NAME}
           readinessProbe:
             httpGet:
               path: /

@@ -1,23 +1,23 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: vibes-server
-  namespace: vibes-platform
+  name: ${PLATFORM_SERVER_NAME}
+  namespace: ${PLATFORM_NAMESPACE}
 spec:
   replicas: 1
   strategy:
     type: Recreate
   selector:
     matchLabels:
-      app: vibes-server
+      app: ${PLATFORM_SERVER_NAME}
   template:
     metadata:
       annotations:
         replica.vibesplatform.ai/config-hash: ${SERVER_CONFIG_HASH}
       labels:
-        app: vibes-server
+        app: ${PLATFORM_SERVER_NAME}
     spec:
-      serviceAccountName: vibes-server-sa
+      serviceAccountName: ${PLATFORM_SERVER_SERVICE_ACCOUNT_NAME}
       containers:
         - name: server
           image: ${SERVER_IMAGE}
@@ -26,7 +26,7 @@ spec:
             - containerPort: 8000
           envFrom:
             - secretRef:
-                name: vibes-server-env
+                name: ${PLATFORM_SERVER_ENV_SECRET_NAME}
           readinessProbe:
             httpGet:
               path: /health
@@ -47,4 +47,4 @@ spec:
       volumes:
         - name: rds-ca
           secret:
-            secretName: rds-ca-bundle
+            secretName: ${PLATFORM_RDS_CA_SECRET_NAME}

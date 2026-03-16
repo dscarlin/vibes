@@ -9,8 +9,8 @@ import { promisify } from 'node:util';
 
 const execFile = promisify(execFileCallback);
 const repoRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
-const generatedDir = path.join(repoRoot, 'deploy', '.generated', 'replica');
-const metadataEnvPath = path.join(generatedDir, 'metadata.env');
+const generatedDir = process.env.REPLICA_OUTPUT_DIR || path.join(repoRoot, 'deploy', '.generated', 'replica');
+const metadataEnvPath = process.env.VALIDATION_METADATA_ENV_FILE || path.join(generatedDir, 'metadata.env');
 
 function parseEnv(text) {
   const values = {};
@@ -24,6 +24,49 @@ function parseEnv(text) {
     values[key] = value;
   }
   return values;
+}
+
+function normalizeDnsLabelSegment(raw) {
+  return String(raw || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+function buildHostLabel(parts, suffix = '') {
+  let base = parts.map((part) => normalizeDnsLabelSegment(part)).filter(Boolean).join('-') || 'app';
+  const normalizedSuffix = normalizeDnsLabelSegment(suffix);
+  const suffixPart = normalizedSuffix ? `--${normalizedSuffix}` : '';
+  const maxBaseLength = Math.max(1, 63 - suffixPart.length);
+  if (base.length > maxBaseLength) {
+    base = base.slice(0, maxBaseLength).replace(/-+$/g, '');
+  }
+  return `${base || 'app'}${suffixPart}`;
+}
+
+function previewHostForProject(project, metadataEnv, environment = 'development') {
+  const domain = String(metadataEnv.PROJECT_HOST_DOMAIN || metadataEnv.ROOT_HOST || '').trim();
+  const suffix = String(metadataEnv.PROJECT_HOST_SUFFIX || '').trim();
+  const slug = project?.project_slug || 'app';
+  const shortId = project?.short_id || '';
+  if (!domain) {
+    throw new Error('metadata env is missing PROJECT_HOST_DOMAIN/ROOT_HOST');
+  }
+  return `${buildHostLabel([slug, environment, shortId], suffix)}.${domain}`;
+}
+
+function deriveProjectDatabaseName(shortId, environment, metadataEnv) {
+  const safe = `${shortId}-${environment}`.toLowerCase().replace(/[^a-z0-9_]/g, '_');
+  const rawPrefix = String(metadataEnv.PROJECT_DATABASE_PREFIX || 'vibes')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_]/g, '_')
+    .replace(/^_+|_+$/g, '') || 'vibes';
+  const maxPrefixLength = Math.max(1, 63 - safe.length - 1);
+  const prefix = rawPrefix.slice(0, maxPrefixLength).replace(/_+$/g, '') || 'vibes';
+  return `${prefix}_${safe}`;
 }
 
 function sleep(ms) {
@@ -286,8 +329,18 @@ async function ensureMarkerInRepo(downloadPath, extractDir, marker) {
 }
 
 const metadataEnv = parseEnv(await fs.readFile(metadataEnvPath, 'utf8'));
+const platformNamespace = process.env.VALIDATION_PLATFORM_NAMESPACE || metadataEnv.PLATFORM_NAMESPACE || 'vibes-platform';
+const platformWebIngress = process.env.VALIDATION_PLATFORM_WEB_NAME || metadataEnv.PLATFORM_WEB_NAME || 'vibes-web';
 const apiBaseUrl = `https://${metadataEnv.API_HOST}`;
-const sharedAlbDnsName = await run('kubectl', ['-n', 'vibes-platform', 'get', 'ingress', 'vibes-web', '-o', 'jsonpath={.status.loadBalancer.ingress[0].hostname}']);
+const sharedAlbDnsName = await run('kubectl', [
+  '-n',
+  platformNamespace,
+  'get',
+  'ingress',
+  platformWebIngress,
+  '-o',
+  'jsonpath={.status.loadBalancer.ingress[0].hostname}'
+]);
 
 function resolveForRequest(hostname, callback, all = false) {
   dns.resolve4(hostname, (resolve4Error, addresses) => {
@@ -313,7 +366,9 @@ function replicaLookup(hostname, options, callback) {
 }
 
 const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-const evidenceDir = path.join(repoRoot, 'validation', 'evidence', timestamp);
+const evidenceDir = process.env.VALIDATION_EVIDENCE_DIR
+  ? path.resolve(process.env.VALIDATION_EVIDENCE_DIR)
+  : path.join(repoRoot, 'validation', 'evidence', timestamp);
 
 await fs.mkdir(evidenceDir, { recursive: true });
 
@@ -439,7 +494,7 @@ const wakeRes = await apiRequest(apiBaseUrl, `/projects/${projectId}/development
 });
 await writeJson(path.join(evidenceDir, '06-preview-wake.json'), wakeRes);
 
-const previewHost = `${projectReady.project_slug}-development-${projectReady.short_id}.${metadataEnv.ROOT_HOST}`;
+const previewHost = previewHostForProject(projectReady, metadataEnv, 'development');
 const previewUrl = `https://${previewHost}`;
 await waitForPreviewMarker({
   label: 'preview marker',
@@ -596,7 +651,11 @@ const summary = {
     id: projectId,
     name: projectName,
     short_id: projectReady.short_id,
-    project_slug: projectReady.project_slug
+    project_slug: projectReady.project_slug,
+    databases: ['development', 'testing', 'production'].map((environment) => ({
+      environment,
+      db_name: deriveProjectDatabaseName(projectReady.short_id, environment, metadataEnv)
+    }))
   },
   task: {
     id: taskId,
@@ -607,6 +666,15 @@ const summary = {
     id: fullBuildResult.build.id,
     status: fullBuildResult.build.status,
     ref_commit: fullBuildResult.build.ref_commit
+  },
+  platform: {
+    namespace: platformNamespace,
+    web_ingress: platformWebIngress,
+    api_host: metadataEnv.API_HOST,
+    app_host: metadataEnv.APP_HOST,
+    root_host: metadataEnv.ROOT_HOST,
+    project_host_domain: metadataEnv.PROJECT_HOST_DOMAIN || metadataEnv.ROOT_HOST,
+    project_host_suffix: metadataEnv.PROJECT_HOST_SUFFIX || ''
   },
   artifact_path: artifactPath,
   evidence_dir: evidenceDir

@@ -388,8 +388,14 @@ const WORKSPACE_HEARTBEAT_STALE_MS = Number(process.env.WORKSPACE_HEARTBEAT_STAL
 const WORKSPACE_SERVICE_PORT = Number(process.env.WORKSPACE_SERVICE_PORT || 3000);
 const WORKSPACE_SERVICE_CLUSTER_PORT = Number(process.env.WORKSPACE_SERVICE_CLUSTER_PORT || 80);
 const WORKSPACE_IMAGE = process.env.WORKSPACE_IMAGE || '';
-const WORKSPACE_POD_NAMESPACE = process.env.WORKSPACE_POD_NAMESPACE || 'vibes-platform';
+const WORKSPACE_POD_NAMESPACE = process.env.WORKSPACE_POD_NAMESPACE || 'vibes-development';
 const WORKER_POD_NAMESPACE = process.env.WORKER_POD_NAMESPACE || 'vibes-platform';
+const RUNTIME_NAMESPACE_DEVELOPMENT =
+  process.env.RUNTIME_NAMESPACE_DEVELOPMENT || process.env.DEVELOPMENT_NAMESPACE || 'vibes-development';
+const RUNTIME_NAMESPACE_TESTING =
+  process.env.RUNTIME_NAMESPACE_TESTING || process.env.TESTING_NAMESPACE || 'vibes-testing';
+const RUNTIME_NAMESPACE_PRODUCTION =
+  process.env.RUNTIME_NAMESPACE_PRODUCTION || process.env.PRODUCTION_NAMESPACE || 'vibes-production';
 const WORKSPACE_POD_CPU_REQUEST = process.env.WORKSPACE_POD_CPU_REQUEST || '200m';
 const WORKSPACE_POD_CPU_LIMIT = process.env.WORKSPACE_POD_CPU_LIMIT || '1500m';
 const WORKSPACE_POD_MEM_REQUEST = process.env.WORKSPACE_POD_MEM_REQUEST || '512Mi';
@@ -884,7 +890,14 @@ async function getDemoOpenAiKey(projectId) {
 
 function dbNameFor(shortId, environment) {
   const safe = `${shortId}-${environment}`.toLowerCase().replace(/[^a-z0-9_]/g, '_');
-  return `vibes_${safe}`;
+  const rawPrefix = String(process.env.PROJECT_DATABASE_PREFIX || 'vibes')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_]/g, '_')
+    .replace(/^_+|_+$/g, '') || 'vibes';
+  const maxPrefixLength = Math.max(1, 63 - safe.length - 1);
+  const prefix = rawPrefix.slice(0, maxPrefixLength).replace(/_+$/g, '') || 'vibes';
+  return `${prefix}_${safe}`;
 }
 
 function dbUrlFor(dbName) {
@@ -1043,7 +1056,7 @@ function computeLogDelta(previous, current) {
 }
 
 async function fetchPodsForApp(projectId, environment) {
-  const namespace = `vibes-${environment}`;
+  const namespace = runtimeNamespace(environment);
   const appName = `vibes-app-${projectId}`;
   const { stdout } = await exec('sh', ['-lc', `kubectl -n ${namespace} get pods -l app=${appName} -o json`]);
   const data = JSON.parse(stdout || '{}');
@@ -1519,7 +1532,7 @@ async function scaleDeploymentToZero(projectId, environment) {
       return 'failed';
     }
   }
-  const namespace = `vibes-${environment}`;
+  const namespace = runtimeNamespace(environment);
   const appName = `vibes-app-${projectId}`;
   const usePodRuntime = usesDevPodRuntime(environment);
   let deploymentMissing = false;
@@ -1680,7 +1693,7 @@ async function fetchCurrentPodLogSnapshot(projectId, environment, lines = RUNTIM
       return { snapshot: '', podName: container, namespace: 'local', statuses: [] };
     }
   }
-  const namespace = `vibes-${environment}`;
+  const namespace = runtimeNamespace(environment);
   const pods = sortPodsNewestFirst(await fetchPodsForApp(projectId, environment));
   if (!pods.length) return { snapshot: '', podName: '', namespace, statuses: [] };
   const pod = pods[0];
@@ -1841,7 +1854,7 @@ async function fetchPodLogs(projectId, environment, lines = 10) {
       return '';
     }
   }
-  const namespace = `vibes-${environment}`;
+  const namespace = runtimeNamespace(environment);
   const appName = `vibes-app-${projectId}`;
   try {
     const pods = sortPodsNewestFirst(await fetchPodsForApp(projectId, environment));
@@ -1897,7 +1910,7 @@ async function captureRuntimeFailureEvidence(projectId, environment, attemptId =
 
 async function detectRuntimeRestarts(projectId, environment) {
   if (isLocalPlatform()) return null;
-  const namespace = `vibes-${environment}`;
+  const namespace = runtimeNamespace(environment);
   const appName = `vibes-app-${projectId}`;
   try {
     const { stdout } = await exec('sh', ['-lc', `kubectl -n ${namespace} get pods -l app=${appName} -o json`]);
@@ -1991,7 +2004,7 @@ function classifyFailureFromEvents(events = []) {
 async function detectLikelyRuntimeFailure(projectId, environment) {
   if (isLocalPlatform()) return null;
   try {
-    const namespace = `vibes-${environment}`;
+    const namespace = runtimeNamespace(environment);
     const pods = sortPodsNewestFirst(await fetchPodsForApp(projectId, environment));
     if (!pods.length) {
       return {
@@ -2080,7 +2093,7 @@ async function buildHealthcheckError(projectId, environment, host) {
 async function resumeDeployment(projectId, environment, envPath) {
   if (isLocalPlatform()) return false;
   if (usesDevPodRuntime(environment)) return false;
-  const namespace = `vibes-${environment}`;
+  const namespace = runtimeNamespace(environment);
   const appName = `vibes-app-${projectId}`;
   const rdsCaPath = process.env.RDS_CA_PATH || '/etc/ssl/certs/rds-ca.pem';
   try {
@@ -2187,7 +2200,7 @@ async function fastResumeEnvironment(projectId, environment, commitHash, buildId
 
   const host = hostFor(project, environment);
   const appName = `vibes-app-${projectId}`;
-  const namespace = `vibes-${environment}`;
+  const namespace = runtimeNamespace(environment);
   const internalHost = `${appName}.${namespace}.svc.cluster.local`;
   const healthHost = deploymentHealthHost(environment, host, internalHost);
   const healthTimeoutMs = healthTimeoutForHost(healthHost);
@@ -2233,6 +2246,23 @@ function hostProjectName(name) {
   return cleaned || 'app';
 }
 
+function runtimeNamespace(environment) {
+  const normalized = String(environment || '').trim().toLowerCase();
+  if (normalized === 'development' || normalized === 'dev') return RUNTIME_NAMESPACE_DEVELOPMENT;
+  if (normalized === 'testing' || normalized === 'test') return RUNTIME_NAMESPACE_TESTING;
+  if (normalized === 'production' || normalized === 'prod') return RUNTIME_NAMESPACE_PRODUCTION;
+  return `vibes-${normalized || 'development'}`;
+}
+
+function normalizeDnsLabelSegment(raw) {
+  return String(raw || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
 function normalizeDomain(raw) {
   return String(raw || '')
     .trim()
@@ -2253,14 +2283,30 @@ function appDomainForHosts() {
   return fallback;
 }
 
+function projectHostSuffix() {
+  return normalizeDnsLabelSegment(process.env.PROJECT_HOST_SUFFIX || '');
+}
+
+function buildHostLabel(parts, suffix = '') {
+  let base = parts.map((part) => normalizeDnsLabelSegment(part)).filter(Boolean).join('-') || 'app';
+  const normalizedSuffix = normalizeDnsLabelSegment(suffix);
+  const suffixPart = normalizedSuffix ? `--${normalizedSuffix}` : '';
+  const maxBaseLength = Math.max(1, 63 - suffixPart.length);
+  if (base.length > maxBaseLength) {
+    base = base.slice(0, maxBaseLength).replace(/-+$/g, '');
+  }
+  return `${base || 'app'}${suffixPart}`;
+}
+
 function hostFor(project, environment) {
   const domain = appDomainForHosts();
   const slug = project?.project_slug || hostProjectName(project?.name);
-  const suffix = project?.short_id ? `-${project.short_id}` : '';
+  const taskSuffix = projectHostSuffix();
+  const label = environment === 'production'
+    ? buildHostLabel([slug, project?.short_id || ''], taskSuffix)
+    : buildHostLabel([slug, environment, project?.short_id || ''], taskSuffix);
   // Use a single-label subdomain so it matches *.vibesplatform.ai wildcard certs.
-  return environment === 'production'
-    ? `${slug}${suffix}.${domain}`
-    : `${slug}-${environment}${suffix}.${domain}`;
+  return `${label}.${domain}`;
 }
 
 function albLogsEnabled() {
@@ -2632,7 +2678,7 @@ const WORKSPACE_DB_FIELDS = [
 let cachedWorkspaceImage = '';
 
 function workspaceNamespace() {
-  return 'vibes-development';
+  return WORKSPACE_POD_NAMESPACE;
 }
 
 function workspaceNames(projectId) {
@@ -4208,7 +4254,7 @@ async function resumeDevelopmentFullBuildFromCache(projectId, commitHash, taskId
     const resumed = await resumeDeployment(projectId, 'development', envPath);
     if (!resumed) return false;
     const appName = `vibes-app-${projectId}`;
-    const namespace = 'vibes-development';
+    const namespace = runtimeNamespace('development');
     const internalHost = `${appName}.${namespace}.svc.cluster.local`;
     const host = hostFor(runtime.project, 'development');
     const appPort = Number(runtime.envVars.PORT || process.env.PORT || 3000);
@@ -4461,7 +4507,7 @@ async function deployEnvironment(projectId, environment, commitHash, buildId = n
     throw new Error(`Env file missing before deploy: ${envPath} (${err?.message || err})`);
   }
   const appName = `vibes-app-${projectId}`;
-  const namespace = `vibes-${environment}`;
+  const namespace = runtimeNamespace(environment);
   const internalHost = `${appName}.${namespace}.svc.cluster.local`;
   const healthHost = deploymentHealthHost(environment, host, internalHost);
   const healthTimeoutMs = healthTimeoutForHost(healthHost);
@@ -4730,7 +4776,8 @@ async function processDeleteProject(projectId) {
         PROJECT_ID: projectId,
         PROJECT_SHORT_ID: project.short_id,
         ENVIRONMENT: env.name,
-        APP_HOST: env.host
+        APP_HOST: env.host,
+        NAMESPACE: runtimeNamespace(env.name)
       };
       try {
         await exec('sh', ['-lc', cmd], { env: envVars });
