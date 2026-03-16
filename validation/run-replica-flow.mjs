@@ -140,11 +140,12 @@ function sortPreviewResources(resources = []) {
   });
 }
 
-async function findMarkerInPreviewResources(previewUrl, html, marker, lookup, evidenceDir) {
+async function findMarkerInPreviewResources(previewUrl, html, marker, lookup, evidenceDir, resourcePrefix) {
   const baseUrl = new URL(previewUrl);
   const queue = sortPreviewResources(extractScriptSrcs(html).map((src) => new URL(src, baseUrl).toString()));
   const visited = new Set();
   let fetched = 0;
+  const prefix = String(resourcePrefix || 'preview-resource').trim() || 'preview-resource';
 
   while (queue.length > 0 && fetched < 80) {
     const resourceUrl = queue.shift();
@@ -164,7 +165,7 @@ async function findMarkerInPreviewResources(previewUrl, html, marker, lookup, ev
 
     const fileUrl = new URL(resourceUrl);
     const ext = path.extname(fileUrl.pathname) || '.txt';
-    const fileName = `07-preview-resource-${String(fetched).padStart(2, '0')}${ext}`;
+    const fileName = `${prefix}-${String(fetched).padStart(2, '0')}${ext}`;
     await fs.writeFile(path.join(evidenceDir, fileName), bodyText, 'utf8');
 
     if (bodyText.includes(marker)) {
@@ -320,7 +321,8 @@ async function waitForPreviewMarker({
   evidenceDir,
   htmlFile,
   matchFile,
-  onRetry
+  onRetry,
+  resourcePrefix
 }) {
   const result = await pollUntil(
     label,
@@ -341,7 +343,8 @@ async function waitForPreviewMarker({
           html,
           marker,
           lookup,
-          evidenceDir
+          evidenceDir,
+          resourcePrefix
         );
         if (resourceMatch.matched) {
           return {
@@ -368,6 +371,47 @@ async function waitForPreviewMarker({
     evidence_file: result.evidenceFile
   });
   return result;
+}
+
+async function waitForDevelopmentRoute({
+  apiBaseUrl,
+  projectId,
+  token,
+  lookup,
+  evidenceDir,
+  evidenceFile,
+  expectedMode,
+  expectedCommit,
+  expectedTaskId,
+  onRetry
+}) {
+  return pollUntil(
+    `${expectedMode} route activation`,
+    async (attempt) => {
+      if (onRetry && attempt > 1 && attempt % 6 === 0) {
+        await onRetry(attempt).catch(() => null);
+      }
+
+      const res = await apiRequest(apiBaseUrl, '/projects', { token, lookup });
+      const currentProject = Array.isArray(res.body)
+        ? res.body.find((item) => item.id === projectId) || null
+        : null;
+      await writeJson(path.join(evidenceDir, evidenceFile), {
+        project: currentProject
+      });
+
+      const env = currentProject?.environments?.development || null;
+      if (!env) return { done: false };
+      if (String(env.build_status || '').toLowerCase() !== 'live') return { done: false };
+      if (String(env.preview_mode || '').toLowerCase() !== expectedMode) return { done: false };
+      if (String(env.selected_mode || '').toLowerCase() !== expectedMode) return { done: false };
+      if (String(env.live_commit_sha || '').trim() !== expectedCommit) return { done: false };
+      if (expectedTaskId && String(env.live_task_id || '') !== String(expectedTaskId)) return { done: false };
+      return { done: true, value: currentProject };
+    },
+    10 * 60 * 1000,
+    5000
+  );
 }
 
 async function pollUntil(label, fn, timeoutMs, intervalMs) {
@@ -594,6 +638,7 @@ await waitForPreviewMarker({
   evidenceDir,
   htmlFile: '07-preview-final.html',
   matchFile: '07-preview-match.json',
+  resourcePrefix: '07-preview-resource',
   onRetry: async () => apiRequest(apiBaseUrl, `/projects/${projectId}/development/wake`, {
     method: 'POST',
     lookup: replicaLookup,
@@ -700,6 +745,27 @@ const fullBuildResult = await pollUntil(
   10000
 );
 
+await waitForDevelopmentRoute({
+  apiBaseUrl,
+  projectId,
+  token,
+  lookup: replicaLookup,
+  evidenceDir,
+  evidenceFile: '08-route-state.json',
+  expectedMode: 'verified',
+  expectedCommit: completedTask.commit_hash,
+  expectedTaskId: taskId,
+  onRetry: async () => apiRequest(apiBaseUrl, `/projects/${projectId}/development/wake`, {
+    method: 'POST',
+    lookup: replicaLookup,
+    token,
+    body: {
+      mode: 'verified',
+      taskId
+    }
+  })
+});
+
 await waitForPreviewMarker({
   label: 'verified marker',
   previewUrl,
@@ -708,6 +774,7 @@ await waitForPreviewMarker({
   evidenceDir,
   htmlFile: '08-verified-final.html',
   matchFile: '08-verified-match.json',
+  resourcePrefix: '08-verified-resource',
   onRetry: async () => apiRequest(apiBaseUrl, `/projects/${projectId}/development/wake`, {
     method: 'POST',
     lookup: replicaLookup,

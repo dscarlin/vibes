@@ -1027,9 +1027,12 @@ async function cleanupValidation(manifest) {
     ? summary.project.databases.map((entry) => entry.db_name).filter(Boolean)
     : [];
   await dropDatabases(manifest, manifest.database.customerAdminUrl, databaseNames);
-  await deleteValidationUser(manifest, manifest.database.baseDatabaseUrl, manifest.task.schema, summary?.user?.email || '');
+  const validationUserEmail = summary?.user?.email || '';
+  await deleteValidationUser(manifest, manifest.database.baseDatabaseUrl, manifest.task.schema, validationUserEmail);
   manifest.cleanup.validation = {
     completedAt: new Date().toISOString(),
+    projectId: summary?.project?.id || null,
+    userEmail: validationUserEmail || null,
     databases: databaseNames
   };
   await saveManifest(manifest);
