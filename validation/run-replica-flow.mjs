@@ -353,7 +353,20 @@ function resolveForRequest(hostname, callback, all = false) {
       return;
     }
 
-    dns.lookup(hostname, all ? { all: true } : {}, callback);
+    const publicResolver = new dns.Resolver();
+    publicResolver.setServers(['8.8.8.8', '1.1.1.1']);
+    publicResolver.resolve4(hostname, (publicResolveError, publicAddresses) => {
+      if (!publicResolveError && Array.isArray(publicAddresses) && publicAddresses.length > 0) {
+        if (all) {
+          callback(null, publicAddresses.map((address) => ({ address, family: 4 })));
+          return;
+        }
+        callback(null, publicAddresses[0], 4);
+        return;
+      }
+
+      dns.lookup(hostname, all ? { all: true } : {}, callback);
+    });
   });
 }
 

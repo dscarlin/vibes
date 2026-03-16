@@ -44,6 +44,42 @@ function toEnv(value) {
   return String(value);
 }
 
+function parseEnv(content) {
+  const values = {};
+  for (const rawLine of String(content || '').split('\n')) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) continue;
+    const index = line.indexOf('=');
+    if (index === -1) continue;
+    const key = line.slice(0, index).trim().replace(/^export\s+/, '');
+    let value = line.slice(index + 1);
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    values[key] = value;
+  }
+  return values;
+}
+
+async function readOptionalEnvFile(filePath) {
+  try {
+    return parseEnv(await fs.readFile(filePath, 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+async function readOptionalJson(filePath) {
+  try {
+    return JSON.parse(await fs.readFile(filePath, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
 function validateSecret(secretName, payload, requiredKeys) {
   for (const key of requiredKeys) {
     const value = String(payload?.[key] || '').trim();
@@ -65,18 +101,117 @@ async function terraformOutput(name) {
   return run(terraformBin, [`-chdir=${layer1Dir}`, 'output', '-raw', name], { cwd: repoRoot });
 }
 
-async function readSecret(secretId) {
-  const raw = await run('aws', [
-    'secretsmanager',
-    'get-secret-value',
-    '--secret-id',
-    secretId,
-    '--query',
-    'SecretString',
-    '--output',
-    'text'
-  ]);
-  return JSON.parse(raw);
+async function resolveTerraformOrDefault(name, fallback) {
+  try {
+    const value = await terraformOutput(name);
+    return String(value || '').trim() || fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+async function readSecret(secretId, fallbackFile) {
+  try {
+    const raw = await run('aws', [
+      'secretsmanager',
+      'get-secret-value',
+      '--secret-id',
+      secretId,
+      '--query',
+      'SecretString',
+      '--output',
+      'text'
+    ]);
+    return JSON.parse(raw);
+  } catch (error) {
+    const fallback = fallbackFile ? await readOptionalJson(fallbackFile) : null;
+    if (fallback) return fallback;
+    throw error;
+  }
+}
+
+function repositoryNameFromUrl(repositoryUrl) {
+  return String(repositoryUrl || '').trim().split('/').pop() || '';
+}
+
+function repositoryUrl(accountId, region, repositoryName) {
+  return `${accountId}.dkr.ecr.${region}.amazonaws.com/${repositoryName}`;
+}
+
+async function repositoryExists(repositoryName, region) {
+  if (!repositoryName) return false;
+  try {
+    await run('aws', [
+      'ecr',
+      'describe-repositories',
+      '--region',
+      region,
+      '--repository-names',
+      repositoryName,
+      '--query',
+      'repositories[0].repositoryName',
+      '--output',
+      'text'
+    ]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function currentAwsAccountId() {
+  try {
+    return await run('aws', ['sts', 'get-caller-identity', '--query', 'Account', '--output', 'text']);
+  } catch {
+    return '';
+  }
+}
+
+function trimOr(value, fallback = '') {
+  const trimmed = String(value || '').trim();
+  return trimmed || fallback;
+}
+
+function normalizeDnsLabel(rawValue, fallback = 'replica') {
+  const normalized = String(rawValue || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return normalized || fallback;
+}
+
+function inferReplicaLabel(rootHost, rootDomain) {
+  const normalizedRootHost = trimOr(rootHost);
+  const normalizedRootDomain = trimOr(rootDomain);
+  if (normalizedRootHost && normalizedRootDomain && normalizedRootHost.endsWith(`.${normalizedRootDomain}`)) {
+    return normalizeDnsLabel(normalizedRootHost.slice(0, -(normalizedRootDomain.length + 1)));
+  }
+  return normalizeDnsLabel(normalizedRootHost.split('.')[0] || '');
+}
+
+function deriveReplicaHosts(rootHost, rootDomain) {
+  const normalizedRootDomain = trimOr(rootDomain, 'vibesplatform.ai');
+  const normalizedRootHost = trimOr(rootHost, `replica.${normalizedRootDomain}`);
+  const replicaLabel = inferReplicaLabel(normalizedRootHost, normalizedRootDomain);
+  return {
+    root: normalizedRootHost,
+    app: `app-${replicaLabel}.${normalizedRootDomain}`,
+    api: `api-${replicaLabel}.${normalizedRootDomain}`,
+    projectDomain: normalizedRootDomain,
+    projectSuffix: replicaLabel,
+    wildcardHosts: normalizedRootDomain
+  };
+}
+
+function albAttributePrefix(rawValue) {
+  const value = trimOr(rawValue);
+  if (!value) return 'alb-logs';
+  const marker = '/AWSLogs/';
+  const index = value.indexOf(marker);
+  const prefix = index === -1 ? value : value.slice(0, index);
+  return prefix.replace(/^\/+|\/+$/g, '') || 'alb-logs';
 }
 
 function formatEnv(entries) {
@@ -87,33 +222,81 @@ function formatEnv(entries) {
 
 await fs.mkdir(outputDir, { recursive: true });
 
+const liveServerEnv = await readOptionalEnvFile(path.join(repoRoot, process.env.LIVE_SERVER_ENV_FILE || '.env.server'));
+const liveWebEnv = await readOptionalEnvFile(path.join(repoRoot, process.env.LIVE_WEB_ENV_FILE || '.env.web'));
+const liveWorkerEnv = await readOptionalEnvFile(path.join(repoRoot, process.env.LIVE_WORKER_ENV_FILE || '.env.worker'));
+const manualSecretsDir = path.join(
+  repoRoot,
+  process.env.REPLICA_MANUAL_SECRETS_DIR || path.join('deploy', '.generated', 'replica', 'manual-secrets')
+);
+const liveRegion = trimOr(process.env.AWS_REGION || liveWorkerEnv.AWS_REGION, 'us-east-1');
+const liveAccountId = trimOr(process.env.AWS_ACCOUNT_ID || liveWorkerEnv.AWS_ACCOUNT_ID, await currentAwsAccountId());
+const liveRootDomain = trimOr(
+  process.env.REPLICA_ROOT_DOMAIN || liveWebEnv.DOMAIN || liveWorkerEnv.APP_DOMAIN,
+  'vibesplatform.ai'
+);
+const liveReplicaSubdomain = normalizeDnsLabel(process.env.REPLICA_SUBDOMAIN || 'replica');
+const replicaHosts = deriveReplicaHosts(`${liveReplicaSubdomain}.${liveRootDomain}`, liveRootDomain);
+const livePlatformDatabaseUrl = trimOr(process.env.PLATFORM_DATABASE_URL || liveServerEnv.DATABASE_URL);
+const liveCustomerDbAdminUrl = trimOr(process.env.CUSTOMER_DB_ADMIN_URL || liveWorkerEnv.CUSTOMER_DB_ADMIN_URL);
+const liveCustomerDbHost = trimOr(process.env.CUSTOMER_DB_HOST || liveWorkerEnv.CUSTOMER_DB_HOST);
+const liveCustomerDbUser = trimOr(process.env.CUSTOMER_DB_USER || liveWorkerEnv.CUSTOMER_DB_USER);
+const liveCustomerDbPassword = trimOr(process.env.CUSTOMER_DB_PASSWORD || liveWorkerEnv.CUSTOMER_DB_PASSWORD);
+const liveCustomerDbPort = trimOr(process.env.CUSTOMER_DB_PORT || liveWorkerEnv.CUSTOMER_DB_PORT, '5432');
+const liveRoute53ZoneId = trimOr(
+  process.env.ROUTE53_ZONE_ID || process.env.ROUTE53_HOSTED_ZONE_ID || liveWorkerEnv.ROUTE53_HOSTED_ZONE_ID
+);
+const liveAcmCertArn = trimOr(process.env.ACM_CERT_ARN || liveWorkerEnv.ACM_CERT_ARN);
+const liveWorkspaceSnapshotBucket = trimOr(process.env.WORKSPACE_SNAPSHOT_BUCKET || liveWorkerEnv.WORKSPACE_SNAPSHOT_BUCKET);
+const liveWorkspaceSnapshotPrefix = trimOr(
+  process.env.WORKSPACE_SNAPSHOT_PREFIX || liveWorkerEnv.WORKSPACE_SNAPSHOT_PREFIX,
+  'project-workspaces'
+);
+const liveAlbLogBucket = trimOr(process.env.ALB_LOG_BUCKET || liveWorkerEnv.ALB_LOG_BUCKET);
+const liveAlbLogPrefix = trimOr(process.env.ALB_LOG_PREFIX, albAttributePrefix(liveWorkerEnv.ALB_LOG_PREFIX));
+const liveCustomerAppRepositoryName = trimOr(process.env.ECR_REPO || liveWorkerEnv.ECR_REPO, 'vibes-app');
+const liveClusterName = trimOr(process.env.CLUSTER_NAME, 'vibes-platform');
+const liveWorkerIrsaRoleArn = trimOr(process.env.WORKER_IRSA_ROLE_ARN, liveAccountId ? `arn:aws:iam::${liveAccountId}:role/vibes-worker-irsa` : '');
+const liveAlbGroupName = trimOr(process.env.ALB_GROUP_NAME, `vibes-${liveReplicaSubdomain}-shared`);
+
 const outputs = {
-  accountId: await terraformOutput('account_id'),
-  region: await terraformOutput('aws_region'),
-  apiHost: await terraformOutput('api_host'),
-  appHost: await terraformOutput('app_host'),
-  rootHost: await terraformOutput('root_host'),
-  route53ZoneId: await terraformOutput('route53_zone_id'),
-  acmCertificateArn: await terraformOutput('acm_certificate_arn'),
-  albGroupName: await terraformOutput('alb_group_name'),
-  albLogBucket: await terraformOutput('alb_log_bucket'),
-  albLogPrefix: await terraformOutput('alb_log_prefix'),
-  customerAppRepositoryName: await terraformOutput('customer_app_repository_name'),
-  dbHost: await terraformOutput('db_host'),
-  dbPort: await terraformOutput('db_port'),
-  platformDatabaseUrl: await terraformOutput('platform_database_url'),
-  customerDbAdminUrl: await terraformOutput('customer_db_admin_url'),
-  customerDbAdminUsername: await terraformOutput('customer_db_admin_username'),
-  customerDbAdminPassword: await terraformOutput('customer_db_admin_password'),
-  serverSecretName: await terraformOutput('server_manual_secret_name'),
-  webSecretName: await terraformOutput('web_manual_secret_name'),
-  workerSecretName: await terraformOutput('worker_manual_secret_name'),
-  serverRepositoryUrl: await terraformOutput('server_repository_url'),
-  webRepositoryUrl: await terraformOutput('web_repository_url'),
-  workerRepositoryUrl: await terraformOutput('worker_repository_url'),
-  workspaceSnapshotBucket: await terraformOutput('workspace_snapshot_bucket'),
-  workspaceSnapshotPrefix: await terraformOutput('workspace_snapshot_prefix'),
-  workerIrsaRoleArn: await terraformOutput('worker_irsa_role_arn')
+  accountId: await resolveTerraformOrDefault('account_id', liveAccountId),
+  region: await resolveTerraformOrDefault('aws_region', liveRegion),
+  rootDomain: await resolveTerraformOrDefault('root_domain', liveRootDomain),
+  rootHost: trimOr(process.env.ROOT_HOST, replicaHosts.root),
+  appHost: trimOr(process.env.APP_HOST, replicaHosts.app),
+  apiHost: trimOr(process.env.API_HOST, replicaHosts.api),
+  route53ZoneId: await resolveTerraformOrDefault('route53_zone_id', liveRoute53ZoneId),
+  acmCertificateArn: await resolveTerraformOrDefault('acm_certificate_arn', liveAcmCertArn),
+  albGroupName: await resolveTerraformOrDefault('alb_group_name', liveAlbGroupName),
+  albLogBucket: await resolveTerraformOrDefault('alb_log_bucket', liveAlbLogBucket),
+  albLogPrefix: await resolveTerraformOrDefault('alb_log_prefix', liveAlbLogPrefix),
+  customerAppRepositoryName: await resolveTerraformOrDefault('customer_app_repository_name', liveCustomerAppRepositoryName),
+  dbHost: await resolveTerraformOrDefault('db_host', liveCustomerDbHost),
+  dbPort: await resolveTerraformOrDefault('db_port', liveCustomerDbPort),
+  platformDatabaseUrl: await resolveTerraformOrDefault('platform_database_url', livePlatformDatabaseUrl),
+  customerDbAdminUrl: await resolveTerraformOrDefault('customer_db_admin_url', liveCustomerDbAdminUrl),
+  customerDbAdminUsername: await resolveTerraformOrDefault('customer_db_admin_username', liveCustomerDbUser),
+  customerDbAdminPassword: await resolveTerraformOrDefault('customer_db_admin_password', liveCustomerDbPassword),
+  serverSecretName: await resolveTerraformOrDefault('server_manual_secret_name', '/vibes/test-replica/server'),
+  webSecretName: await resolveTerraformOrDefault('web_manual_secret_name', '/vibes/test-replica/web'),
+  workerSecretName: await resolveTerraformOrDefault('worker_manual_secret_name', '/vibes/test-replica/worker'),
+  serverRepositoryUrl: await resolveTerraformOrDefault(
+    'server_repository_url',
+    repositoryUrl(trimOr(liveAccountId), trimOr(liveRegion, 'us-east-1'), 'vibes-server')
+  ),
+  webRepositoryUrl: await resolveTerraformOrDefault(
+    'web_repository_url',
+    repositoryUrl(trimOr(liveAccountId), trimOr(liveRegion, 'us-east-1'), 'vibes-web')
+  ),
+  workerRepositoryUrl: await resolveTerraformOrDefault(
+    'worker_repository_url',
+    repositoryUrl(trimOr(liveAccountId), trimOr(liveRegion, 'us-east-1'), 'vibes-worker')
+  ),
+  workspaceSnapshotBucket: await resolveTerraformOrDefault('workspace_snapshot_bucket', liveWorkspaceSnapshotBucket),
+  workspaceSnapshotPrefix: await resolveTerraformOrDefault('workspace_snapshot_prefix', liveWorkspaceSnapshotPrefix),
+  workerIrsaRoleArn: await resolveTerraformOrDefault('worker_irsa_role_arn', liveWorkerIrsaRoleArn),
+  clusterName: await resolveTerraformOrDefault('cluster_name', liveClusterName)
 };
 
 const platformNamespace = process.env.PLATFORM_NAMESPACE || 'vibes-platform';
@@ -133,16 +316,31 @@ const platformServerMetricsClusterRoleBindingName =
 const platformWorkerClusterRoleName = process.env.PLATFORM_WORKER_CLUSTER_ROLE_NAME || 'worker-deployer';
 const platformWorkerClusterRoleBindingName =
   process.env.PLATFORM_WORKER_CLUSTER_ROLE_BINDING_NAME || 'worker-deployer';
-const projectHostDomain = process.env.PROJECT_HOST_DOMAIN || outputs.rootHost;
-const projectHostSuffix = process.env.PROJECT_HOST_SUFFIX || '';
-const projectWildcardHosts = process.env.PROJECT_WILDCARD_HOSTS || projectHostDomain;
+const projectHostDomain = process.env.PROJECT_HOST_DOMAIN || outputs.rootDomain;
+const projectHostSuffix = process.env.PROJECT_HOST_SUFFIX || inferReplicaLabel(outputs.rootHost, outputs.rootDomain);
+const projectWildcardHosts = process.env.PROJECT_WILDCARD_HOSTS || outputs.rootDomain;
 const projectDatabasePrefix = process.env.PROJECT_DATABASE_PREFIX || 'vibes';
 const platformServerSocketUrl =
   process.env.SERVER_SOCKET_URL || `http://${platformServerName}.${platformNamespace}.svc.cluster.local:80`;
+const resolvedServerRepositoryName = (await repositoryExists(repositoryNameFromUrl(outputs.serverRepositoryUrl), outputs.region))
+  ? repositoryNameFromUrl(outputs.serverRepositoryUrl)
+  : 'vibes-server';
+const resolvedWebRepositoryName = (await repositoryExists(repositoryNameFromUrl(outputs.webRepositoryUrl), outputs.region))
+  ? repositoryNameFromUrl(outputs.webRepositoryUrl)
+  : 'vibes-web';
+const resolvedWorkerRepositoryName = (await repositoryExists(repositoryNameFromUrl(outputs.workerRepositoryUrl), outputs.region))
+  ? repositoryNameFromUrl(outputs.workerRepositoryUrl)
+  : 'vibes-worker';
+const resolvedCustomerAppRepositoryName = (await repositoryExists(outputs.customerAppRepositoryName, outputs.region))
+  ? outputs.customerAppRepositoryName
+  : 'vibes-app';
+const resolvedServerRepositoryUrl = repositoryUrl(outputs.accountId, outputs.region, resolvedServerRepositoryName);
+const resolvedWebRepositoryUrl = repositoryUrl(outputs.accountId, outputs.region, resolvedWebRepositoryName);
+const resolvedWorkerRepositoryUrl = repositoryUrl(outputs.accountId, outputs.region, resolvedWorkerRepositoryName);
 
-const serverSecret = await readSecret(outputs.serverSecretName);
-const webSecret = await readSecret(outputs.webSecretName);
-const workerSecret = await readSecret(outputs.workerSecretName);
+const serverSecret = await readSecret(outputs.serverSecretName, path.join(manualSecretsDir, 'server.json'));
+const webSecret = await readSecret(outputs.webSecretName, path.join(manualSecretsDir, 'web.json'));
+const workerSecret = await readSecret(outputs.workerSecretName, path.join(manualSecretsDir, 'worker.json'));
 
 validateSecret(outputs.serverSecretName, serverSecret, ['OPENAI_API_KEY', 'OPENAI_MODEL', 'JWT_SECRET', 'ADMIN_API_KEY']);
 validateSecret(outputs.workerSecretName, workerSecret, ['OPENAI_API_KEY', 'OPENAI_MODEL', 'GIT_TOKEN']);
@@ -208,7 +406,7 @@ const workerEnv = {
   PROJECT_DATABASE_PREFIX: projectDatabasePrefix,
   AWS_REGION: outputs.region,
   AWS_ACCOUNT_ID: outputs.accountId,
-  ECR_REPO: outputs.customerAppRepositoryName,
+  ECR_REPO: resolvedCustomerAppRepositoryName,
   ACM_CERT_ARN: outputs.acmCertificateArn,
   DELETE_ECR_IMAGES: workerSecret.DELETE_ECR_IMAGES || 'true',
   AUTO_DNS: 'true',
@@ -253,7 +451,7 @@ const workerEnv = {
   WORKSPACE_POD_CPU_LIMIT: workerSecret.WORKSPACE_POD_CPU_LIMIT || '1500m',
   WORKSPACE_POD_MEM_REQUEST: workerSecret.WORKSPACE_POD_MEM_REQUEST || '512Mi',
   WORKSPACE_POD_MEM_LIMIT: workerSecret.WORKSPACE_POD_MEM_LIMIT || '2Gi',
-  WORKSPACE_STORAGE_CLASS: 'gp3',
+  WORKSPACE_STORAGE_CLASS: workerSecret.WORKSPACE_STORAGE_CLASS || liveWorkerEnv.WORKSPACE_STORAGE_CLASS || 'gp3',
   WORKSPACE_SNAPSHOT_BUCKET: outputs.workspaceSnapshotBucket,
   WORKSPACE_SNAPSHOT_PREFIX: outputs.workspaceSnapshotPrefix,
   DEV_SCALE_TO_ZERO_AFTER_MS: workerSecret.DEV_SCALE_TO_ZERO_AFTER_MS || '900000',
@@ -310,7 +508,7 @@ const workerEnv = {
 const metadataEnv = {
   AWS_REGION: outputs.region,
   ACCOUNT_ID: outputs.accountId,
-  CLUSTER_NAME: await terraformOutput('cluster_name'),
+  CLUSTER_NAME: outputs.clusterName,
   ROOT_HOST: outputs.rootHost,
   APP_HOST: outputs.appHost,
   API_HOST: outputs.apiHost,
@@ -319,10 +517,10 @@ const metadataEnv = {
   ALB_GROUP_NAME: outputs.albGroupName,
   ALB_LOG_BUCKET: outputs.albLogBucket,
   ALB_LOG_PREFIX: outputs.albLogPrefix,
-  SERVER_REPOSITORY_URL: outputs.serverRepositoryUrl,
-  WEB_REPOSITORY_URL: outputs.webRepositoryUrl,
-  WORKER_REPOSITORY_URL: outputs.workerRepositoryUrl,
-  CUSTOMER_APP_REPOSITORY_NAME: outputs.customerAppRepositoryName,
+  SERVER_REPOSITORY_URL: resolvedServerRepositoryUrl,
+  WEB_REPOSITORY_URL: resolvedWebRepositoryUrl,
+  WORKER_REPOSITORY_URL: resolvedWorkerRepositoryUrl,
+  CUSTOMER_APP_REPOSITORY_NAME: resolvedCustomerAppRepositoryName,
   WORKER_IRSA_ROLE_ARN: outputs.workerIrsaRoleArn,
   PLATFORM_NAMESPACE: platformNamespace,
   DEVELOPMENT_NAMESPACE: developmentNamespace,

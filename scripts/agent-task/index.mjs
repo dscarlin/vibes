@@ -12,7 +12,6 @@ import {
   readJson,
   removePath,
   repoRootFrom,
-  rootHostForTask,
   runCommand,
   schemaNameFromSlug,
   shellQuote,
@@ -163,18 +162,19 @@ function buildTaskContext(baseMetadata, featureBranch, taskSlug) {
   if (!baseRootHost) {
     throw new Error('Base replica metadata is missing ROOT_HOST');
   }
+  const projectDomain = String(baseMetadata.PROJECT_HOST_DOMAIN || '').trim() || baseRootHost;
   const platformNamespace = `vibes-task-${taskSlug}`;
   return {
     slug: taskSlug,
     featureBranch,
     schema: schemaNameFromSlug(taskSlug),
     hosts: {
-      root: rootHostForTask(baseRootHost, taskSlug),
-      app: `app-${taskSlug}.${baseRootHost}`,
-      api: `api-${taskSlug}.${baseRootHost}`,
-      projectDomain: baseRootHost,
+      root: `task-${taskSlug}.${projectDomain}`,
+      app: `app-${taskSlug}.${projectDomain}`,
+      api: `api-${taskSlug}.${projectDomain}`,
+      projectDomain,
       projectSuffix: taskSlug,
-      wildcardHosts: baseRootHost
+      wildcardHosts: projectDomain
     },
     namespaces: {
       platform: platformNamespace,

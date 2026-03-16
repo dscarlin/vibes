@@ -258,7 +258,32 @@ wait_for_shared_alb_hostname() {
 
 dns_first_ipv4() {
   hostname="$1"
-  node -e "require('dns').resolve4(process.argv[1], (error, addresses) => { if (error || !addresses || addresses.length === 0) process.exit(1); console.log(addresses[0]); })" "$hostname"
+  node - <<'EOF' "$hostname"
+const dns = require('dns');
+
+async function resolveFirstIpv4(hostname) {
+  try {
+    const addresses = await dns.promises.resolve4(hostname);
+    if (Array.isArray(addresses) && addresses.length > 0) return addresses[0];
+  } catch {}
+
+  const resolver = new dns.promises.Resolver();
+  resolver.setServers(['8.8.8.8', '1.1.1.1']);
+  const addresses = await resolver.resolve4(hostname);
+  if (!Array.isArray(addresses) || addresses.length === 0) {
+    throw new Error(`no A records for ${hostname}`);
+  }
+  return addresses[0];
+}
+
+resolveFirstIpv4(process.argv[2])
+  .then((address) => {
+    process.stdout.write(`${address}\n`);
+  })
+  .catch(() => {
+    process.exit(1);
+  });
+EOF
 }
 
 dns_hostname_resolves() {
