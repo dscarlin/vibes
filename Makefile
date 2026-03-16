@@ -1,4 +1,4 @@
-.PHONY: setup dev certs stop logs worker-kustomize aws-dev-up aws-dev-down server-apply web-apply build-push deploy-all desktop-release status-check db-tunnel stop-db-tunnel replica-plan replica-up replica-destroy-plan replica-down replica-validate replica-seed-secrets-plan replica-seed-secrets agent-task agent-task-cleanup
+.PHONY: setup dev certs stop logs worker-kustomize aws-dev-up aws-dev-down server-apply web-apply build-push deploy-all desktop-release status-check db-tunnel stop-db-tunnel replica-plan replica-up replica-destroy-plan replica-down replica-validate replica-seed-secrets-plan replica-seed-secrets agent-task agent-task-resume agent-task-cleanup agent-task-janitor agent-task-test
 
 AWS_REGION ?= us-east-1
 RDS_CA_FILE ?= ./rds-ca.pem
@@ -107,5 +107,14 @@ replica-seed-secrets:
 agent-task:
 	node ./scripts/agent-task/index.mjs run $(ARGS)
 
+agent-task-resume:
+	node ./scripts/agent-task/index.mjs resume $(ARGS)
+
 agent-task-cleanup:
 	node ./scripts/agent-task/index.mjs cleanup $(ARGS)
+
+agent-task-janitor:
+	node ./scripts/agent-task/index.mjs janitor $(ARGS)
+
+agent-task-test:
+	node --test ./scripts/agent-task/*.test.mjs

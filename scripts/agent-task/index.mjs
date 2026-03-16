@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   ensureDir,
   gitOutput,
@@ -36,7 +37,9 @@ function usage() {
     [
       'Usage:',
       '  node scripts/agent-task/index.mjs run --branch <feature-branch> (--prompt <text> | --prompt-file <path>) [--base main]',
+      '  node scripts/agent-task/index.mjs resume --manifest <path> [--keep-clone] [--skip-cleanup]',
       '  node scripts/agent-task/index.mjs cleanup --manifest <path> [--keep-clone]',
+      '  node scripts/agent-task/index.mjs janitor [--runs-root <path>] [--older-than-hours <hours>] [--apply] [--keep-clone]',
       '',
       'Optional flags for run:',
       '  --run-id <id>',
@@ -44,6 +47,8 @@ function usage() {
       '  --commit-message <message>',
       '  --model <model>',
       '  --timeout-minutes <minutes>',
+      '  --feature-validation-cmd <shell command>',
+      '  --feature-validation-file <path>',
       '  --skip-push',
       '  --skip-cleanup',
       '  --keep-clone'
@@ -108,6 +113,14 @@ async function readPrompt(args) {
   throw new Error('Provide --prompt or --prompt-file');
 }
 
+async function readFeatureValidationCommand(args) {
+  if (args.featureValidationCmd) return String(args.featureValidationCmd).trim();
+  if (args.featureValidationFile) {
+    return String(await fs.readFile(path.resolve(String(args.featureValidationFile)), 'utf8')).trim();
+  }
+  return '';
+}
+
 async function ensureKubeAccess() {
   try {
     await runCommand('kubectl', ['get', 'ns', '--request-timeout=15s']);
@@ -138,7 +151,116 @@ async function ensureKubeAccess() {
 }
 
 async function saveManifest(manifest) {
+  ensureManifestDefaults(manifest);
   await writeJson(manifest.paths.manifestPath, manifest);
+  await writeRunReport(manifest).catch(() => null);
+}
+
+function ensureManifestDefaults(manifest) {
+  manifest.version = Math.max(Number(manifest.version || 0), 2);
+  manifest.paths = manifest.paths || {};
+  if (manifest.paths.runDir && !manifest.paths.reportPath) {
+    manifest.paths.reportPath = path.join(manifest.paths.runDir, 'final-report.json');
+  }
+  manifest.request = manifest.request || {};
+  manifest.resources = manifest.resources || {};
+  manifest.resources.platformImages = Array.isArray(manifest.resources.platformImages)
+    ? manifest.resources.platformImages
+    : [];
+  manifest.cleanup = manifest.cleanup || {};
+  manifest.status = manifest.status || {};
+  manifest.stages = manifest.stages || {};
+  return manifest;
+}
+
+function serializeError(error) {
+  if (!error) return { message: 'Unknown error' };
+  return {
+    name: error?.name || 'Error',
+    message: error?.message || String(error),
+    stack: error?.stack || '',
+    code: error?.code || null
+  };
+}
+
+function summarizeStageResult(result) {
+  if (result === undefined) return null;
+  if (result === null) return null;
+  if (typeof result === 'string' || typeof result === 'number' || typeof result === 'boolean') {
+    return result;
+  }
+  try {
+    return JSON.parse(JSON.stringify(result));
+  } catch {
+    return String(result);
+  }
+}
+
+function stageRecord(manifest, stageName) {
+  return manifest?.stages?.[stageName] || null;
+}
+
+function stageCompleted(manifest, stageName) {
+  return stageRecord(manifest, stageName)?.status === 'completed';
+}
+
+async function markStage(manifest, stageName, patch) {
+  const current = stageRecord(manifest, stageName) || {};
+  manifest.stages[stageName] = {
+    ...current,
+    ...patch,
+    updatedAt: new Date().toISOString()
+  };
+  await saveManifest(manifest);
+  return manifest.stages[stageName];
+}
+
+async function skipStage(manifest, stageName, reason = '') {
+  return markStage(manifest, stageName, {
+    status: 'skipped',
+    skippedAt: new Date().toISOString(),
+    reason: reason || null
+  });
+}
+
+async function runStage(manifest, stageName, work, { skipIfComplete = true, details = {} } = {}) {
+  if (skipIfComplete && stageCompleted(manifest, stageName)) {
+    return stageRecord(manifest, stageName)?.result ?? null;
+  }
+  const current = stageRecord(manifest, stageName) || {};
+  await markStage(manifest, stageName, {
+    status: 'running',
+    startedAt: current.startedAt || new Date().toISOString(),
+    completedAt: null,
+    failedAt: null,
+    error: null,
+    attempts: Number(current.attempts || 0) + 1,
+    details: {
+      ...(current.details || {}),
+      ...(details || {})
+    }
+  });
+  try {
+    const result = await work();
+    await markStage(manifest, stageName, {
+      status: 'completed',
+      completedAt: new Date().toISOString(),
+      error: null,
+      result: summarizeStageResult(result)
+    });
+    return result;
+  } catch (error) {
+    await markStage(manifest, stageName, {
+      status: 'failed',
+      failedAt: new Date().toISOString(),
+      error: serializeError(error)
+    });
+    throw error;
+  }
+}
+
+function stageFailed(manifest) {
+  return Object.values(manifest?.stages || {}).find((stage) => stage?.status === 'failed') || null;
 }
 
 function codexBinaryForRepo(repoPath) {
@@ -783,6 +905,7 @@ async function writeTaskCommands(cloneDir, manifest) {
   const runDir = manifest.paths.runDir;
   const generatedDir = manifest.paths.generatedDir;
   const generatedEnv = `REPLICA_OUTPUT_DIR=${shellQuote(generatedDir)}`;
+  const featureValidationCommand = String(manifest.request?.featureValidationCommand || '').trim();
 
   const scripts = {
     'await-platform': `#!/usr/bin/env sh
@@ -834,6 +957,20 @@ export VALIDATION_EVIDENCE_DIR="$dir"
 node ./validation/run-replica-flow.mjs
 echo "validation evidence: $dir"
 `,
+    'validate-feature': featureValidationCommand
+      ? `#!/usr/bin/env sh
+set -eu
+cd ${shellQuote(manifest.repo.cloneDir)}
+export ${generatedEnv}
+export VALIDATION_METADATA_ENV_FILE=${shellQuote(path.join(generatedDir, 'metadata.env'))}
+export AGENT_TASK_MANIFEST_PATH=${shellQuote(manifest.paths.manifestPath)}
+export AGENT_TASK_RUN_DIR=${shellQuote(manifest.paths.runDir)}
+${featureValidationCommand}
+`
+      : `#!/usr/bin/env sh
+set -eu
+echo "No feature validation command configured for this run."
+`,
     'tail-server': `#!/usr/bin/env sh
 set -eu
 kubectl -n ${shellQuote(manifest.task.namespaces.platform)} logs deploy/${shellQuote(manifest.task.workloads.server)} --tail="\${1:-200}"
@@ -862,6 +999,7 @@ kubectl -n ${shellQuote(manifest.task.namespaces.platform)} logs deploy/${shellQ
     '- `./.vp-task/bin/platform-urls` prints the task-scoped hosts.',
     '- `./.vp-task/bin/redeploy-platform` rebuilds and reapplies the task platform from this clone.',
     '- `./.vp-task/bin/validate-platform` runs the full user/project/task validation flow and writes evidence outside the clone.',
+    '- `./.vp-task/bin/validate-feature` runs the optional feature-specific validation command for this run.',
     '- `./.vp-task/bin/tail-server`, `tail-worker`, and `tail-web` stream platform logs.',
     '- `./.vp-task/bin/status` prints the manifest path and current task context.'
   ].join('\n');
@@ -1001,6 +1139,211 @@ async function runValidation(manifest, label) {
   return summary;
 }
 
+async function readOptionalJsonFile(filePath) {
+  if (!(await pathExists(filePath))) return null;
+  return readJson(filePath).catch(() => null);
+}
+
+async function readOptionalTextFile(filePath) {
+  if (!(await pathExists(filePath))) return '';
+  return fs.readFile(filePath, 'utf8').catch(() => '');
+}
+
+function validationWarningsFromArtifacts({ summary, routeState, runtimeLogs, verifiedMatch, repoMarkerText }) {
+  const warnings = [];
+  if (!summary) {
+    warnings.push('summary_missing');
+    return warnings;
+  }
+
+  const task = summary?.task || {};
+  const fullBuild = summary?.full_build || {};
+  if (String(task.status || '').toLowerCase() !== 'completed') warnings.push('task_not_completed');
+  if (!String(task.commit_hash || '').trim()) warnings.push('task_commit_missing');
+  if (String(fullBuild.status || '').toLowerCase() !== 'live') warnings.push('full_build_not_live');
+  if (!String(fullBuild.id || '').trim()) warnings.push('full_build_id_missing');
+  if (String(fullBuild.ref_commit || '').trim() !== String(task.commit_hash || '').trim()) {
+    warnings.push('full_build_commit_mismatch');
+  }
+
+  const development = routeState?.project?.environments?.development || null;
+  if (!development) {
+    warnings.push('verified_route_state_missing');
+  } else {
+    if (String(development.build_status || '').toLowerCase() !== 'live') warnings.push('verified_build_status_not_live');
+    if (String(development.preview_mode || '').toLowerCase() !== 'verified') warnings.push('verified_preview_mode_missing');
+    if (String(development.selected_mode || '').toLowerCase() !== 'verified') warnings.push('verified_selected_mode_missing');
+    if (String(development.live_commit_sha || '').trim() !== String(task.commit_hash || '').trim()) {
+      warnings.push('verified_live_commit_mismatch');
+    }
+    if (String(development.live_task_id || '') !== String(task.id || '')) warnings.push('verified_live_task_mismatch');
+  }
+
+  if (!String(verifiedMatch?.matched_in || '').trim()) warnings.push('verified_marker_missing');
+  if (!String(repoMarkerText || '').trim()) warnings.push('repo_marker_missing');
+
+  const runtimeLogBody = String(runtimeLogs?.body?.logs || '');
+  if (!String(runtimeLogs?.body?.attempt_id || '').trim()) warnings.push('verified_runtime_attempt_missing');
+  if (runtimeLogBody.includes('Workspace preview running')) warnings.push('verified_runtime_still_workspace_preview');
+
+  return Array.from(new Set(warnings));
+}
+
+async function analyzeValidationArtifacts(manifest) {
+  if (!manifest.validation?.lastEvidenceDir || !manifest.validation?.lastSummaryPath) {
+    return {
+      summary: null,
+      routeState: null,
+      runtimeLogs: null,
+      verifiedMatch: null,
+      repoMarkerText: '',
+      warnings: []
+    };
+  }
+  const evidenceDir = manifest.validation.lastEvidenceDir;
+  const summary = await readOptionalJsonFile(manifest.validation.lastSummaryPath);
+  const routeState = await readOptionalJsonFile(path.join(evidenceDir, '08-route-state.json'));
+  const runtimeLogs = await readOptionalJsonFile(path.join(evidenceDir, '09-runtime-logs.json'));
+  const verifiedMatch = await readOptionalJsonFile(path.join(evidenceDir, '08-verified-match.json'));
+  const repoMarkerText = await readOptionalTextFile(path.join(evidenceDir, '10-repo-marker.txt'));
+  const warnings = validationWarningsFromArtifacts({
+    summary,
+    routeState,
+    runtimeLogs,
+    verifiedMatch,
+    repoMarkerText
+  });
+  return {
+    summary,
+    routeState,
+    runtimeLogs,
+    verifiedMatch,
+    repoMarkerText,
+    warnings
+  };
+}
+
+async function assertValidationReadyForPublish(manifest) {
+  const analysis = await analyzeValidationArtifacts(manifest);
+  manifest.validation = {
+    ...(manifest.validation || {}),
+    checkedAt: new Date().toISOString(),
+    warnings: analysis.warnings
+  };
+  await saveManifest(manifest);
+  if (analysis.warnings.length) {
+    throw new Error(`Validation warnings prevent publish: ${analysis.warnings.join(', ')}`);
+  }
+  return analysis.summary;
+}
+
+async function runFeatureValidation(manifest) {
+  const command = String(manifest.request?.featureValidationCommand || '').trim();
+  if (!command) return { skipped: true };
+  const evidenceDir = path.join(manifest.paths.runDir, 'validation', 'feature');
+  await ensureDir(evidenceDir);
+  const mergedEnv = parseEnv(await fs.readFile(path.join(manifest.repo.cloneDir, '.env'), 'utf8'));
+  await spawnLogged({
+    cmd: 'sh',
+    args: ['-lc', command],
+    cwd: manifest.repo.cloneDir,
+    env: {
+      ...process.env,
+      ...mergedEnv,
+      REPLICA_OUTPUT_DIR: manifest.paths.generatedDir,
+      VALIDATION_METADATA_ENV_FILE: path.join(manifest.paths.generatedDir, 'metadata.env'),
+      AGENT_TASK_MANIFEST_PATH: manifest.paths.manifestPath,
+      AGENT_TASK_RUN_DIR: manifest.paths.runDir,
+      AGENT_TASK_VALIDATION_SUMMARY_PATH: manifest.validation?.lastSummaryPath || '',
+      AGENT_TASK_VALIDATION_EVIDENCE_DIR: manifest.validation?.lastEvidenceDir || ''
+    },
+    stdoutPath: path.join(evidenceDir, 'feature-validation.stdout.log'),
+    stderrPath: path.join(evidenceDir, 'feature-validation.stderr.log'),
+    timeoutMs: 30 * 60 * 1000
+  });
+  manifest.featureValidation = {
+    command,
+    evidenceDir,
+    stdoutPath: path.join(evidenceDir, 'feature-validation.stdout.log'),
+    stderrPath: path.join(evidenceDir, 'feature-validation.stderr.log'),
+    completedAt: new Date().toISOString()
+  };
+  await saveManifest(manifest);
+  return manifest.featureValidation;
+}
+
+function overallRunStatus(manifest, validationAnalysis) {
+  const failedStage = stageFailed(manifest);
+  const publish = manifest.status?.publish || null;
+  const cleanup = manifest.cleanup || {};
+  if (cleanup.completedAt) {
+    if (Array.isArray(cleanup.errors) && cleanup.errors.length > 0) return 'failed';
+    if (publish && !publish.skipPush && !publish.remoteVerifiedAt) return 'failed';
+    if (failedStage) return 'failed';
+    return publish?.skipPush ? 'completed_unpublished' : 'succeeded';
+  }
+  if (failedStage || manifest.status?.lastError) return 'failed';
+  if (publish?.committedAt) return 'cleaning_up';
+  if (validationAnalysis?.warnings?.length) return 'validation_warning';
+  return 'running';
+}
+
+function nextActionForReport(status) {
+  if (status === 'running') return 'Wait for the active run to finish or resume it if interrupted.';
+  if (status === 'cleaning_up') return 'Wait for cleanup to complete or rerun cleanup from the manifest.';
+  if (status === 'validation_warning') return 'Review validation evidence and rerun after fixing the warning conditions.';
+  if (status === 'completed_unpublished') return 'Review the branch and push manually if desired.';
+  if (status === 'failed') return 'Inspect final-report.json and the stage evidence, then resume or run cleanup.';
+  return 'Review the pushed branch and preserved evidence.';
+}
+
+async function writeRunReport(manifest) {
+  if (!manifest?.paths?.reportPath) return;
+  const validationAnalysis = await analyzeValidationArtifacts(manifest);
+  const report = {
+    version: 1,
+    generatedAt: new Date().toISOString(),
+    runId: manifest.runId,
+    status: overallRunStatus(manifest, validationAnalysis),
+    nextAction: nextActionForReport(overallRunStatus(manifest, validationAnalysis)),
+    repo: manifest.repo,
+    task: manifest.task,
+    request: {
+      model: manifest.request?.model || null,
+      timeoutMinutes: manifest.request?.timeoutMinutes || null,
+      skipPush: Boolean(manifest.request?.skipPush),
+      skipCleanup: Boolean(manifest.request?.skipCleanup),
+      keepClone: Boolean(manifest.request?.keepClone),
+      featureValidationConfigured: Boolean(manifest.request?.featureValidationCommand)
+    },
+    stages: manifest.stages || {},
+    publish: manifest.status?.publish || null,
+    validation: {
+      lastLabel: manifest.validation?.lastLabel || null,
+      evidenceDir: manifest.validation?.lastEvidenceDir || null,
+      summaryPath: manifest.validation?.lastSummaryPath || null,
+      checkedAt: manifest.validation?.checkedAt || null,
+      warnings: validationAnalysis.warnings,
+      summary: validationAnalysis.summary?.task
+        ? {
+            task: validationAnalysis.summary.task,
+            full_build: validationAnalysis.summary.full_build
+          }
+        : null
+    },
+    featureValidation: manifest.featureValidation || null,
+    cleanup: manifest.cleanup || {},
+    paths: {
+      manifestPath: manifest.paths.manifestPath,
+      reportPath: manifest.paths.reportPath,
+      runDir: manifest.paths.runDir,
+      cloneDir: manifest.repo?.cloneDir || null
+    },
+    lastError: manifest.status?.lastError || null
+  };
+  await writeJson(manifest.paths.reportPath, report);
+}
+
 async function cleanupValidation(manifest) {
   if (!manifest.validation?.lastEvidenceDir || !manifest.validation?.lastSummaryPath) return;
   const summary = await readJson(manifest.validation.lastSummaryPath);
@@ -1090,6 +1433,29 @@ async function sanitizeClone(manifest) {
   await saveManifest(manifest);
 }
 
+async function verifyRemoteBranch(manifest, expectedCommit) {
+  const cloneDir = manifest.repo.cloneDir;
+  const output = await gitOutput(cloneDir, ['ls-remote', '--heads', 'origin', manifest.repo.featureBranch]);
+  const line = output
+    .split('\n')
+    .map((entry) => entry.trim())
+    .find(Boolean);
+  if (!line) {
+    throw new Error(`Remote branch ${manifest.repo.featureBranch} was not found on origin after push`);
+  }
+  const [remoteCommit, remoteRef] = line.split(/\s+/, 2);
+  if (!remoteCommit || remoteCommit !== expectedCommit) {
+    throw new Error(
+      `Remote branch ${manifest.repo.featureBranch} points to ${remoteCommit || 'unknown'}, expected ${expectedCommit}`
+    );
+  }
+  return {
+    remoteCommit,
+    remoteRef: remoteRef || `refs/heads/${manifest.repo.featureBranch}`,
+    remoteVerifiedAt: new Date().toISOString()
+  };
+}
+
 async function commitAndPush(manifest, commitMessage, skipPush) {
   const cloneDir = manifest.repo.cloneDir;
   await runCommand('git', ['add', '-A'], { cwd: cloneDir });
@@ -1098,12 +1464,18 @@ async function commitAndPush(manifest, commitMessage, skipPush) {
     throw new Error('No tracked changes remain after sanitation; nothing to commit');
   }
   await runCommand('git', ['commit', '-m', commitMessage], { cwd: cloneDir });
+  const commitHash = await gitOutput(cloneDir, ['rev-parse', 'HEAD']);
   if (!skipPush) {
     await runCommand('git', ['push', '-u', 'origin', `HEAD:${manifest.repo.featureBranch}`], { cwd: cloneDir });
   }
+  const remoteVerification = skipPush ? null : await verifyRemoteBranch(manifest, commitHash);
   manifest.status.publish = {
     committedAt: new Date().toISOString(),
-    skipPush: Boolean(skipPush)
+    skipPush: Boolean(skipPush),
+    commitHash,
+    remoteRef: remoteVerification?.remoteRef || null,
+    remoteCommit: remoteVerification?.remoteCommit || null,
+    remoteVerifiedAt: remoteVerification?.remoteVerifiedAt || null
   };
   await saveManifest(manifest);
 }
@@ -1157,34 +1529,32 @@ async function deleteNamespaces(manifest) {
 
 async function cleanupManifest(manifest, { keepClone = false } = {}) {
   const errors = [];
+  let effectiveKeepClone = Boolean(keepClone);
   try {
     await cleanupValidation(manifest);
   } catch (error) {
     errors.push(`validation cleanup: ${error.message}`);
   }
-  if (
-    manifest.status?.overlayReady &&
-    manifest.task?.namespaces?.platform &&
-    manifest.repo?.cloneDir &&
-    await pathExists(manifest.repo.cloneDir)
-  ) {
-    try {
-      await spawnLogged({
-        cmd: 'sh',
-        args: ['./deploy/destroy-platform.sh'],
-        cwd: manifest.repo.cloneDir,
-        env: {
-          ...process.env,
-          REPLICA_OUTPUT_DIR: manifest.paths.generatedDir,
-          DELETE_PLATFORM_CLUSTER_ROLES: 'false',
-          SKIP_REPLICA_KUBECONFIG_UPDATE: 'true'
-        },
-        stdoutPath: path.join(manifest.paths.runDir, 'cleanup', 'destroy.stdout.log'),
-        stderrPath: path.join(manifest.paths.runDir, 'cleanup', 'destroy.stderr.log'),
-        timeoutMs: 30 * 60 * 1000
-      });
-    } catch (error) {
-      errors.push(`destroy-platform: ${error.message}`);
+  if (manifest.status?.overlayReady && manifest.task?.namespaces?.platform) {
+    if (manifest.repo?.cloneDir && await pathExists(manifest.repo.cloneDir)) {
+      try {
+        await spawnLogged({
+          cmd: 'sh',
+          args: ['./deploy/destroy-platform.sh'],
+          cwd: manifest.repo.cloneDir,
+          env: {
+            ...process.env,
+            REPLICA_OUTPUT_DIR: manifest.paths.generatedDir,
+            DELETE_PLATFORM_CLUSTER_ROLES: 'false',
+            SKIP_REPLICA_KUBECONFIG_UPDATE: 'true'
+          },
+          stdoutPath: path.join(manifest.paths.runDir, 'cleanup', 'destroy.stdout.log'),
+          stderrPath: path.join(manifest.paths.runDir, 'cleanup', 'destroy.stderr.log'),
+          timeoutMs: 30 * 60 * 1000
+        });
+      } catch (error) {
+        errors.push(`destroy-platform: ${error.message}`);
+      }
     }
     try {
       await deleteNamespaces(manifest);
@@ -1203,24 +1573,31 @@ async function cleanupManifest(manifest, { keepClone = false } = {}) {
         errors.push(`schema cleanup: ${error.message}`);
       }
     }
-    try {
-      await restoreWorkerIrsaTrust(manifest);
-    } catch (error) {
-      errors.push(`worker irsa restore: ${error.message}`);
-    }
-    try {
-      await restorePlatformNodegroupCapacity(manifest);
-    } catch (error) {
-      errors.push(`platform nodegroup restore: ${error.message}`);
-    }
   }
-  if (!keepClone) {
+  try {
+    await restoreWorkerIrsaTrust(manifest);
+  } catch (error) {
+    errors.push(`worker irsa restore: ${error.message}`);
+  }
+  try {
+    await restorePlatformNodegroupCapacity(manifest);
+  } catch (error) {
+    errors.push(`platform nodegroup restore: ${error.message}`);
+  }
+  if (manifest.status?.publish && !manifest.status.publish.skipPush && !manifest.status.publish.remoteVerifiedAt) {
+    errors.push('clone retained because push verification is missing');
+    effectiveKeepClone = true;
+  }
+  if (errors.length > 0) {
+    effectiveKeepClone = true;
+  }
+  if (!effectiveKeepClone) {
     await removePath(manifest.repo.cloneDir);
   }
   manifest.cleanup = {
     ...(manifest.cleanup || {}),
     completedAt: new Date().toISOString(),
-    keepClone,
+    keepClone: effectiveKeepClone,
     errors
   };
   await saveManifest(manifest);
@@ -1229,22 +1606,57 @@ async function cleanupManifest(manifest, { keepClone = false } = {}) {
   }
 }
 
-async function runFlow(args) {
-  await ensureKubeAccess();
+function resolveRequestedBoolean(argsValue, storedValue = false) {
+  if (argsValue === undefined) return Boolean(storedValue);
+  return Boolean(argsValue);
+}
+
+function resolveRunOptions(manifest, args = {}) {
+  return {
+    prompt: String(manifest.request?.prompt || ''),
+    commitMessage: String(args.commitMessage || manifest.request?.commitMessage || `feat: ${manifest.repo.featureBranch}`),
+    model: String(args.model || manifest.request?.model || 'gpt-5.4'),
+    timeoutMs: Math.max(
+      15,
+      Number(args.timeoutMinutes || manifest.request?.timeoutMinutes || 120)
+    ) * 60 * 1000,
+    skipPush: resolveRequestedBoolean(args.skipPush, manifest.request?.skipPush),
+    skipCleanup: resolveRequestedBoolean(args.skipCleanup, manifest.request?.skipCleanup),
+    keepClone: resolveRequestedBoolean(args.keepClone, manifest.request?.keepClone),
+    featureValidationCommand: String(manifest.request?.featureValidationCommand || '')
+  };
+}
+
+async function createRunManifest(args) {
   const baseBranch = String(args.base || 'main');
   const featureBranch = requiredArg(args, 'branch');
   const prompt = await readPrompt(args);
+  const featureValidationCommand = await readFeatureValidationCommand(args);
   const runId = String(args.runId || `${timestampSlug()}-${shortRandom(6)}`);
-  const taskSlug = deriveTaskSlug(featureBranch, args.taskSlug, runId);
   const runDir = path.join(repoRoot, 'validation', 'evidence', 'agent-cli', runId);
+  const manifestPath = path.join(runDir, 'manifest.json');
+  if (await pathExists(manifestPath)) {
+    throw new Error(`Run ${runId} already exists at ${manifestPath}; use resume instead of run`);
+  }
+  const taskSlug = deriveTaskSlug(featureBranch, args.taskSlug, runId);
   const cloneDir = path.join(runDir, 'clone');
   const generatedDir = path.join(runDir, 'generated', 'replica');
   await ensureDir(runDir);
 
   const manifest = {
-    version: 1,
+    version: 2,
     runId,
     createdAt: new Date().toISOString(),
+    request: {
+      prompt,
+      commitMessage: String(args.commitMessage || `feat: ${featureBranch}`),
+      model: String(args.model || 'gpt-5.4'),
+      timeoutMinutes: Math.max(15, Number(args.timeoutMinutes || 120)),
+      skipPush: Boolean(args.skipPush),
+      skipCleanup: Boolean(args.skipCleanup),
+      keepClone: Boolean(args.keepClone),
+      featureValidationCommand
+    },
     repo: {
       sourceRoot: repoRoot,
       originUrl: await gitOutput(repoRoot, ['remote', 'get-url', 'origin']),
@@ -1254,7 +1666,8 @@ async function runFlow(args) {
     },
     paths: {
       runDir,
-      manifestPath: path.join(runDir, 'manifest.json'),
+      manifestPath,
+      reportPath: path.join(runDir, 'final-report.json'),
       generatedDir,
       metadataSnapshotPath: path.join(runDir, 'metadata.snapshot.json')
     },
@@ -1265,53 +1678,278 @@ async function runFlow(args) {
       platformImages: []
     },
     cleanup: {},
-    status: {}
+    status: {},
+    stages: {}
   };
+  ensureManifestDefaults(manifest);
   await saveManifest(manifest);
+  return manifest;
+}
 
-  const keepClone = Boolean(args.keepClone);
-  const skipCleanup = Boolean(args.skipCleanup);
-  let success = false;
+async function loadManifestForResume(manifestPath) {
+  const manifest = await readJson(path.resolve(manifestPath));
+  ensureManifestDefaults(manifest);
+  await saveManifest(manifest);
+  return manifest;
+}
+
+async function executeRun(manifest, args = {}) {
+  ensureManifestDefaults(manifest);
+  const options = resolveRunOptions(manifest, args);
+  if (!options.prompt) {
+    throw new Error('Manifest is missing the stored prompt needed to resume this run');
+  }
+
+  let primaryError = null;
   try {
-    await createClone({
-      sourceRepoRoot: repoRoot,
-      originUrl: manifest.repo.originUrl,
-      cloneDir,
-      baseBranch,
-      featureBranch
+    await runStage(
+      manifest,
+      'clone',
+      async () => {
+        if (await pathExists(path.join(manifest.repo.cloneDir, '.git'))) {
+          return { reused: true };
+        }
+        await createClone({
+          sourceRepoRoot: repoRoot,
+          originUrl: manifest.repo.originUrl,
+          cloneDir: manifest.repo.cloneDir,
+          baseBranch: manifest.repo.baseBranch,
+          featureBranch: manifest.repo.featureBranch
+        });
+        return { reused: false };
+      },
+      {
+        details: {
+          baseBranch: manifest.repo.baseBranch,
+          featureBranch: manifest.repo.featureBranch
+        }
+      }
+    );
+
+    await runStage(manifest, 'overlay', async () => {
+      await buildTaskOverlay(manifest);
+      return { generatedDir: manifest.paths.generatedDir };
     });
-    await buildTaskOverlay(manifest);
-    await ensurePlatformNodegroupCapacity(manifest);
-    await ensureWorkerIrsaTrust(manifest);
-    await deployPlatform(manifest, 'pre-codex');
-    await runCodex(
+
+    await runStage(manifest, 'platform-capacity', async () => {
+      await ensurePlatformNodegroupCapacity(manifest);
+      return manifest.resources.platformNodegroupScaling || {};
+    });
+
+    await runStage(manifest, 'worker-irsa-trust', async () => {
+      await ensureWorkerIrsaTrust(manifest);
+      return manifest.resources.workerIrsaTrust || {};
+    });
+
+    await runStage(manifest, 'deploy-pre-codex', async () => {
+      await deployPlatform(manifest, 'pre-codex');
+      return manifest.status.lastDeploy || {};
+    });
+
+    await runStage(
       manifest,
-      prompt,
-      String(args.model || 'gpt-5.4'),
-      Math.max(15, Number(args.timeoutMinutes || 120)) * 60 * 1000
+      'codex',
+      async () => {
+        await runCodex(manifest, options.prompt, options.model, options.timeoutMs);
+        return manifest.status.codex || {};
+      },
+      {
+        details: {
+          model: options.model,
+          timeoutMs: options.timeoutMs
+        }
+      }
     );
-    await deployPlatform(manifest, 'post-codex');
-    await runValidation(manifest, 'post-codex');
-    await sanitizeClone(manifest);
-    await commitAndPush(
-      manifest,
-      String(args.commitMessage || `feat: ${featureBranch}`),
-      Boolean(args.skipPush)
-    );
-    success = true;
-  } finally {
-    if (!skipCleanup) {
-      await cleanupManifest(manifest, { keepClone }).catch((error) => {
-        console.error(error.message);
+
+    await runStage(manifest, 'deploy-post-codex', async () => {
+      await deployPlatform(manifest, 'post-codex');
+      return manifest.status.lastDeploy || {};
+    });
+
+    await runStage(manifest, 'validation', async () => {
+      const summary = await runValidation(manifest, 'post-codex');
+      await assertValidationReadyForPublish(manifest);
+      return {
+        summaryPath: manifest.validation?.lastSummaryPath || null,
+        task: summary?.task || null,
+        fullBuild: summary?.full_build || null
+      };
+    });
+
+    if (options.featureValidationCommand) {
+      await runStage(manifest, 'feature-validation', async () => {
+        return runFeatureValidation(manifest);
       });
+    } else if (!stageRecord(manifest, 'feature-validation')) {
+      await skipStage(manifest, 'feature-validation', 'No feature validation command configured');
     }
+
+    await runStage(manifest, 'sanitize', async () => {
+      await sanitizeClone(manifest);
+      return { sanitizedAt: manifest.status.sanitizedAt || null };
+    });
+
+    await runStage(
+      manifest,
+      'publish',
+      async () => {
+        await commitAndPush(manifest, options.commitMessage, options.skipPush);
+        return manifest.status.publish || {};
+      },
+      {
+        details: {
+          skipPush: options.skipPush
+        }
+      }
+    );
+  } catch (error) {
+    primaryError = error;
+    manifest.status.lastError = serializeError(error);
+    manifest.status.failedAt = new Date().toISOString();
+    await saveManifest(manifest);
+  } finally {
+    if (!options.skipCleanup) {
+      try {
+        await runStage(
+          manifest,
+          'cleanup',
+          async () => {
+            await cleanupManifest(manifest, { keepClone: options.keepClone });
+            return manifest.cleanup;
+          },
+          { skipIfComplete: false, details: { keepClone: options.keepClone } }
+        );
+      } catch (cleanupError) {
+        console.error(cleanupError.message);
+        if (!primaryError) {
+          primaryError = cleanupError;
+        }
+      }
+    }
+  }
+
+  if (primaryError) {
+    throw primaryError;
   }
 }
 
+async function runFlow(args) {
+  await ensureKubeAccess();
+  const manifest = await createRunManifest(args);
+  await executeRun(manifest, args);
+}
+
+async function resumeFlow(args) {
+  await ensureKubeAccess();
+  const manifest = await loadManifestForResume(requiredArg(args, 'manifest'));
+  await executeRun(manifest, args);
+}
+
 async function cleanupFlow(args) {
-  const manifestPath = path.resolve(requiredArg(args, 'manifest'));
-  const manifest = await readJson(manifestPath);
-  await cleanupManifest(manifest, { keepClone: Boolean(args.keepClone) });
+  const manifest = await loadManifestForResume(requiredArg(args, 'manifest'));
+  await runStage(
+    manifest,
+    'cleanup',
+    async () => {
+      await cleanupManifest(manifest, { keepClone: Boolean(args.keepClone) });
+      return manifest.cleanup;
+    },
+    { skipIfComplete: false, details: { keepClone: Boolean(args.keepClone) } }
+  );
+}
+
+async function namespaceExists(namespace) {
+  try {
+    await runCommand('kubectl', ['get', 'namespace', namespace]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function janitorReasons(manifest) {
+  const reasons = [];
+  if (!manifest.cleanup?.completedAt) reasons.push('cleanup_incomplete');
+  if (Array.isArray(manifest.cleanup?.errors) && manifest.cleanup.errors.length) reasons.push('cleanup_errors');
+  if (manifest.status?.publish && !manifest.status.publish.skipPush && !manifest.status.publish.remoteVerifiedAt) {
+    reasons.push('push_unverified');
+  }
+  if (manifest.repo?.cloneDir && await pathExists(manifest.repo.cloneDir) && !manifest.cleanup?.keepClone) {
+    reasons.push('clone_present');
+  }
+  for (const namespace of Object.values(manifest.task?.namespaces || {})) {
+    if (await namespaceExists(namespace)) {
+      reasons.push(`namespace_present:${namespace}`);
+    }
+  }
+  return Array.from(new Set(reasons));
+}
+
+async function janitorFlow(args) {
+  await ensureKubeAccess();
+  const runsRoot = path.resolve(String(args.runsRoot || path.join(repoRoot, 'validation', 'evidence', 'agent-cli')));
+  const olderThanHours = Math.max(0, Number(args.olderThanHours || 1));
+  const olderThanMs = olderThanHours * 60 * 60 * 1000;
+  const apply = Boolean(args.apply);
+  const keepClone = Boolean(args.keepClone);
+  const entries = await fs.readdir(runsRoot, { withFileTypes: true }).catch(() => []);
+  const candidates = [];
+
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const manifestPath = path.join(runsRoot, entry.name, 'manifest.json');
+    if (!(await pathExists(manifestPath))) continue;
+    const manifest = await loadManifestForResume(manifestPath);
+    const createdAt = new Date(manifest.createdAt || 0).getTime();
+    if (olderThanMs > 0 && createdAt && Date.now() - createdAt < olderThanMs) continue;
+    const reasons = await janitorReasons(manifest);
+    if (!reasons.length) continue;
+    const candidate = {
+      runId: manifest.runId,
+      manifestPath,
+      reasons,
+      applied: false,
+      error: null
+    };
+    if (apply) {
+      try {
+        await runStage(
+          manifest,
+          'cleanup',
+          async () => {
+            await cleanupManifest(manifest, { keepClone });
+            return manifest.cleanup;
+          },
+          { skipIfComplete: false, details: { keepClone, janitor: true } }
+        );
+        candidate.applied = true;
+      } catch (error) {
+        candidate.error = serializeError(error);
+      }
+    }
+    candidates.push(candidate);
+  }
+
+  const janitorDir = path.join(runsRoot, 'janitor');
+  await ensureDir(janitorDir);
+  const janitorReportPath = path.join(janitorDir, `${timestampSlug()}-${shortRandom(6)}.json`);
+  await writeJson(janitorReportPath, {
+    generatedAt: new Date().toISOString(),
+    runsRoot,
+    olderThanHours,
+    apply,
+    keepClone,
+    candidates
+  });
+  console.log(`Janitor report: ${janitorReportPath}`);
+  if (candidates.length) {
+    console.log(JSON.stringify(candidates, null, 2));
+  } else {
+    console.log('No stale agent-task runs matched the janitor filter.');
+  }
+  if (apply && candidates.some((candidate) => candidate.error)) {
+    process.exitCode = 1;
+  }
 }
 
 async function main() {
@@ -1321,15 +1959,36 @@ async function main() {
     await runFlow(args);
     return;
   }
+  if (command === 'resume') {
+    await resumeFlow(args);
+    return;
+  }
   if (command === 'cleanup') {
     await cleanupFlow(args);
+    return;
+  }
+  if (command === 'janitor') {
+    await janitorFlow(args);
     return;
   }
   usage();
   process.exitCode = 1;
 }
 
-main().catch((error) => {
-  console.error(error?.stack || error?.message || String(error));
-  process.exit(1);
-});
+const isEntrypoint = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
+
+export {
+  buildTaskContext,
+  deriveTaskSlug,
+  ensureManifestDefaults,
+  overallRunStatus,
+  parseArgs,
+  validationWarningsFromArtifacts
+};
+
+if (isEntrypoint) {
+  main().catch((error) => {
+    console.error(error?.stack || error?.message || String(error));
+    process.exit(1);
+  });
+}
