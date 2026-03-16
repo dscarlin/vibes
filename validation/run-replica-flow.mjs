@@ -105,13 +105,35 @@ function extractImportSpecifiers(sourceText) {
   return Array.from(imports);
 }
 
+function previewResourcePriority(resourceUrl) {
+  try {
+    const { pathname } = new URL(resourceUrl);
+    if (pathname.startsWith('/src/')) return 0;
+    if (pathname.startsWith('/assets/')) return 1;
+    if (pathname.startsWith('/static/')) return 2;
+    if (pathname.startsWith('/@vite/')) return 8;
+    if (pathname.includes('/node_modules/')) return 9;
+    return 3;
+  } catch {
+    return 10;
+  }
+}
+
+function sortPreviewResources(resources = []) {
+  return resources.sort((left, right) => {
+    const priority = previewResourcePriority(left) - previewResourcePriority(right);
+    if (priority !== 0) return priority;
+    return String(left).localeCompare(String(right));
+  });
+}
+
 async function findMarkerInPreviewResources(previewUrl, html, marker, lookup, evidenceDir) {
   const baseUrl = new URL(previewUrl);
-  const queue = extractScriptSrcs(html).map((src) => new URL(src, baseUrl).toString());
+  const queue = sortPreviewResources(extractScriptSrcs(html).map((src) => new URL(src, baseUrl).toString()));
   const visited = new Set();
   let fetched = 0;
 
-  while (queue.length > 0 && fetched < 30) {
+  while (queue.length > 0 && fetched < 80) {
     const resourceUrl = queue.shift();
     if (!resourceUrl || visited.has(resourceUrl)) continue;
     visited.add(resourceUrl);
@@ -150,6 +172,7 @@ async function findMarkerInPreviewResources(previewUrl, html, marker, lookup, ev
       if (resolved.origin !== baseUrl.origin) continue;
       queue.push(resolved.toString());
     }
+    sortPreviewResources(queue);
   }
 
   return { matched: false };
