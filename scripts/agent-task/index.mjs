@@ -265,14 +265,27 @@ async function buildTaskOverlay(manifest) {
   await ensureDir(generatedDir);
   await ensureDir(overlayDir);
 
-  const syncEnv = {
-    ...process.env,
-    REPLICA_OUTPUT_DIR: generatedDir
-  };
-  await runCommand('node', ['./cluster-bootstrap/sync-secrets.mjs'], {
-    cwd: cloneDir,
-    env: syncEnv
-  });
+  const sourceGeneratedDir = path.join(repoRoot, 'deploy', '.generated', 'replica');
+  const sourceFiles = ['server.env', 'web.env', 'worker.env', 'metadata.env'];
+  const hasSourceGeneratedEnv = await Promise.all(
+    sourceFiles.map((fileName) => pathExists(path.join(sourceGeneratedDir, fileName)))
+  );
+  if (hasSourceGeneratedEnv.every(Boolean)) {
+    await Promise.all(
+      sourceFiles.map((fileName) =>
+        fs.copyFile(path.join(sourceGeneratedDir, fileName), path.join(generatedDir, fileName))
+      )
+    );
+  } else {
+    const syncEnv = {
+      ...process.env,
+      REPLICA_OUTPUT_DIR: generatedDir
+    };
+    await runCommand('node', ['./cluster-bootstrap/sync-secrets.mjs'], {
+      cwd: repoRoot,
+      env: syncEnv
+    });
+  }
 
   const baseMetadata = await readEnvFile(path.join(generatedDir, 'metadata.env'));
   const baseServerEnv = await readEnvFile(path.join(generatedDir, 'server.env'));
@@ -725,6 +738,7 @@ function parseImageRef(imageRef) {
 }
 
 async function cleanupPlatformImages(manifest) {
+  if (!manifest.task?.awsRegion) return;
   const refs = Array.isArray(manifest.resources.platformImages) ? manifest.resources.platformImages : [];
   for (const ref of refs) {
     const parsed = parseImageRef(ref);
@@ -743,6 +757,7 @@ async function cleanupPlatformImages(manifest) {
 }
 
 async function deleteNamespaces(manifest) {
+  if (!manifest.task?.namespaces) return;
   const namespaces = Object.values(manifest.task.namespaces);
   for (const namespace of namespaces) {
     await runCommand('kubectl', ['delete', 'namespace', namespace, '--ignore-not-found', '--wait=false']).catch(() => null);
@@ -766,37 +781,41 @@ async function cleanupManifest(manifest, { keepClone = false } = {}) {
   } catch (error) {
     errors.push(`validation cleanup: ${error.message}`);
   }
-  try {
-    await spawnLogged({
-      cmd: 'sh',
-      args: ['./deploy/destroy-platform.sh'],
-      cwd: manifest.repo.cloneDir,
-      env: {
-        ...process.env,
-        REPLICA_OUTPUT_DIR: manifest.paths.generatedDir,
-        DELETE_PLATFORM_CLUSTER_ROLES: 'false'
-      },
-      stdoutPath: path.join(manifest.paths.runDir, 'cleanup', 'destroy.stdout.log'),
-      stderrPath: path.join(manifest.paths.runDir, 'cleanup', 'destroy.stderr.log'),
-      timeoutMs: 30 * 60 * 1000
-    });
-  } catch (error) {
-    errors.push(`destroy-platform: ${error.message}`);
-  }
-  try {
-    await deleteNamespaces(manifest);
-  } catch (error) {
-    errors.push(`namespace delete: ${error.message}`);
-  }
-  try {
-    await cleanupPlatformImages(manifest);
-  } catch (error) {
-    errors.push(`image cleanup: ${error.message}`);
-  }
-  try {
-    await dropSchema(manifest.database.baseDatabaseUrl, manifest.task.schema);
-  } catch (error) {
-    errors.push(`schema cleanup: ${error.message}`);
+  if (manifest.task?.namespaces?.platform && manifest.repo?.cloneDir && await pathExists(manifest.repo.cloneDir)) {
+    try {
+      await spawnLogged({
+        cmd: 'sh',
+        args: ['./deploy/destroy-platform.sh'],
+        cwd: manifest.repo.cloneDir,
+        env: {
+          ...process.env,
+          REPLICA_OUTPUT_DIR: manifest.paths.generatedDir,
+          DELETE_PLATFORM_CLUSTER_ROLES: 'false'
+        },
+        stdoutPath: path.join(manifest.paths.runDir, 'cleanup', 'destroy.stdout.log'),
+        stderrPath: path.join(manifest.paths.runDir, 'cleanup', 'destroy.stderr.log'),
+        timeoutMs: 30 * 60 * 1000
+      });
+    } catch (error) {
+      errors.push(`destroy-platform: ${error.message}`);
+    }
+    try {
+      await deleteNamespaces(manifest);
+    } catch (error) {
+      errors.push(`namespace delete: ${error.message}`);
+    }
+    try {
+      await cleanupPlatformImages(manifest);
+    } catch (error) {
+      errors.push(`image cleanup: ${error.message}`);
+    }
+    if (manifest.database?.baseDatabaseUrl && manifest.task?.schema) {
+      try {
+        await dropSchema(manifest.database.baseDatabaseUrl, manifest.task.schema);
+      } catch (error) {
+        errors.push(`schema cleanup: ${error.message}`);
+      }
+    }
   }
   if (!keepClone) {
     await removePath(manifest.repo.cloneDir);
