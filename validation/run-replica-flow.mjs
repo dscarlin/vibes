@@ -161,6 +161,7 @@ function httpRequest(url, options = {}) {
   const headers = {
     ...(options.headers || {})
   };
+  const timeoutMs = Number(options.timeoutMs || process.env.VALIDATION_HTTP_TIMEOUT_MS || 20000);
 
   let payload = null;
   if (options.body) {
@@ -172,6 +173,7 @@ function httpRequest(url, options = {}) {
   }
 
   return new Promise((resolve, reject) => {
+    let settled = false;
     const req = client.request(
       target,
       {
@@ -184,6 +186,7 @@ function httpRequest(url, options = {}) {
         const chunks = [];
         response.on('data', (chunk) => chunks.push(chunk));
         response.on('end', () => {
+          settled = true;
           resolve({
             ok: response.statusCode >= 200 && response.statusCode < 300,
             status: response.statusCode || 0,
@@ -194,7 +197,13 @@ function httpRequest(url, options = {}) {
       }
     );
 
-    req.on('error', reject);
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new Error(`Request timed out after ${timeoutMs}ms for ${url}`));
+    });
+    req.on('error', (error) => {
+      if (settled) return;
+      reject(error);
+    });
     if (payload) {
       req.write(payload);
     }
