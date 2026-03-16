@@ -28,6 +28,8 @@ import {
 
 const repoRoot = repoRootFrom(import.meta.url);
 const promptTemplatePath = path.join(repoRoot, 'scripts', 'agent-task', 'codex-wrapper-prompt.txt');
+const PLATFORM_NODEGROUP_NAME = 'platform-core';
+const MIN_PLATFORM_NODE_COUNT = 2;
 
 function usage() {
   console.error(
@@ -238,7 +240,7 @@ function dbParts(databaseUrl) {
 }
 
 async function runSqlThroughCluster(manifest, databaseUrl, sql, { namespace = '' } = {}) {
-  const kubeNamespace = namespace || manifest.task?.namespaces?.platform || 'vibes-platform';
+  const kubeNamespace = namespace || manifest.cluster?.sharedPlatformNamespace || 'vibes-platform';
   const parts = dbParts(databaseUrl);
   const podName = `agent-task-db-${manifest.task?.slug || 'task'}-${shortRandom(4)}`;
   await runCommand('sh', [
@@ -291,7 +293,8 @@ async function createSchema(manifest, databaseUrl, schema) {
   await runSqlThroughCluster(
     manifest,
     databaseUrl,
-    `create schema if not exists ${quoteIdent(schema)} authorization current_user;`
+    `create schema if not exists ${quoteIdent(schema)} authorization current_user;`,
+    { namespace: manifest.cluster?.sharedPlatformNamespace }
   );
 }
 
@@ -299,7 +302,8 @@ async function dropSchema(manifest, databaseUrl, schema) {
   await runSqlThroughCluster(
     manifest,
     databaseUrl,
-    `drop schema if exists ${quoteIdent(schema)} cascade;`
+    `drop schema if exists ${quoteIdent(schema)} cascade;`,
+    { namespace: manifest.cluster?.sharedPlatformNamespace }
   );
 }
 
@@ -309,7 +313,8 @@ async function deleteValidationUser(manifest, databaseUrl, schema, email) {
   await runSqlThroughCluster(
     manifest,
     databaseUrl,
-    `set search_path to ${quoteIdent(schema)}, public;\ndelete from users where email = '${escapedEmail}';`
+    `set search_path to ${quoteIdent(schema)}, public;\ndelete from users where email = '${escapedEmail}';`,
+    { namespace: manifest.cluster?.sharedPlatformNamespace }
   );
 }
 
@@ -321,16 +326,160 @@ async function dropDatabases(manifest, adminUrl, databases = []) {
       await runSqlThroughCluster(
         manifest,
         adminUrl,
-        `drop database if exists ${quoteIdent(database)} with (force);`
+        `drop database if exists ${quoteIdent(database)} with (force);`,
+        { namespace: manifest.cluster?.sharedPlatformNamespace }
       );
     } catch {
       await runSqlThroughCluster(
         manifest,
         adminUrl,
-        `drop database if exists ${quoteIdent(database)};`
+        `drop database if exists ${quoteIdent(database)};`,
+        { namespace: manifest.cluster?.sharedPlatformNamespace }
       ).catch(() => null);
     }
   }
+}
+
+async function waitForDeploymentAvailable(namespace, deploymentName, timeout = '15m') {
+  await runCommand('kubectl', [
+    '-n',
+    namespace,
+    'wait',
+    '--for=condition=Available',
+    `deployment/${deploymentName}`,
+    `--timeout=${timeout}`
+  ]);
+}
+
+async function waitForTaskPlatformReady(manifest, phase) {
+  const namespace = manifest.task?.namespaces?.platform;
+  if (!namespace) return;
+  await waitForDeploymentAvailable(namespace, manifest.task.workloads.redis, '10m');
+  await waitForDeploymentAvailable(namespace, manifest.task.workloads.server, '15m');
+  await waitForDeploymentAvailable(namespace, manifest.task.workloads.web, '15m');
+  await waitForDeploymentAvailable(namespace, manifest.task.workloads.worker, '15m');
+  manifest.status.platformReady = {
+    ...(manifest.status.platformReady || {}),
+    [phase]: new Date().toISOString()
+  };
+  await saveManifest(manifest);
+}
+
+async function schedulablePlatformNodeCount() {
+  const { stdout } = await runCommand('kubectl', ['get', 'nodes', '-o', 'json']);
+  const payload = JSON.parse(stdout || '{}');
+  const nodes = Array.isArray(payload?.items) ? payload.items : [];
+  return nodes.filter((node) => {
+    const readyCondition = Array.isArray(node?.status?.conditions)
+      ? node.status.conditions.find((condition) => condition.type === 'Ready')
+      : null;
+    if (readyCondition?.status !== 'True') return false;
+    const taints = Array.isArray(node?.spec?.taints) ? node.spec.taints : [];
+    return !taints.some((taint) => taint.effect === 'NoSchedule');
+  }).length;
+}
+
+async function ensurePlatformNodegroupCapacity(manifest) {
+  const clusterName = String(manifest.cluster?.name || '').trim();
+  const region = String(manifest.task?.awsRegion || '').trim();
+  if (!clusterName || !region) return;
+
+  const { stdout } = await runCommand('aws', [
+    'eks',
+    'describe-nodegroup',
+    '--cluster-name',
+    clusterName,
+    '--nodegroup-name',
+    PLATFORM_NODEGROUP_NAME,
+    '--region',
+    region
+  ]);
+  const payload = JSON.parse(stdout || '{}');
+  const scalingConfig = payload?.nodegroup?.scalingConfig || {};
+  const currentScaling = {
+    minSize: Number(scalingConfig.minSize || 0),
+    maxSize: Number(scalingConfig.maxSize || 0),
+    desiredSize: Number(scalingConfig.desiredSize || 0)
+  };
+
+  manifest.resources.platformNodegroupScaling = manifest.resources.platformNodegroupScaling || {
+    clusterName,
+    region,
+    nodegroupName: PLATFORM_NODEGROUP_NAME,
+    previousScalingConfig: currentScaling,
+    adjusted: false
+  };
+  await saveManifest(manifest);
+
+  const nextScaling = {
+    minSize: currentScaling.minSize,
+    maxSize: Math.max(currentScaling.maxSize, MIN_PLATFORM_NODE_COUNT),
+    desiredSize: Math.max(currentScaling.desiredSize, MIN_PLATFORM_NODE_COUNT)
+  };
+
+  const needsUpdate =
+    nextScaling.maxSize !== currentScaling.maxSize || nextScaling.desiredSize !== currentScaling.desiredSize;
+  if (needsUpdate) {
+    await runCommand('aws', [
+      'eks',
+      'update-nodegroup-config',
+      '--cluster-name',
+      clusterName,
+      '--nodegroup-name',
+      PLATFORM_NODEGROUP_NAME,
+      '--region',
+      region,
+      '--scaling-config',
+      `minSize=${nextScaling.minSize},maxSize=${nextScaling.maxSize},desiredSize=${nextScaling.desiredSize}`
+    ]);
+    manifest.resources.platformNodegroupScaling.adjusted = true;
+    manifest.resources.platformNodegroupScaling.appliedScalingConfig = nextScaling;
+    await saveManifest(manifest);
+  }
+
+  await waitFor(
+    async () => (await schedulablePlatformNodeCount()) >= MIN_PLATFORM_NODE_COUNT,
+    { timeoutMs: 20 * 60 * 1000, intervalMs: 5000 }
+  );
+}
+
+async function restorePlatformNodegroupCapacity(manifest) {
+  const scaling = manifest.resources?.platformNodegroupScaling;
+  if (!scaling?.adjusted || !scaling.previousScalingConfig) return;
+  await runCommand('aws', [
+    'eks',
+    'update-nodegroup-config',
+    '--cluster-name',
+    scaling.clusterName,
+    '--nodegroup-name',
+    scaling.nodegroupName,
+    '--region',
+    scaling.region,
+    '--scaling-config',
+    [
+      `minSize=${Number(scaling.previousScalingConfig.minSize || 0)}`,
+      `maxSize=${Number(scaling.previousScalingConfig.maxSize || 0)}`,
+      `desiredSize=${Number(scaling.previousScalingConfig.desiredSize || 0)}`
+    ].join(',')
+  ]);
+  manifest.cleanup.platformNodegroupScaling = {
+    restoredAt: new Date().toISOString(),
+    scalingConfig: scaling.previousScalingConfig
+  };
+  await saveManifest(manifest);
+}
+
+async function prepareCodexHome(manifest) {
+  const codexHome = path.join(manifest.paths.runDir, 'codex-home');
+  const authSourcePath = path.join(process.env.HOME || '', '.codex', 'auth.json');
+  if (!(await pathExists(authSourcePath))) {
+    throw new Error(`Codex auth file not found at ${authSourcePath}`);
+  }
+  await removePath(codexHome);
+  await ensureDir(codexHome);
+  await fs.copyFile(authSourcePath, path.join(codexHome, 'auth.json'));
+  await fs.writeFile(path.join(codexHome, 'config.toml'), '', 'utf8');
+  return codexHome;
 }
 
 async function apiRequest(baseUrl, route, { method = 'GET', token = '', body = null } = {}) {
@@ -386,6 +535,10 @@ async function buildTaskOverlay(manifest) {
   const baseWorkerEnv = await readEnvFile(path.join(generatedDir, 'worker.env'));
 
   manifest.task = buildTaskContext(baseMetadata, manifest.repo.featureBranch, manifest.task.slug);
+  manifest.cluster = {
+    name: String(baseMetadata.CLUSTER_NAME || '').trim(),
+    sharedPlatformNamespace: String(baseMetadata.PLATFORM_NAMESPACE || 'vibes-platform').trim() || 'vibes-platform'
+  };
   manifest.database = {
     baseDatabaseUrl: baseServerEnv.DATABASE_URL,
     taskDatabaseUrl: withSearchPath(baseServerEnv.DATABASE_URL, manifest.task.schema),
@@ -520,6 +673,13 @@ async function writeTaskCommands(cloneDir, manifest) {
   const generatedEnv = `REPLICA_OUTPUT_DIR=${shellQuote(generatedDir)}`;
 
   const scripts = {
+    'await-platform': `#!/usr/bin/env sh
+set -eu
+kubectl -n ${shellQuote(manifest.task.namespaces.platform)} wait --for=condition=Available deployment/${shellQuote(manifest.task.workloads.redis)} --timeout=10m
+kubectl -n ${shellQuote(manifest.task.namespaces.platform)} wait --for=condition=Available deployment/${shellQuote(manifest.task.workloads.server)} --timeout=15m
+kubectl -n ${shellQuote(manifest.task.namespaces.platform)} wait --for=condition=Available deployment/${shellQuote(manifest.task.workloads.web)} --timeout=15m
+kubectl -n ${shellQuote(manifest.task.namespaces.platform)} wait --for=condition=Available deployment/${shellQuote(manifest.task.workloads.worker)} --timeout=15m
+`,
     'platform-urls': `#!/usr/bin/env sh
 set -eu
 echo "root: https://${manifest.task.hosts.root}"
@@ -547,6 +707,7 @@ export ${generatedEnv}
 export REPLICA_IMAGE_TAG="task-${manifest.task.slug}-manual-$(date -u +%Y%m%d%H%M%S)"
 ./deploy/build-push.sh
 ./deploy/apply-platform.sh
+./.vp-task/bin/await-platform
 `,
     'validate-platform': `#!/usr/bin/env sh
 set -eu
@@ -557,6 +718,7 @@ mkdir -p "$dir"
 export ${generatedEnv}
 export VALIDATION_METADATA_ENV_FILE=${shellQuote(path.join(generatedDir, 'metadata.env'))}
 export VALIDATION_EVIDENCE_DIR="$dir"
+./.vp-task/bin/await-platform
 node ./validation/run-replica-flow.mjs
 echo "validation evidence: $dir"
 `,
@@ -584,6 +746,7 @@ kubectl -n ${shellQuote(manifest.task.namespaces.platform)} logs deploy/${shellQ
     '',
     `Run artifacts live in \`${runDir}\`.`,
     '',
+    '- `./.vp-task/bin/await-platform` blocks until the task platform deployments are available.',
     '- `./.vp-task/bin/platform-urls` prints the task-scoped hosts.',
     '- `./.vp-task/bin/redeploy-platform` rebuilds and reapplies the task platform from this clone.',
     '- `./.vp-task/bin/validate-platform` runs the full user/project/task validation flow and writes evidence outside the clone.',
@@ -624,6 +787,7 @@ async function deployPlatform(manifest, phase) {
     stderrPath: path.join(deployDir, 'apply.stderr.log'),
     timeoutMs: 45 * 60 * 1000
   });
+  await waitForTaskPlatformReady(manifest, phase);
   const imagesEnv = await readEnvFile(path.join(manifest.paths.generatedDir, 'images.env'));
   const imageRefs = [imagesEnv.SERVER_IMAGE, imagesEnv.WEB_IMAGE, imagesEnv.WORKER_IMAGE].filter(Boolean);
   manifest.resources.platformImages = Array.from(new Set([...(manifest.resources.platformImages || []), ...imageRefs]));
@@ -652,42 +816,49 @@ async function runCodex(manifest, prompt, model, timeoutMs) {
   const codexDir = path.join(manifest.paths.runDir, 'codex');
   await ensureDir(codexDir);
   const binary = await resolveCodexBinary(repoRoot);
-  const fullPrompt = await buildCodexPrompt(manifest, prompt);
-  const mergedEnv = parseEnv(await fs.readFile(path.join(manifest.repo.cloneDir, '.env'), 'utf8'));
-  const env = {
-    ...process.env,
-    ...mergedEnv
-  };
-  const args = [
-    'exec',
-    '--skip-git-repo-check',
-    '--json',
-    '-o',
-    path.join(codexDir, 'last-message.txt'),
-    '-m',
-    model,
-    '-c',
-    'reasoning.effort="xhigh"',
-    '--dangerously-bypass-approvals-and-sandbox',
-    '-C',
-    manifest.repo.cloneDir
-  ];
-  await spawnLogged({
-    cmd: binary,
-    args,
-    cwd: repoRoot,
-    env,
-    stdinText: fullPrompt,
-    stdoutPath: path.join(codexDir, 'stdout.jsonl'),
-    stderrPath: path.join(codexDir, 'stderr.log'),
-    timeoutMs
-  });
-  manifest.status.codex = {
-    model,
-    completedAt: new Date().toISOString(),
-    lastMessagePath: path.join(codexDir, 'last-message.txt')
-  };
-  await saveManifest(manifest);
+  const codexHome = await prepareCodexHome(manifest);
+  try {
+    const fullPrompt = await buildCodexPrompt(manifest, prompt);
+    const mergedEnv = parseEnv(await fs.readFile(path.join(manifest.repo.cloneDir, '.env'), 'utf8'));
+    const env = {
+      ...process.env,
+      ...mergedEnv,
+      CODEX_HOME: codexHome
+    };
+    const args = [
+      'exec',
+      '--ephemeral',
+      '--skip-git-repo-check',
+      '--json',
+      '-o',
+      path.join(codexDir, 'last-message.txt'),
+      '-m',
+      model,
+      '-c',
+      'reasoning.effort="xhigh"',
+      '--dangerously-bypass-approvals-and-sandbox',
+      '-C',
+      manifest.repo.cloneDir
+    ];
+    await spawnLogged({
+      cmd: binary,
+      args,
+      cwd: repoRoot,
+      env,
+      stdinText: fullPrompt,
+      stdoutPath: path.join(codexDir, 'stdout.jsonl'),
+      stderrPath: path.join(codexDir, 'stderr.log'),
+      timeoutMs
+    });
+    manifest.status.codex = {
+      model,
+      completedAt: new Date().toISOString(),
+      lastMessagePath: path.join(codexDir, 'last-message.txt')
+    };
+    await saveManifest(manifest);
+  } finally {
+    await removePath(codexHome).catch(() => null);
+  }
 }
 
 async function runValidation(manifest, label) {
@@ -917,6 +1088,11 @@ async function cleanupManifest(manifest, { keepClone = false } = {}) {
         errors.push(`schema cleanup: ${error.message}`);
       }
     }
+    try {
+      await restorePlatformNodegroupCapacity(manifest);
+    } catch (error) {
+      errors.push(`platform nodegroup restore: ${error.message}`);
+    }
   }
   if (!keepClone) {
     await removePath(manifest.repo.cloneDir);
@@ -985,6 +1161,7 @@ async function runFlow(args) {
       featureBranch
     });
     await buildTaskOverlay(manifest);
+    await ensurePlatformNodegroupCapacity(manifest);
     await deployPlatform(manifest, 'pre-codex');
     await runCodex(
       manifest,
