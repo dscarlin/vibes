@@ -4522,7 +4522,10 @@ async function deployEnvironment(projectId, environment, commitHash, buildId = n
   const appName = `vibes-app-${projectId}`;
   const namespace = runtimeNamespace(environment);
   const internalHost = `${appName}.${namespace}.svc.cluster.local`;
-  const healthHost = deploymentHealthHost(environment, host, internalHost);
+  const healthHost =
+    options.skipIngress && !isLocalPlatform()
+      ? internalHost
+      : deploymentHealthHost(environment, host, internalHost);
   const healthTimeoutMs = healthTimeoutForHost(healthHost);
   let repoTemp = null;
   let archiveDir = null;
