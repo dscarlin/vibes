@@ -488,8 +488,9 @@ const projectReady = await pollUntil(
 );
 
 const prompt = [
-  `Open the main user-facing web interface and add the exact text "${marker}" somewhere visible in the default page output.`,
+  `Edit \`web/src/App.jsx\` directly and add the exact text "${marker}" somewhere visible in the default page output.`,
   'Keep the change minimal and safe.',
+  'Do not scan generated artifacts, mobile build outputs, or node_modules.',
   'Return a short summary of the file you changed.'
 ].join(' ');
 
