@@ -36,10 +36,20 @@ function normalizeDnsLabelSegment(raw) {
 }
 
 function buildHostLabel(parts, suffix = '') {
-  let base = parts.map((part) => normalizeDnsLabelSegment(part)).filter(Boolean).join('-') || 'app';
+  const normalizedParts = parts.map((part) => normalizeDnsLabelSegment(part)).filter(Boolean);
+  const primary = normalizedParts[0] || 'app';
+  const preservedTail = normalizedParts.slice(1);
   const normalizedSuffix = normalizeDnsLabelSegment(suffix);
   const suffixPart = normalizedSuffix ? `--${normalizedSuffix}` : '';
   const maxBaseLength = Math.max(1, 63 - suffixPart.length);
+  const tail = preservedTail.join('-');
+  const separator = tail ? '-' : '';
+  const primaryBudget = Math.max(1, maxBaseLength - tail.length - separator.length);
+  let trimmedPrimary = primary;
+  if ((primary + separator + tail).length > maxBaseLength) {
+    trimmedPrimary = primary.slice(0, primaryBudget).replace(/-+$/g, '');
+  }
+  let base = [trimmedPrimary, ...preservedTail].filter(Boolean).join('-') || 'app';
   if (base.length > maxBaseLength) {
     base = base.slice(0, maxBaseLength).replace(/-+$/g, '');
   }
@@ -54,7 +64,10 @@ function previewHostForProject(project, metadataEnv, environment = 'development'
   if (!domain) {
     throw new Error('metadata env is missing PROJECT_HOST_DOMAIN/ROOT_HOST');
   }
-  return `${buildHostLabel([slug, environment, shortId], suffix)}.${domain}`;
+  const label = String(environment || '').trim().toLowerCase() === 'production'
+    ? buildHostLabel([slug, shortId], suffix)
+    : buildHostLabel([slug, environment, shortId], suffix);
+  return `${label}.${domain}`;
 }
 
 function deriveProjectDatabaseName(shortId, environment, metadataEnv) {
