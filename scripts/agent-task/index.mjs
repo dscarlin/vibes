@@ -381,6 +381,20 @@ function replaceUpgradeHost(rawUrl, host) {
   }
 }
 
+function agentTaskGuardEnv(manifest) {
+  return {
+    AGENT_TASK_STRICT: 'true',
+    AGENT_TASK_EXPECTED_PLATFORM_NAMESPACE: manifest.task.namespaces.platform,
+    AGENT_TASK_EXPECTED_PLATFORM_SERVER_NAME: manifest.task.workloads.server,
+    AGENT_TASK_EXPECTED_PLATFORM_WEB_NAME: manifest.task.workloads.web,
+    AGENT_TASK_EXPECTED_PLATFORM_WORKER_NAME: manifest.task.workloads.worker,
+    AGENT_TASK_EXPECTED_PLATFORM_REDIS_NAME: manifest.task.workloads.redis,
+    AGENT_TASK_EXPECTED_ROOT_HOST: manifest.task.hosts.root,
+    AGENT_TASK_EXPECTED_APP_HOST: manifest.task.hosts.app,
+    AGENT_TASK_EXPECTED_API_HOST: manifest.task.hosts.api
+  };
+}
+
 function dbParts(databaseUrl) {
   const url = new URL(String(databaseUrl || ''));
   return {
@@ -901,7 +915,8 @@ async function buildTaskOverlay(manifest) {
   const mergedRootEnv = {
     ...taskServerEnv,
     ...taskWorkerEnv,
-    ...taskWebEnv
+    ...taskWebEnv,
+    ...agentTaskGuardEnv(manifest)
   };
   await Promise.all([
     writeEnvFile(path.join(cloneDir, '.env'), mergedRootEnv),
@@ -936,6 +951,10 @@ async function writeTaskCommands(cloneDir, manifest) {
   const runDir = manifest.paths.runDir;
   const generatedDir = manifest.paths.generatedDir;
   const generatedEnv = `REPLICA_OUTPUT_DIR=${shellQuote(generatedDir)}`;
+  const guardEnv = agentTaskGuardEnv(manifest);
+  const guardExports = Object.entries(guardEnv)
+    .map(([key, value]) => `export ${key}=${shellQuote(value)}`)
+    .join('\n');
   const featureValidationCommand = String(manifest.request?.featureValidationCommand || '').trim();
 
   const scripts = {
@@ -970,6 +989,7 @@ echo "  https://${manifest.task.hosts.api}"
 set -eu
 cd ${shellQuote(manifest.repo.cloneDir)}
 export ${generatedEnv}
+${guardExports}
 export REPLICA_IMAGE_TAG="task-${manifest.task.slug}-manual-$(date -u +%Y%m%d%H%M%S)"
 ./deploy/build-push.sh
 ./deploy/apply-platform.sh
@@ -1048,7 +1068,8 @@ async function deployPlatform(manifest, phase) {
   const env = {
     ...process.env,
     REPLICA_OUTPUT_DIR: manifest.paths.generatedDir,
-    REPLICA_IMAGE_TAG: imageTagForPhase(manifest, phase)
+    REPLICA_IMAGE_TAG: imageTagForPhase(manifest, phase),
+    ...agentTaskGuardEnv(manifest)
   };
   await spawnLogged({
     cmd: 'sh',
@@ -1578,6 +1599,7 @@ async function cleanupManifest(manifest, { keepClone = false } = {}) {
           env: {
             ...process.env,
             REPLICA_OUTPUT_DIR: manifest.paths.generatedDir,
+            ...agentTaskGuardEnv(manifest),
             DELETE_PLATFORM_CLUSTER_ROLES: 'false',
             SKIP_REPLICA_KUBECONFIG_UPDATE: 'true'
           },
@@ -2018,6 +2040,7 @@ export {
   ensureManifestDefaults,
   overallRunStatus,
   parseArgs,
+  agentTaskGuardEnv,
   shouldRunCleanupStage,
   validationWarningsFromArtifacts
 };

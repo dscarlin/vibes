@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  agentTaskGuardEnv,
   buildTaskContext,
   cleanupCompletedCleanly,
   deriveTaskSlug,
@@ -48,6 +49,39 @@ test('buildTaskContext produces namespaced hosts and runtime namespaces', () => 
   assert.equal(context.namespaces.platform, 'vibes-task-task-demo');
   assert.equal(context.namespaces.development, 'vibes-task-task-demo-dev');
   assert.equal(context.projectDatabasePrefix, 'vibes_task_task_demo');
+});
+
+test('agentTaskGuardEnv encodes the expected task target contract', () => {
+  const manifest = {
+    task: {
+      namespaces: {
+        platform: 'vibes-task-demo'
+      },
+      workloads: {
+        server: 'vibes-server-demo',
+        web: 'vibes-web-demo',
+        worker: 'vibes-worker-demo',
+        redis: 'redis-demo'
+      },
+      hosts: {
+        root: 'task-demo.vibesplatform.ai',
+        app: 'app-task-demo.vibesplatform.ai',
+        api: 'api-task-demo.vibesplatform.ai'
+      }
+    }
+  };
+
+  assert.deepEqual(agentTaskGuardEnv(manifest), {
+    AGENT_TASK_STRICT: 'true',
+    AGENT_TASK_EXPECTED_PLATFORM_NAMESPACE: 'vibes-task-demo',
+    AGENT_TASK_EXPECTED_PLATFORM_SERVER_NAME: 'vibes-server-demo',
+    AGENT_TASK_EXPECTED_PLATFORM_WEB_NAME: 'vibes-web-demo',
+    AGENT_TASK_EXPECTED_PLATFORM_WORKER_NAME: 'vibes-worker-demo',
+    AGENT_TASK_EXPECTED_PLATFORM_REDIS_NAME: 'redis-demo',
+    AGENT_TASK_EXPECTED_ROOT_HOST: 'task-demo.vibesplatform.ai',
+    AGENT_TASK_EXPECTED_APP_HOST: 'app-task-demo.vibesplatform.ai',
+    AGENT_TASK_EXPECTED_API_HOST: 'api-task-demo.vibesplatform.ai'
+  });
 });
 
 test('validationWarningsFromArtifacts fails closed for workspace preview leftovers', () => {

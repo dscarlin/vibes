@@ -134,6 +134,63 @@ source_env_file() {
   set +a
 }
 
+assert_agent_task_platform_target() {
+  if [ "${AGENT_TASK_STRICT:-false}" != "true" ]; then
+    return 0
+  fi
+
+  expected_platform_namespace="${AGENT_TASK_EXPECTED_PLATFORM_NAMESPACE:-}"
+  expected_server_name="${AGENT_TASK_EXPECTED_PLATFORM_SERVER_NAME:-}"
+  expected_web_name="${AGENT_TASK_EXPECTED_PLATFORM_WEB_NAME:-}"
+  expected_worker_name="${AGENT_TASK_EXPECTED_PLATFORM_WORKER_NAME:-}"
+  expected_redis_name="${AGENT_TASK_EXPECTED_PLATFORM_REDIS_NAME:-}"
+  expected_root_host="${AGENT_TASK_EXPECTED_ROOT_HOST:-}"
+  expected_app_host="${AGENT_TASK_EXPECTED_APP_HOST:-}"
+  expected_api_host="${AGENT_TASK_EXPECTED_API_HOST:-}"
+
+  for expected_name in \
+    AGENT_TASK_EXPECTED_PLATFORM_NAMESPACE \
+    AGENT_TASK_EXPECTED_PLATFORM_SERVER_NAME \
+    AGENT_TASK_EXPECTED_PLATFORM_WEB_NAME \
+    AGENT_TASK_EXPECTED_PLATFORM_WORKER_NAME \
+    AGENT_TASK_EXPECTED_PLATFORM_REDIS_NAME; do
+    expected_value="$(eval "printf '%s' \"\${$expected_name:-}\"")"
+    if [ -z "$expected_value" ]; then
+      die "AGENT_TASK_STRICT requires ${expected_name} to be set"
+    fi
+  done
+
+  if [ "$expected_platform_namespace" = "vibes-platform" ]; then
+    die "AGENT_TASK_STRICT refuses to target the shared vibes-platform namespace"
+  fi
+
+  if [ "${PLATFORM_NAMESPACE:-}" != "$expected_platform_namespace" ]; then
+    die "AGENT_TASK_STRICT namespace mismatch: expected ${expected_platform_namespace}, got ${PLATFORM_NAMESPACE:-<empty>}"
+  fi
+  if [ "${PLATFORM_SERVER_NAME:-}" != "$expected_server_name" ]; then
+    die "AGENT_TASK_STRICT server mismatch: expected ${expected_server_name}, got ${PLATFORM_SERVER_NAME:-<empty>}"
+  fi
+  if [ "${PLATFORM_WEB_NAME:-}" != "$expected_web_name" ]; then
+    die "AGENT_TASK_STRICT web mismatch: expected ${expected_web_name}, got ${PLATFORM_WEB_NAME:-<empty>}"
+  fi
+  if [ "${PLATFORM_WORKER_NAME:-}" != "$expected_worker_name" ]; then
+    die "AGENT_TASK_STRICT worker mismatch: expected ${expected_worker_name}, got ${PLATFORM_WORKER_NAME:-<empty>}"
+  fi
+  if [ "${PLATFORM_REDIS_NAME:-}" != "$expected_redis_name" ]; then
+    die "AGENT_TASK_STRICT redis mismatch: expected ${expected_redis_name}, got ${PLATFORM_REDIS_NAME:-<empty>}"
+  fi
+
+  if [ -n "$expected_root_host" ] && [ "${ROOT_HOST:-}" != "$expected_root_host" ]; then
+    die "AGENT_TASK_STRICT root host mismatch: expected ${expected_root_host}, got ${ROOT_HOST:-<empty>}"
+  fi
+  if [ -n "$expected_app_host" ] && [ "${APP_HOST:-}" != "$expected_app_host" ]; then
+    die "AGENT_TASK_STRICT app host mismatch: expected ${expected_app_host}, got ${APP_HOST:-<empty>}"
+  fi
+  if [ -n "$expected_api_host" ] && [ "${API_HOST:-}" != "$expected_api_host" ]; then
+    die "AGENT_TASK_STRICT api host mismatch: expected ${expected_api_host}, got ${API_HOST:-<empty>}"
+  fi
+}
+
 export_layer1_tf_vars() {
   export TF_VAR_aws_region="$REPLICA_AWS_REGION"
   export TF_VAR_name_prefix="$REPLICA_NAME_PREFIX"
