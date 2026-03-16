@@ -107,6 +107,35 @@ async function readPrompt(args) {
   throw new Error('Provide --prompt or --prompt-file');
 }
 
+async function ensureKubeAccess() {
+  try {
+    await runCommand('kubectl', ['get', 'ns', '--request-timeout=15s']);
+    return;
+  } catch (originalError) {
+    const metadataPath = path.join(repoRoot, 'deploy', '.generated', 'replica', 'metadata.env');
+    let region = 'us-east-1';
+    if (await pathExists(metadataPath)) {
+      const metadata = await readEnvFile(metadataPath);
+      region = String(metadata.AWS_REGION || region).trim() || region;
+    }
+    let clusters = [];
+    try {
+      const { stdout } = await runCommand('aws', ['eks', 'list-clusters', '--region', region, '--output', 'json']);
+      const payload = JSON.parse(stdout || '{}');
+      clusters = Array.isArray(payload?.clusters) ? payload.clusters : [];
+    } catch {}
+    if (clusters.length === 1) {
+      const clusterName = String(clusters[0] || '').trim();
+      if (!clusterName) throw originalError;
+      await runCommand('aws', ['eks', 'update-kubeconfig', '--region', region, '--name', clusterName, '--alias', clusterName]);
+      await runCommand('kubectl', ['config', 'use-context', clusterName]);
+      await runCommand('kubectl', ['get', 'ns', '--request-timeout=15s']);
+      return;
+    }
+    throw originalError;
+  }
+}
+
 async function saveManifest(manifest) {
   await writeJson(manifest.paths.manifestPath, manifest);
 }
@@ -890,6 +919,7 @@ async function cleanupManifest(manifest, { keepClone = false } = {}) {
 }
 
 async function runFlow(args) {
+  await ensureKubeAccess();
   const baseBranch = String(args.base || 'main');
   const featureBranch = requiredArg(args, 'branch');
   const prompt = await readPrompt(args);
