@@ -203,7 +203,15 @@ async function createClone({ sourceRepoRoot, originUrl, cloneDir, baseBranch, fe
   await runCommand('git', ['clone', sourceRepoRoot, cloneDir], { cwd: sourceRepoRoot });
   await runCommand('git', ['remote', 'set-url', 'origin', originUrl], { cwd: cloneDir });
   await runCommand('git', ['fetch', 'origin', '--prune'], { cwd: cloneDir });
-  await runCommand('git', ['checkout', '-B', baseBranch, `origin/${baseBranch}`], { cwd: cloneDir });
+  let checkoutRef = `origin/${baseBranch}`;
+  try {
+    await runCommand('git', ['rev-parse', '--verify', checkoutRef], { cwd: cloneDir });
+  } catch {
+    checkoutRef = await gitOutput(sourceRepoRoot, ['rev-parse', '--verify', baseBranch]).catch(async () => {
+      return gitOutput(sourceRepoRoot, ['rev-parse', '--verify', 'HEAD']);
+    });
+  }
+  await runCommand('git', ['checkout', '-B', baseBranch, checkoutRef], { cwd: cloneDir });
   await runCommand('git', ['checkout', '-b', featureBranch], { cwd: cloneDir });
 }
 
