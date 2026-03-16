@@ -1,9 +1,7 @@
 #!/usr/bin/env node
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { Client } from 'pg';
 import {
-  applyTaskContextToDatabaseUrl,
   ensureDir,
   gitOutput,
   parseEnv,
@@ -191,52 +189,110 @@ function replaceUpgradeHost(rawUrl, host) {
   }
 }
 
-async function createSchema(databaseUrl, schema) {
-  const client = new Client({ connectionString: databaseUrl });
-  await client.connect();
+function dbParts(databaseUrl) {
+  const url = new URL(String(databaseUrl || ''));
+  return {
+    host: url.hostname,
+    port: String(url.port || 5432),
+    user: decodeURIComponent(url.username || ''),
+    password: decodeURIComponent(url.password || ''),
+    database: String(url.pathname || '').replace(/^\//, '') || 'postgres'
+  };
+}
+
+async function runSqlThroughCluster(manifest, databaseUrl, sql, { namespace = '' } = {}) {
+  const kubeNamespace = namespace || manifest.task?.namespaces?.platform || 'vibes-platform';
+  const parts = dbParts(databaseUrl);
+  const podName = `agent-task-db-${manifest.task?.slug || 'task'}-${shortRandom(4)}`;
+  await runCommand('sh', [
+    '-lc',
+    `kubectl create namespace ${shellQuote(kubeNamespace)} --dry-run=client -o yaml | kubectl apply -f -`
+  ]);
   try {
-    await client.query(`create schema if not exists ${quoteIdent(schema)} authorization current_user`);
+    await runCommand('sh', [
+      '-lc',
+      [
+        `kubectl -n ${shellQuote(kubeNamespace)} run ${shellQuote(podName)}`,
+        '--image=postgres:16',
+        '--restart=Never',
+        `--env=PGHOST=${shellQuote(parts.host)}`,
+        `--env=PGPORT=${shellQuote(parts.port)}`,
+        `--env=PGUSER=${shellQuote(parts.user)}`,
+        `--env=PGPASSWORD=${shellQuote(parts.password)}`,
+        '--env=PGSSLMODE=require',
+        '--dry-run=client -o yaml --command -- sleep 600',
+        '| kubectl apply -f -'
+      ].join(' ')
+    ]);
+    await runCommand('kubectl', ['-n', kubeNamespace, 'wait', '--for=condition=Ready', `pod/${podName}`, '--timeout=180s']);
+    await runCommand('kubectl', [
+      '-n',
+      kubeNamespace,
+      'exec',
+      podName,
+      '--',
+      'sh',
+      '-lc',
+      `psql -v ON_ERROR_STOP=1 -d ${shellQuote(parts.database)} <<'SQL'\n${sql}\nSQL`
+    ]);
   } finally {
-    await client.end();
+    await runCommand('kubectl', [
+      '-n',
+      kubeNamespace,
+      'delete',
+      'pod',
+      podName,
+      '--ignore-not-found',
+      '--wait=false',
+      '--grace-period=0',
+      '--force'
+    ]).catch(() => null);
   }
 }
 
-async function dropSchema(databaseUrl, schema) {
-  const client = new Client({ connectionString: databaseUrl });
-  await client.connect();
-  try {
-    await client.query(`drop schema if exists ${quoteIdent(schema)} cascade`);
-  } finally {
-    await client.end();
-  }
+async function createSchema(manifest, databaseUrl, schema) {
+  await runSqlThroughCluster(
+    manifest,
+    databaseUrl,
+    `create schema if not exists ${quoteIdent(schema)} authorization current_user;`
+  );
 }
 
-async function deleteValidationUser(databaseUrl, email) {
+async function dropSchema(manifest, databaseUrl, schema) {
+  await runSqlThroughCluster(
+    manifest,
+    databaseUrl,
+    `drop schema if exists ${quoteIdent(schema)} cascade;`
+  );
+}
+
+async function deleteValidationUser(manifest, databaseUrl, schema, email) {
   if (!email) return;
-  const client = new Client({ connectionString: databaseUrl });
-  await client.connect();
-  try {
-    await client.query('delete from users where email = $1', [email]);
-  } finally {
-    await client.end();
-  }
+  const escapedEmail = String(email).replace(/'/g, "''");
+  await runSqlThroughCluster(
+    manifest,
+    databaseUrl,
+    `set search_path to ${quoteIdent(schema)}, public;\ndelete from users where email = '${escapedEmail}';`
+  );
 }
 
-async function dropDatabases(adminUrl, databases = []) {
+async function dropDatabases(manifest, adminUrl, databases = []) {
   if (!databases.length) return;
-  const client = new Client({ connectionString: adminUrl });
-  await client.connect();
-  try {
-    for (const database of databases) {
-      if (!database) continue;
-      try {
-        await client.query(`drop database if exists ${quoteIdent(database)} with (force)`);
-      } catch {
-        await client.query(`drop database if exists ${quoteIdent(database)}`);
-      }
+  for (const database of databases) {
+    if (!database) continue;
+    try {
+      await runSqlThroughCluster(
+        manifest,
+        adminUrl,
+        `drop database if exists ${quoteIdent(database)} with (force);`
+      );
+    } catch {
+      await runSqlThroughCluster(
+        manifest,
+        adminUrl,
+        `drop database if exists ${quoteIdent(database)};`
+      ).catch(() => null);
     }
-  } finally {
-    await client.end();
   }
 }
 
@@ -294,12 +350,12 @@ async function buildTaskOverlay(manifest) {
 
   manifest.task = buildTaskContext(baseMetadata, manifest.repo.featureBranch, manifest.task.slug);
   manifest.database = {
-    baseDatabaseUrl: applyTaskContextToDatabaseUrl(baseServerEnv.DATABASE_URL, repoRoot),
-    taskDatabaseUrl: applyTaskContextToDatabaseUrl(withSearchPath(baseServerEnv.DATABASE_URL, manifest.task.schema), repoRoot),
-    customerAdminUrl: applyTaskContextToDatabaseUrl(baseWorkerEnv.CUSTOMER_DB_ADMIN_URL, repoRoot)
+    baseDatabaseUrl: baseServerEnv.DATABASE_URL,
+    taskDatabaseUrl: withSearchPath(baseServerEnv.DATABASE_URL, manifest.task.schema),
+    customerAdminUrl: baseWorkerEnv.CUSTOMER_DB_ADMIN_URL
   };
 
-  await createSchema(manifest.database.baseDatabaseUrl, manifest.task.schema);
+  await createSchema(manifest, manifest.database.baseDatabaseUrl, manifest.task.schema);
   manifest.resources.platformSchema = {
     schema: manifest.task.schema,
     created: true
@@ -648,8 +704,8 @@ async function cleanupValidation(manifest) {
   const databaseNames = Array.isArray(summary?.project?.databases)
     ? summary.project.databases.map((entry) => entry.db_name).filter(Boolean)
     : [];
-  await dropDatabases(manifest.database.customerAdminUrl, databaseNames);
-  await deleteValidationUser(manifest.database.taskDatabaseUrl, summary?.user?.email || '');
+  await dropDatabases(manifest, manifest.database.customerAdminUrl, databaseNames);
+  await deleteValidationUser(manifest, manifest.database.baseDatabaseUrl, manifest.task.schema, summary?.user?.email || '');
   manifest.cleanup.validation = {
     completedAt: new Date().toISOString(),
     databases: databaseNames
@@ -790,7 +846,8 @@ async function cleanupManifest(manifest, { keepClone = false } = {}) {
         env: {
           ...process.env,
           REPLICA_OUTPUT_DIR: manifest.paths.generatedDir,
-          DELETE_PLATFORM_CLUSTER_ROLES: 'false'
+          DELETE_PLATFORM_CLUSTER_ROLES: 'false',
+          SKIP_REPLICA_KUBECONFIG_UPDATE: 'true'
         },
         stdoutPath: path.join(manifest.paths.runDir, 'cleanup', 'destroy.stdout.log'),
         stderrPath: path.join(manifest.paths.runDir, 'cleanup', 'destroy.stderr.log'),
@@ -811,7 +868,7 @@ async function cleanupManifest(manifest, { keepClone = false } = {}) {
     }
     if (manifest.database?.baseDatabaseUrl && manifest.task?.schema) {
       try {
-        await dropSchema(manifest.database.baseDatabaseUrl, manifest.task.schema);
+        await dropSchema(manifest, manifest.database.baseDatabaseUrl, manifest.task.schema);
       } catch (error) {
         errors.push(`schema cleanup: ${error.message}`);
       }

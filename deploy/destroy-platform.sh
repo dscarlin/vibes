@@ -7,7 +7,9 @@ REPO_ROOT="$(CDPATH='' cd -- "$SCRIPT_DIR/.." && pwd)"
 
 require_cmd kubectl
 
-update_kubeconfig_for_replica || true
+if [ "${SKIP_REPLICA_KUBECONFIG_UPDATE:-false}" != "true" ]; then
+  update_kubeconfig_for_replica || true
+fi
 
 if [ -f "$METADATA_ENV_FILE" ]; then
   source_env_file "$METADATA_ENV_FILE"
