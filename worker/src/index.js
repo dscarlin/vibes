@@ -2202,7 +2202,10 @@ async function fastResumeEnvironment(projectId, environment, commitHash, buildId
   const appName = `vibes-app-${projectId}`;
   const namespace = runtimeNamespace(environment);
   const internalHost = `${appName}.${namespace}.svc.cluster.local`;
-  const healthHost = deploymentHealthHost(environment, host, internalHost);
+  const healthHost =
+    options.skipIngress && !isLocalPlatform()
+      ? internalHost
+      : deploymentHealthHost(environment, host, internalHost);
   const healthTimeoutMs = healthTimeoutForHost(healthHost);
   const appPort = Number(envVars.PORT || process.env.PORT || 3000);
   await ensureBuildNotCancelled(buildId);
