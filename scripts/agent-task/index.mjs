@@ -31,6 +31,12 @@ const repoRoot = repoRootFrom(import.meta.url);
 const promptTemplatePath = path.join(repoRoot, 'scripts', 'agent-task', 'codex-wrapper-prompt.txt');
 const PLATFORM_NODEGROUP_NAME = 'platform-core';
 const MIN_PLATFORM_NODE_COUNT = 2;
+const DEFAULT_NOTIFY_EMAIL = 'ottobotowner@gmail.com';
+const DEFAULT_NOTIFY_ON = 'always';
+const DEFAULT_NOTIFY_FROM_EMAIL = 'noreply@vibesplatform.ai';
+const DEFAULT_NOTIFY_REPLY_TO = 'ottobotowner@gmail.com';
+const DEFAULT_NOTIFY_REGION = 'us-east-1';
+const NOTIFY_MODES = new Set(['always', 'success', 'failure', 'never']);
 
 function usage() {
   console.error(
@@ -49,6 +55,8 @@ function usage() {
       '  --timeout-minutes <minutes>',
       '  --feature-validation-cmd <shell command>',
       '  --feature-validation-file <path>',
+      '  --notify-email <email>',
+      '  --notify-on <always|success|failure|never>',
       '  --skip-push',
       '  --skip-cleanup',
       '  --keep-clone'
@@ -103,6 +111,36 @@ function requiredArg(args, key) {
     throw new Error(`Missing required argument: --${key.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`)}`);
   }
   return value;
+}
+
+function normalizeNotifyOn(value) {
+  const normalized = String(value || DEFAULT_NOTIFY_ON).trim().toLowerCase();
+  if (NOTIFY_MODES.has(normalized)) return normalized;
+  throw new Error(`Invalid --notify-on value: ${value}`);
+}
+
+function resolveNotificationSettings(args = {}, stored = {}) {
+  return {
+    email: String(args.notifyEmail || stored.notifyEmail || DEFAULT_NOTIFY_EMAIL).trim() || DEFAULT_NOTIFY_EMAIL,
+    notifyOn: normalizeNotifyOn(args.notifyOn || stored.notifyOn || DEFAULT_NOTIFY_ON),
+    fromEmail: DEFAULT_NOTIFY_FROM_EMAIL,
+    replyTo: DEFAULT_NOTIFY_REPLY_TO,
+    region: DEFAULT_NOTIFY_REGION
+  };
+}
+
+function notificationShouldSend(status, notifyOn) {
+  const normalizedStatus = String(status || '').trim().toLowerCase();
+  const normalizedNotifyOn = normalizeNotifyOn(notifyOn);
+  if (normalizedNotifyOn === 'never') return false;
+  if (normalizedNotifyOn === 'always') return true;
+  if (normalizedNotifyOn === 'success') {
+    return normalizedStatus === 'succeeded' || normalizedStatus === 'completed_unpublished';
+  }
+  if (normalizedNotifyOn === 'failure') {
+    return normalizedStatus === 'failed' || normalizedStatus === 'validation_warning';
+  }
+  return true;
 }
 
 async function readPrompt(args) {
@@ -1368,7 +1406,9 @@ async function writeRunReport(manifest) {
       skipPush: Boolean(manifest.request?.skipPush),
       skipCleanup: Boolean(manifest.request?.skipCleanup),
       keepClone: Boolean(manifest.request?.keepClone),
-      featureValidationConfigured: Boolean(manifest.request?.featureValidationCommand)
+      featureValidationConfigured: Boolean(manifest.request?.featureValidationCommand),
+      notifyEmail: manifest.request?.notifyEmail || null,
+      notifyOn: manifest.request?.notifyOn || null
     },
     stages: manifest.stages || {},
     publish: manifest.status?.publish || null,
@@ -1386,6 +1426,7 @@ async function writeRunReport(manifest) {
         : null
     },
     featureValidation: manifest.featureValidation || null,
+    notifications: manifest.notifications || null,
     cleanup: manifest.cleanup || {},
     paths: {
       manifestPath: manifest.paths.manifestPath,
@@ -1396,6 +1437,251 @@ async function writeRunReport(manifest) {
     lastError: manifest.status?.lastError || null
   };
   await writeJson(manifest.paths.reportPath, report);
+}
+
+function formatStageSummary(stages = {}) {
+  return Object.entries(stages)
+    .map(([name, stage]) => `${name}: ${stage?.status || 'unknown'}`)
+    .join('\n');
+}
+
+function runNotificationSubject(command, manifest, report) {
+  return `[agent-task:${report.status}] ${manifest.repo?.featureBranch || manifest.runId} (${command})`;
+}
+
+function runNotificationBody(command, manifest, report) {
+  const validationWarnings = Array.isArray(report?.validation?.warnings) ? report.validation.warnings : [];
+  const cleanupErrors = Array.isArray(report?.cleanup?.errors) ? report.cleanup.errors : [];
+  return [
+    'Vibes Platform agent-task notification',
+    '',
+    `Command: ${command}`,
+    `Generated: ${new Date().toISOString()}`,
+    `Status: ${report.status}`,
+    `Next action: ${report.nextAction || ''}`,
+    '',
+    `Run ID: ${manifest.runId}`,
+    `Feature branch: ${manifest.repo?.featureBranch || ''}`,
+    `Base branch: ${manifest.repo?.baseBranch || ''}`,
+    `Model: ${manifest.request?.model || ''}`,
+    `Notify email: ${manifest.request?.notifyEmail || DEFAULT_NOTIFY_EMAIL}`,
+    `Notify on: ${manifest.request?.notifyOn || DEFAULT_NOTIFY_ON}`,
+    '',
+    `Commit: ${report.publish?.commitHash || 'not committed'}`,
+    `Remote verified: ${report.publish?.remoteVerifiedAt || 'no'}`,
+    `Cleanup completed: ${report.cleanup?.completedAt || 'no'}`,
+    `Cleanup errors: ${cleanupErrors.length ? cleanupErrors.join(' | ') : 'none'}`,
+    `Validation warnings: ${validationWarnings.length ? validationWarnings.join(', ') : 'none'}`,
+    '',
+    'Artifacts:',
+    `Report: ${manifest.paths?.reportPath || ''}`,
+    `Manifest: ${manifest.paths?.manifestPath || ''}`,
+    `Run dir: ${manifest.paths?.runDir || ''}`,
+    '',
+    'Stages:',
+    formatStageSummary(report.stages || {}),
+    '',
+    `Last error: ${report.lastError?.message || 'none'}`
+  ].join('\n');
+}
+
+function domainFromEmailAddress(value) {
+  const parts = String(value || '').trim().toLowerCase().split('@');
+  if (parts.length !== 2 || !parts[1]) return '';
+  return parts[1];
+}
+
+function sesSenderIdentityCandidates(fromEmail) {
+  return Array.from(new Set([String(fromEmail || '').trim(), domainFromEmailAddress(fromEmail)].filter(Boolean)));
+}
+
+async function readSesIdentity(region, identity) {
+  try {
+    const { stdout } = await runCommand('aws', ['sesv2', 'get-email-identity', '--region', region, '--email-identity', identity]);
+    return stdout ? JSON.parse(stdout) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function assertSesSenderIdentity(region, fromEmail) {
+  let pendingIdentity = '';
+  for (const candidate of sesSenderIdentityCandidates(fromEmail)) {
+    const identity = await readSesIdentity(region, candidate);
+    if (!identity) continue;
+    if (identity.VerifiedForSendingStatus) return candidate;
+    pendingIdentity = candidate;
+  }
+  if (pendingIdentity) {
+    throw new Error(
+      `SES sender identity exists but is not verified for ${pendingIdentity}. Finish SES verification before using CLI email notifications.`
+    );
+  }
+  throw new Error(
+    `SES sender identity is not configured for ${fromEmail} or its domain ${domainFromEmailAddress(fromEmail)}. Verify the sender identity in SES before using CLI email notifications.`
+  );
+}
+
+async function sendSesEmail({ subject, bodyText, toAddress, fromEmail, replyTo, region, evidenceDir, prefix }) {
+  await ensureDir(evidenceDir);
+  const stamp = `${timestampSlug()}-${shortRandom(6)}`;
+  const payloadPath = path.join(evidenceDir, `${prefix}-${stamp}.payload.json`);
+  const responsePath = path.join(evidenceDir, `${prefix}-${stamp}.response.json`);
+  await assertSesSenderIdentity(region, fromEmail);
+  const { stdout: accountStdout } = await runCommand('aws', ['sesv2', 'get-account', '--region', region]);
+  const account = accountStdout ? JSON.parse(accountStdout) : {};
+  if (!account?.ProductionAccessEnabled) {
+    try {
+      await runCommand('aws', ['sesv2', 'get-email-identity', '--region', region, '--email-identity', toAddress]);
+    } catch {
+      throw new Error(
+        `SES account is still in sandbox mode and the recipient identity ${toAddress} is not verified. Verify the recipient or move SES out of sandbox before using CLI email notifications.`
+      );
+    }
+  }
+  const payload = {
+    FromEmailAddress: fromEmail,
+    Destination: {
+      ToAddresses: [toAddress]
+    },
+    ReplyToAddresses: [replyTo],
+    Content: {
+      Simple: {
+        Subject: {
+          Data: subject,
+          Charset: 'UTF-8'
+        },
+        Body: {
+          Text: {
+            Data: bodyText,
+            Charset: 'UTF-8'
+          }
+        }
+      }
+    }
+  };
+  await writeJson(payloadPath, payload);
+  const { stdout } = await runCommand('aws', [
+    'sesv2',
+    'send-email',
+    '--region',
+    region,
+    '--cli-input-json',
+    `file://${payloadPath}`
+  ]);
+  const response = stdout ? JSON.parse(stdout) : {};
+  await writeJson(responsePath, response);
+  return {
+    payloadPath,
+    responsePath,
+    response,
+    sentAt: new Date().toISOString()
+  };
+}
+
+async function sendRunNotification(manifest, args, command) {
+  if (!manifest?.paths?.reportPath) return;
+  const settings = resolveNotificationSettings(args, manifest.request || {});
+  const report = await readJson(manifest.paths.reportPath).catch(async () => {
+    await writeRunReport(manifest);
+    return readJson(manifest.paths.reportPath);
+  });
+  const shouldSend = notificationShouldSend(report.status, settings.notifyOn);
+  const notifications = Array.isArray(manifest.notifications?.attempts) ? manifest.notifications.attempts : [];
+  const evidenceDir = path.join(manifest.paths.runDir, 'notifications');
+  const attempt = {
+    command,
+    at: new Date().toISOString(),
+    notifyEmail: settings.email,
+    notifyOn: settings.notifyOn,
+    fromEmail: settings.fromEmail,
+    replyTo: settings.replyTo,
+    status: shouldSend ? 'pending' : 'skipped',
+    reason: shouldSend ? '' : `notify_on_${settings.notifyOn}`
+  };
+
+  if (shouldSend) {
+    try {
+      const result = await sendSesEmail({
+        subject: runNotificationSubject(command, manifest, report),
+        bodyText: runNotificationBody(command, manifest, report),
+        toAddress: settings.email,
+        fromEmail: settings.fromEmail,
+        replyTo: settings.replyTo,
+        region: settings.region,
+        evidenceDir,
+        prefix: command
+      });
+      attempt.status = 'sent';
+      attempt.payloadPath = result.payloadPath;
+      attempt.responsePath = result.responsePath;
+      attempt.messageId = result.response?.MessageId || null;
+      attempt.sentAt = result.sentAt;
+    } catch (error) {
+      attempt.status = 'failed';
+      attempt.error = serializeError(error);
+      console.error(`agent-task notification failed: ${error.message}`);
+    }
+  }
+
+  manifest.notifications = {
+    ...(manifest.notifications || {}),
+    attempts: [...notifications, attempt]
+  };
+  await saveManifest(manifest);
+}
+
+function janitorNotificationSubject({ apply, candidates }) {
+  const action = apply ? 'apply' : 'dry-run';
+  return `[agent-task:janitor] ${action} ${candidates.length} candidate(s)`;
+}
+
+function janitorNotificationBody({ runsRoot, olderThanHours, apply, keepClone, janitorReportPath, candidates }) {
+  return [
+    'Vibes Platform agent-task janitor notification',
+    '',
+    `Generated: ${new Date().toISOString()}`,
+    `Mode: ${apply ? 'apply' : 'dry-run'}`,
+    `Runs root: ${runsRoot}`,
+    `Older-than hours: ${olderThanHours}`,
+    `Keep clone: ${keepClone}`,
+    `Candidate count: ${candidates.length}`,
+    `Report: ${janitorReportPath}`,
+    '',
+    'Candidates:',
+    ...(candidates.length
+      ? candidates.map((candidate) =>
+          [
+            `- ${candidate.runId}`,
+            `  reasons: ${(candidate.reasons || []).join(', ') || 'none'}`,
+            `  applied: ${candidate.applied ? 'yes' : 'no'}`,
+            `  error: ${candidate.error?.message || 'none'}`,
+            `  manifest: ${candidate.manifestPath || ''}`
+          ].join('\n')
+        )
+      : ['- none'])
+  ].join('\n');
+}
+
+async function sendJanitorNotification(args, details) {
+  const settings = resolveNotificationSettings(args, {});
+  const status = details.apply && details.candidates.some((candidate) => candidate.error) ? 'failed' : 'succeeded';
+  if (!notificationShouldSend(status, settings.notifyOn)) return;
+  const evidenceDir = path.join(details.runsRoot, 'janitor');
+  try {
+    await sendSesEmail({
+      subject: janitorNotificationSubject(details),
+      bodyText: janitorNotificationBody(details),
+      toAddress: settings.email,
+      fromEmail: settings.fromEmail,
+      replyTo: settings.replyTo,
+      region: settings.region,
+      evidenceDir,
+      prefix: 'janitor'
+    });
+  } catch (error) {
+    console.error(`agent-task janitor notification failed: ${error.message}`);
+  }
 }
 
 async function cleanupValidation(manifest) {
@@ -1710,7 +1996,9 @@ async function createRunManifest(args) {
       skipPush: Boolean(args.skipPush),
       skipCleanup: Boolean(args.skipCleanup),
       keepClone: Boolean(args.keepClone),
-      featureValidationCommand
+      featureValidationCommand,
+      notifyEmail: resolveNotificationSettings(args, {}).email,
+      notifyOn: resolveNotificationSettings(args, {}).notifyOn
     },
     repo: {
       sourceRoot: repoRoot,
@@ -1892,26 +2180,50 @@ async function executeRun(manifest, args = {}) {
 async function runFlow(args) {
   await ensureKubeAccess();
   const manifest = await createRunManifest(args);
-  await executeRun(manifest, args);
+  let primaryError = null;
+  try {
+    await executeRun(manifest, args);
+  } catch (error) {
+    primaryError = error;
+  } finally {
+    await sendRunNotification(manifest, args, 'run');
+  }
+  if (primaryError) throw primaryError;
 }
 
 async function resumeFlow(args) {
   await ensureKubeAccess();
   const manifest = await loadManifestForResume(requiredArg(args, 'manifest'));
-  await executeRun(manifest, args);
+  let primaryError = null;
+  try {
+    await executeRun(manifest, args);
+  } catch (error) {
+    primaryError = error;
+  } finally {
+    await sendRunNotification(manifest, args, 'resume');
+  }
+  if (primaryError) throw primaryError;
 }
 
 async function cleanupFlow(args) {
   const manifest = await loadManifestForResume(requiredArg(args, 'manifest'));
-  await runStage(
-    manifest,
-    'cleanup',
-    async () => {
-      await cleanupManifest(manifest, { keepClone: Boolean(args.keepClone) });
-      return manifest.cleanup;
-    },
-    { skipIfComplete: false, details: { keepClone: Boolean(args.keepClone) } }
-  );
+  let primaryError = null;
+  try {
+    await runStage(
+      manifest,
+      'cleanup',
+      async () => {
+        await cleanupManifest(manifest, { keepClone: Boolean(args.keepClone) });
+        return manifest.cleanup;
+      },
+      { skipIfComplete: false, details: { keepClone: Boolean(args.keepClone) } }
+    );
+  } catch (error) {
+    primaryError = error;
+  } finally {
+    await sendRunNotification(manifest, args, 'cleanup');
+  }
+  if (primaryError) throw primaryError;
 }
 
 async function namespaceExists(namespace) {
@@ -1997,6 +2309,14 @@ async function janitorFlow(args) {
     keepClone,
     candidates
   });
+  await sendJanitorNotification(args, {
+    runsRoot,
+    olderThanHours,
+    apply,
+    keepClone,
+    janitorReportPath,
+    candidates
+  });
   console.log(`Janitor report: ${janitorReportPath}`);
   if (candidates.length) {
     console.log(JSON.stringify(candidates, null, 2));
@@ -2034,10 +2354,15 @@ async function main() {
 const isEntrypoint = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
 
 export {
+  resolveNotificationSettings,
+  notificationShouldSend,
+  domainFromEmailAddress,
+  sesSenderIdentityCandidates,
   buildTaskContext,
   cleanupCompletedCleanly,
   deriveTaskSlug,
   ensureManifestDefaults,
+  normalizeNotifyOn,
   overallRunStatus,
   parseArgs,
   agentTaskGuardEnv,

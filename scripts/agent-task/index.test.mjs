@@ -5,10 +5,15 @@ import {
   agentTaskGuardEnv,
   buildTaskContext,
   cleanupCompletedCleanly,
+  domainFromEmailAddress,
   deriveTaskSlug,
   ensureManifestDefaults,
+  normalizeNotifyOn,
+  notificationShouldSend,
   overallRunStatus,
   parseArgs,
+  resolveNotificationSettings,
+  sesSenderIdentityCandidates,
   shouldRunCleanupStage,
   validationWarningsFromArtifacts
 } from './index.mjs';
@@ -20,12 +25,65 @@ test('parseArgs handles resume and feature validation flags', () => {
     '/tmp/run/manifest.json',
     '--feature-validation-cmd',
     'npm run test:e2e',
+    '--notify-email',
+    'alerts@example.com',
+    '--notify-on',
+    'failure',
     '--skip-cleanup'
   ]);
   assert.equal(args._[0], 'resume');
   assert.equal(args.manifest, '/tmp/run/manifest.json');
   assert.equal(args.featureValidationCmd, 'npm run test:e2e');
+  assert.equal(args.notifyEmail, 'alerts@example.com');
+  assert.equal(args.notifyOn, 'failure');
   assert.equal(args.skipCleanup, true);
+});
+
+test('resolveNotificationSettings defaults to ottobotowner always', () => {
+  assert.deepEqual(resolveNotificationSettings({}, {}), {
+    email: 'ottobotowner@gmail.com',
+    notifyOn: 'always',
+    fromEmail: 'noreply@vibesplatform.ai',
+    replyTo: 'ottobotowner@gmail.com',
+    region: 'us-east-1'
+  });
+});
+
+test('resolveNotificationSettings honors explicit args', () => {
+  assert.deepEqual(
+    resolveNotificationSettings(
+      { notifyEmail: 'alerts@example.com', notifyOn: 'failure' },
+      { notifyEmail: 'stored@example.com', notifyOn: 'success' }
+    ),
+    {
+      email: 'alerts@example.com',
+      notifyOn: 'failure',
+      fromEmail: 'noreply@vibesplatform.ai',
+      replyTo: 'ottobotowner@gmail.com',
+      region: 'us-east-1'
+    }
+  );
+});
+
+test('notificationShouldSend matches requested mode', () => {
+  assert.equal(notificationShouldSend('succeeded', 'always'), true);
+  assert.equal(notificationShouldSend('succeeded', 'success'), true);
+  assert.equal(notificationShouldSend('failed', 'success'), false);
+  assert.equal(notificationShouldSend('failed', 'failure'), true);
+  assert.equal(notificationShouldSend('succeeded', 'failure'), false);
+  assert.equal(notificationShouldSend('failed', 'never'), false);
+});
+
+test('normalizeNotifyOn rejects invalid values', () => {
+  assert.throws(() => normalizeNotifyOn('sometimes'), /Invalid --notify-on value/);
+});
+
+test('sesSenderIdentityCandidates falls back to the sender domain', () => {
+  assert.equal(domainFromEmailAddress('noreply@vibesplatform.ai'), 'vibesplatform.ai');
+  assert.deepEqual(sesSenderIdentityCandidates('noreply@vibesplatform.ai'), [
+    'noreply@vibesplatform.ai',
+    'vibesplatform.ai'
+  ]);
 });
 
 test('deriveTaskSlug falls back to branch and run suffix', () => {
