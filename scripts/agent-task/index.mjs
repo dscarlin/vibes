@@ -239,6 +239,113 @@ function dbParts(databaseUrl) {
   };
 }
 
+function roleNameFromArn(roleArn) {
+  return String(roleArn || '').trim().split('/').pop() || '';
+}
+
+function cloneJson(payload) {
+  return JSON.parse(JSON.stringify(payload));
+}
+
+function assumeRoleWebIdentityStatement(policyDocument) {
+  const statements = Array.isArray(policyDocument?.Statement)
+    ? policyDocument.Statement
+    : policyDocument?.Statement
+      ? [policyDocument.Statement]
+      : [];
+  return statements.find((statement) => {
+    const actions = Array.isArray(statement?.Action) ? statement.Action : [statement?.Action];
+    return actions.includes('sts:AssumeRoleWithWebIdentity');
+  }) || null;
+}
+
+function subjectConditionRef(statement) {
+  for (const conditionType of ['StringEquals', 'StringLike']) {
+    const conditionBlock = statement?.Condition?.[conditionType];
+    if (!conditionBlock || typeof conditionBlock !== 'object') continue;
+    for (const [key, value] of Object.entries(conditionBlock)) {
+      if (key.endsWith(':sub')) {
+        return { conditionType, key, value };
+      }
+    }
+  }
+  return null;
+}
+
+async function ensureWorkerIrsaTrust(manifest) {
+  const roleArn = String(manifest.cluster?.workerIrsaRoleArn || '').trim();
+  const roleName = roleNameFromArn(roleArn);
+  if (!roleName) return;
+  const workerSubject = `system:serviceaccount:${manifest.task.namespaces.platform}:${manifest.task.workloads.workerServiceAccount}`;
+
+  const { stdout } = await runCommand('aws', [
+    'iam',
+    'get-role',
+    '--role-name',
+    roleName,
+    '--query',
+    'Role.AssumeRolePolicyDocument',
+    '--output',
+    'json'
+  ]);
+  const originalPolicy = JSON.parse(stdout || '{}');
+  const nextPolicy = cloneJson(originalPolicy);
+  const statement = assumeRoleWebIdentityStatement(nextPolicy);
+  if (!statement) {
+    throw new Error(`Unable to find sts:AssumeRoleWithWebIdentity statement for ${roleName}`);
+  }
+  const subjectRef = subjectConditionRef(statement);
+  if (!subjectRef) {
+    throw new Error(`Unable to find OIDC subject condition for ${roleName}`);
+  }
+
+  const subjects = Array.isArray(subjectRef.value) ? subjectRef.value.slice() : [subjectRef.value].filter(Boolean);
+  if (subjects.includes(workerSubject)) {
+    manifest.resources.workerIrsaTrust = {
+      roleName,
+      workerSubject,
+      adjusted: false
+    };
+    await saveManifest(manifest);
+    return;
+  }
+
+  statement.Condition[subjectRef.conditionType][subjectRef.key] = [...subjects, workerSubject];
+  await runCommand('aws', [
+    'iam',
+    'update-assume-role-policy',
+    '--role-name',
+    roleName,
+    '--policy-document',
+    JSON.stringify(nextPolicy)
+  ]);
+  manifest.resources.workerIrsaTrust = {
+    roleName,
+    workerSubject,
+    adjusted: true,
+    originalPolicy
+  };
+  await saveManifest(manifest);
+}
+
+async function restoreWorkerIrsaTrust(manifest) {
+  const trustPatch = manifest.resources?.workerIrsaTrust;
+  if (!trustPatch?.adjusted || !trustPatch.roleName || !trustPatch.originalPolicy) return;
+  await runCommand('aws', [
+    'iam',
+    'update-assume-role-policy',
+    '--role-name',
+    trustPatch.roleName,
+    '--policy-document',
+    JSON.stringify(trustPatch.originalPolicy)
+  ]);
+  manifest.cleanup.workerIrsaTrust = {
+    restoredAt: new Date().toISOString(),
+    roleName: trustPatch.roleName
+  };
+  await saveManifest(manifest);
+}
+
 async function runSqlThroughCluster(manifest, databaseUrl, sql, { namespace = '' } = {}) {
   const kubeNamespace = namespace || manifest.cluster?.sharedPlatformNamespace || 'vibes-platform';
   const parts = dbParts(databaseUrl);
@@ -537,7 +644,8 @@ async function buildTaskOverlay(manifest) {
   manifest.task = buildTaskContext(baseMetadata, manifest.repo.featureBranch, manifest.task.slug);
   manifest.cluster = {
     name: String(baseMetadata.CLUSTER_NAME || '').trim(),
-    sharedPlatformNamespace: String(baseMetadata.PLATFORM_NAMESPACE || 'vibes-platform').trim() || 'vibes-platform'
+    sharedPlatformNamespace: String(baseMetadata.PLATFORM_NAMESPACE || 'vibes-platform').trim() || 'vibes-platform',
+    workerIrsaRoleArn: String(baseMetadata.WORKER_IRSA_ROLE_ARN || '').trim()
   };
   manifest.database = {
     baseDatabaseUrl: baseServerEnv.DATABASE_URL,
@@ -1093,6 +1201,11 @@ async function cleanupManifest(manifest, { keepClone = false } = {}) {
       }
     }
     try {
+      await restoreWorkerIrsaTrust(manifest);
+    } catch (error) {
+      errors.push(`worker irsa restore: ${error.message}`);
+    }
+    try {
       await restorePlatformNodegroupCapacity(manifest);
     } catch (error) {
       errors.push(`platform nodegroup restore: ${error.message}`);
@@ -1166,6 +1279,7 @@ async function runFlow(args) {
     });
     await buildTaskOverlay(manifest);
     await ensurePlatformNodegroupCapacity(manifest);
+    await ensureWorkerIrsaTrust(manifest);
     await deployPlatform(manifest, 'pre-codex');
     await runCodex(
       manifest,
