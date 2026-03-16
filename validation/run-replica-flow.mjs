@@ -589,13 +589,30 @@ const fullBuildResult = await pollUntil(
     const currentProject = Array.isArray(projectsRes.body)
       ? projectsRes.body.find((item) => item.id === projectId) || null
       : null;
+    const currentDevelopment = currentProject?.environments?.development || null;
     await writeJson(path.join(evidenceDir, '08-full-build-poll.json'), {
       build: buildRes,
       project: currentProject
     });
-    const status = String(buildRes.body?.status || '').toLowerCase();
-    if (status === 'live' && buildRes.body?.ref_commit === completedTask.commit_hash) {
-      return { done: true, value: { build: buildRes.body, project: currentProject } };
+    const status = String(buildRes.body?.status || currentDevelopment?.build_status || '').toLowerCase();
+    const refCommit = String(
+      buildRes.body?.ref_commit ||
+      currentDevelopment?.full_build_commit_sha ||
+      currentDevelopment?.live_commit_sha ||
+      ''
+    ).trim();
+    if (status === 'live' && refCommit === completedTask.commit_hash) {
+      return {
+        done: true,
+        value: {
+          build: buildRes.body || {
+            id: null,
+            status: 'live',
+            ref_commit: refCommit
+          },
+          project: currentProject
+        }
+      };
     }
     if (status === 'failed' || status === 'cancelled') {
       throw new Error(`Full build ${status}: ${buildRes.body?.build_log || 'no build log available'}`);
