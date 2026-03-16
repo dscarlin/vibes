@@ -384,12 +384,6 @@ async function buildTaskOverlay(manifest) {
     customerAdminUrl: baseWorkerEnv.CUSTOMER_DB_ADMIN_URL
   };
 
-  await createSchema(manifest, manifest.database.baseDatabaseUrl, manifest.task.schema);
-  manifest.resources.platformSchema = {
-    schema: manifest.task.schema,
-    created: true
-  };
-
   const taskServerEnv = {
     ...baseServerEnv,
     DATABASE_URL: withSearchPath(baseServerEnv.DATABASE_URL, manifest.task.schema),
@@ -498,6 +492,14 @@ async function buildTaskOverlay(manifest) {
   await writeJson(manifest.paths.metadataSnapshotPath, taskMetadataEnv);
 
   await writeTaskCommands(cloneDir, manifest);
+  manifest.status.overlayReady = true;
+  await saveManifest(manifest);
+
+  await createSchema(manifest, manifest.database.baseDatabaseUrl, manifest.task.schema);
+  manifest.resources.platformSchema = {
+    schema: manifest.task.schema,
+    created: true
+  };
   await saveManifest(manifest);
 }
 
@@ -866,7 +868,12 @@ async function cleanupManifest(manifest, { keepClone = false } = {}) {
   } catch (error) {
     errors.push(`validation cleanup: ${error.message}`);
   }
-  if (manifest.task?.namespaces?.platform && manifest.repo?.cloneDir && await pathExists(manifest.repo.cloneDir)) {
+  if (
+    manifest.status?.overlayReady &&
+    manifest.task?.namespaces?.platform &&
+    manifest.repo?.cloneDir &&
+    await pathExists(manifest.repo.cloneDir)
+  ) {
     try {
       await spawnLogged({
         cmd: 'sh',
