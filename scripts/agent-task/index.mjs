@@ -263,6 +263,37 @@ function stageFailed(manifest) {
   return Object.values(manifest?.stages || {}).find((stage) => stage?.status === 'failed') || null;
 }
 
+function cleanupHasErrors(manifest) {
+  return Array.isArray(manifest?.cleanup?.errors) && manifest.cleanup.errors.length > 0;
+}
+
+function cleanupCompletedCleanly(manifest) {
+  const publish = manifest?.status?.publish || null;
+  const pushVerified = !publish || publish.skipPush || Boolean(publish.remoteVerifiedAt);
+  return Boolean(manifest?.cleanup?.completedAt) && !cleanupHasErrors(manifest) && pushVerified;
+}
+
+function shouldRunCleanupStage(manifest, primaryError = null) {
+  if (primaryError) return true;
+  return !cleanupCompletedCleanly(manifest);
+}
+
+function syncCleanupStage(manifest) {
+  if (!cleanupCompletedCleanly(manifest)) return false;
+  const current = stageRecord(manifest, 'cleanup') || {};
+  if (current.status === 'completed') return false;
+  manifest.stages.cleanup = {
+    ...current,
+    status: 'completed',
+    completedAt: manifest.cleanup.completedAt,
+    failedAt: null,
+    error: null,
+    result: summarizeStageResult(manifest.cleanup),
+    updatedAt: new Date().toISOString()
+  };
+  return true;
+}
+
 function codexBinaryForRepo(repoPath) {
   const candidate = path.join(repoPath, 'node_modules', '.bin', 'codex');
   return candidate;
@@ -1276,8 +1307,10 @@ function overallRunStatus(manifest, validationAnalysis) {
   const failedStage = stageFailed(manifest);
   const publish = manifest.status?.publish || null;
   const cleanup = manifest.cleanup || {};
+  const cleanupStage = stageRecord(manifest, 'cleanup');
+  if (cleanupStage?.status === 'running') return 'cleaning_up';
   if (cleanup.completedAt) {
-    if (Array.isArray(cleanup.errors) && cleanup.errors.length > 0) return 'failed';
+    if (cleanupHasErrors(manifest)) return 'failed';
     if (publish && !publish.skipPush && !publish.remoteVerifiedAt) return 'failed';
     if (failedStage) return 'failed';
     return publish?.skipPush ? 'completed_unpublished' : 'succeeded';
@@ -1689,6 +1722,7 @@ async function createRunManifest(args) {
 async function loadManifestForResume(manifestPath) {
   const manifest = await readJson(path.resolve(manifestPath));
   ensureManifestDefaults(manifest);
+  syncCleanupStage(manifest);
   await saveManifest(manifest);
   return manifest;
 }
@@ -1808,7 +1842,7 @@ async function executeRun(manifest, args = {}) {
     manifest.status.failedAt = new Date().toISOString();
     await saveManifest(manifest);
   } finally {
-    if (!options.skipCleanup) {
+    if (!options.skipCleanup && shouldRunCleanupStage(manifest, primaryError)) {
       try {
         await runStage(
           manifest,
@@ -1979,10 +2013,12 @@ const isEntrypoint = process.argv[1] && fileURLToPath(import.meta.url) === path.
 
 export {
   buildTaskContext,
+  cleanupCompletedCleanly,
   deriveTaskSlug,
   ensureManifestDefaults,
   overallRunStatus,
   parseArgs,
+  shouldRunCleanupStage,
   validationWarningsFromArtifacts
 };
 

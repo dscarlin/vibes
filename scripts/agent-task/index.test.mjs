@@ -3,10 +3,12 @@ import assert from 'node:assert/strict';
 
 import {
   buildTaskContext,
+  cleanupCompletedCleanly,
   deriveTaskSlug,
   ensureManifestDefaults,
   overallRunStatus,
   parseArgs,
+  shouldRunCleanupStage,
   validationWarningsFromArtifacts
 } from './index.mjs';
 
@@ -181,4 +183,81 @@ test('overallRunStatus fails when push verification is missing', () => {
   });
 
   assert.equal(overallRunStatus(manifest, { warnings: [] }), 'failed');
+});
+
+test('shouldRunCleanupStage skips cleanup for a successful terminal manifest', () => {
+  const manifest = ensureManifestDefaults({
+    cleanup: {
+      completedAt: '2026-03-16T00:00:00Z',
+      errors: []
+    },
+    status: {
+      publish: {
+        skipPush: false,
+        remoteVerifiedAt: '2026-03-16T00:00:00Z'
+      }
+    },
+    stages: {
+      cleanup: {
+        status: 'completed'
+      }
+    },
+    paths: {
+      runDir: '/tmp/run'
+    }
+  });
+
+  assert.equal(cleanupCompletedCleanly(manifest), true);
+  assert.equal(shouldRunCleanupStage(manifest, null), false);
+});
+
+test('shouldRunCleanupStage reruns cleanup when the previous cleanup was incomplete', () => {
+  const manifest = ensureManifestDefaults({
+    cleanup: {
+      completedAt: null,
+      errors: []
+    },
+    status: {
+      publish: {
+        skipPush: false,
+        remoteVerifiedAt: '2026-03-16T00:00:00Z'
+      }
+    },
+    stages: {
+      cleanup: {
+        status: 'running'
+      }
+    },
+    paths: {
+      runDir: '/tmp/run'
+    }
+  });
+
+  assert.equal(cleanupCompletedCleanly(manifest), false);
+  assert.equal(shouldRunCleanupStage(manifest, null), true);
+});
+
+test('overallRunStatus reports cleaning_up when cleanup stage is active', () => {
+  const manifest = ensureManifestDefaults({
+    cleanup: {
+      completedAt: '2026-03-16T00:00:00Z',
+      errors: []
+    },
+    status: {
+      publish: {
+        skipPush: false,
+        remoteVerifiedAt: '2026-03-16T00:00:00Z'
+      }
+    },
+    stages: {
+      cleanup: {
+        status: 'running'
+      }
+    },
+    paths: {
+      runDir: '/tmp/run'
+    }
+  });
+
+  assert.equal(overallRunStatus(manifest, { warnings: [] }), 'cleaning_up');
 });
