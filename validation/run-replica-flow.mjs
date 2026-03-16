@@ -174,8 +174,22 @@ function httpRequest(url, options = {}) {
 
   return new Promise((resolve, reject) => {
     let settled = false;
+    let responseRef = null;
+    const fail = (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutId);
+      reject(error instanceof Error ? error : new Error(String(error || 'request failed')));
+    };
     const timeoutId = setTimeout(() => {
-      req.destroy(new Error(`Request timed out after ${timeoutMs}ms for ${url}`));
+      const error = new Error(`Request timed out after ${timeoutMs}ms for ${url}`);
+      try {
+        responseRef?.destroy(error);
+      } catch {}
+      try {
+        req.destroy(error);
+      } catch {}
+      fail(error);
     }, timeoutMs);
     const req = client.request(
       target,
@@ -186,9 +200,18 @@ function httpRequest(url, options = {}) {
         servername: target.hostname
       },
       (response) => {
+        responseRef = response;
         const chunks = [];
         response.on('data', (chunk) => chunks.push(chunk));
+        response.on('aborted', () => fail(new Error(`Response aborted for ${url}`)));
+        response.on('error', fail);
+        response.on('close', () => {
+          if (!settled && !response.complete) {
+            fail(new Error(`Response closed before completion for ${url}`));
+          }
+        });
         response.on('end', () => {
+          if (settled) return;
           settled = true;
           clearTimeout(timeoutId);
           resolve({
@@ -202,13 +225,16 @@ function httpRequest(url, options = {}) {
     );
 
     req.setTimeout(timeoutMs, () => {
-      req.destroy(new Error(`Request timed out after ${timeoutMs}ms for ${url}`));
+      const error = new Error(`Request timed out after ${timeoutMs}ms for ${url}`);
+      try {
+        responseRef?.destroy(error);
+      } catch {}
+      try {
+        req.destroy(error);
+      } catch {}
+      fail(error);
     });
-    req.on('error', (error) => {
-      clearTimeout(timeoutId);
-      if (settled) return;
-      reject(error);
-    });
+    req.on('error', fail);
     if (payload) {
       req.write(payload);
     }
