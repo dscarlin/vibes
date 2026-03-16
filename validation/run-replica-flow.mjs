@@ -174,6 +174,9 @@ function httpRequest(url, options = {}) {
 
   return new Promise((resolve, reject) => {
     let settled = false;
+    const timeoutId = setTimeout(() => {
+      req.destroy(new Error(`Request timed out after ${timeoutMs}ms for ${url}`));
+    }, timeoutMs);
     const req = client.request(
       target,
       {
@@ -187,6 +190,7 @@ function httpRequest(url, options = {}) {
         response.on('data', (chunk) => chunks.push(chunk));
         response.on('end', () => {
           settled = true;
+          clearTimeout(timeoutId);
           resolve({
             ok: response.statusCode >= 200 && response.statusCode < 300,
             status: response.statusCode || 0,
@@ -201,6 +205,7 @@ function httpRequest(url, options = {}) {
       req.destroy(new Error(`Request timed out after ${timeoutMs}ms for ${url}`));
     });
     req.on('error', (error) => {
+      clearTimeout(timeoutId);
       if (settled) return;
       reject(error);
     });

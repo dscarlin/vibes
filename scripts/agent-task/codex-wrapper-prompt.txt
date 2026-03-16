@@ -30,7 +30,9 @@ Execution expectations:
 - Read the affected code paths before editing.
 - Implement the requested change directly in this repo.
 - Redeploy with `./.vp-task/bin/redeploy-platform` when platform code changes need a fresh runtime.
-- Run `./.vp-task/bin/validate-platform` before finishing unless the task is blocked before deployment.
+- Run targeted validation that matches the change you made.
+- Use `./.vp-task/bin/validate-platform` before finishing when your change can affect platform behavior, runtime behavior, deploy plumbing, or end-to-end user flows.
+- If the change is docs-only or otherwise clearly runtime-neutral, do not run full `validate-platform`; the outer runner will perform end-to-end platform validation after you finish.
 - Keep going until the feature is implemented and validated or you hit a concrete blocker you can explain.
 
 Task request:
