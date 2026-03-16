@@ -548,6 +548,8 @@ async function buildTaskOverlay(manifest) {
   const taskServerEnv = {
     ...baseServerEnv,
     DATABASE_URL: withSearchPath(baseServerEnv.DATABASE_URL, manifest.task.schema),
+    REDIS_HOST: manifest.task.workloads.redis,
+    REDIS_PORT: String(baseServerEnv.REDIS_PORT || 6379),
     DOMAIN: manifest.task.hosts.api,
     CORS_ORIGIN: [
       `https://${manifest.task.hosts.root}`,
@@ -573,6 +575,8 @@ async function buildTaskOverlay(manifest) {
   const taskWorkerEnv = {
     ...baseWorkerEnv,
     DATABASE_URL: withSearchPath(baseWorkerEnv.DATABASE_URL, manifest.task.schema),
+    REDIS_HOST: manifest.task.workloads.redis,
+    REDIS_PORT: String(baseWorkerEnv.REDIS_PORT || 6379),
     DOMAIN: manifest.task.hosts.api,
     APP_DOMAIN: manifest.task.hosts.projectDomain,
     PROJECT_HOST_DOMAIN: manifest.task.hosts.projectDomain,
