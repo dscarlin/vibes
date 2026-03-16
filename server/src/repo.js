@@ -55,6 +55,33 @@ async function gitOutput(args, cwd) {
   return stdout.trim();
 }
 
+async function ensureCompleteHistory(repoPath) {
+  let isShallow = false;
+  try {
+    isShallow = (await gitOutput(['rev-parse', '--is-shallow-repository'], repoPath)) === 'true';
+  } catch {
+    return;
+  }
+  if (!isShallow) return;
+
+  let remotes = '';
+  try {
+    remotes = await gitOutput(['remote'], repoPath);
+  } catch {
+    return;
+  }
+  if (!remotes.split(/\s+/).includes('origin')) return;
+
+  try {
+    await runGit(['fetch', '--unshallow', '--tags', 'origin'], repoPath);
+  } catch (error) {
+    const stderr = String(error?.stderr || '');
+    if (!stderr.includes('complete repository') && !stderr.includes('--unshallow on a complete repository')) {
+      throw error;
+    }
+  }
+}
+
 async function cloneBundle(bundlePath, repoPath) {
   await exec('git', ['clone', bundlePath, repoPath]);
 }
@@ -165,6 +192,7 @@ export async function bundleRepo(repoPath) {
   const tempDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), 'vibes-bundle-'));
   const outPath = path.join(tempDir, 'repo.bundle');
   try {
+    await ensureCompleteHistory(repoPath);
     await runGit(['bundle', 'create', outPath, '--all'], repoPath);
     return await fsPromises.readFile(outPath);
   } finally {

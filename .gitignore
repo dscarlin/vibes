@@ -10,3 +10,10 @@ build/
 downloads/**
 !downloads/.gitkeep
 desktop/src-tauri/target/
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+deploy/.generated/
+validation/evidence/*
+!validation/evidence/.gitkeep

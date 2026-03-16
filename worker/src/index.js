@@ -389,6 +389,7 @@ const WORKSPACE_SERVICE_PORT = Number(process.env.WORKSPACE_SERVICE_PORT || 3000
 const WORKSPACE_SERVICE_CLUSTER_PORT = Number(process.env.WORKSPACE_SERVICE_CLUSTER_PORT || 80);
 const WORKSPACE_IMAGE = process.env.WORKSPACE_IMAGE || '';
 const WORKSPACE_POD_NAMESPACE = process.env.WORKSPACE_POD_NAMESPACE || 'vibes-platform';
+const WORKER_POD_NAMESPACE = process.env.WORKER_POD_NAMESPACE || 'vibes-platform';
 const WORKSPACE_POD_CPU_REQUEST = process.env.WORKSPACE_POD_CPU_REQUEST || '200m';
 const WORKSPACE_POD_CPU_LIMIT = process.env.WORKSPACE_POD_CPU_LIMIT || '1500m';
 const WORKSPACE_POD_MEM_REQUEST = process.env.WORKSPACE_POD_MEM_REQUEST || '512Mi';
@@ -437,7 +438,7 @@ const EXTERNAL_HEALTHCHECK_POLL_BACKOFF_AFTER_MS = Math.max(
 );
 const EXTERNAL_HEALTHCHECK_MAX_ATTEMPTS = Math.max(
   1,
-  Number(process.env.EXTERNAL_HEALTHCHECK_MAX_ATTEMPTS || 2)
+  Number(process.env.EXTERNAL_HEALTHCHECK_MAX_ATTEMPTS || 8)
 );
 const HEALTHCHECK_LOG_LINES = Math.max(50, Math.min(Number(process.env.HEALTHCHECK_LOG_LINES || 1200), 2000));
 const CRASHLOOP_RESTART_THRESHOLD = Number(process.env.CRASHLOOP_RESTART_THRESHOLD || 5);
@@ -2744,12 +2745,19 @@ function workspacePreviewInternalHost(projectId) {
   return `${serviceName}.${workspaceNamespace()}.svc.cluster.local`;
 }
 
-async function applyManifest(namespace, manifest, fileName = 'manifest.yaml') {
+async function applyManifest(namespace, manifest, fileName = 'manifest.yaml', options = {}) {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'vibes-manifest-'));
   const manifestPath = path.join(tempDir, fileName);
   await fs.writeFile(manifestPath, manifest);
   try {
     await exec('kubectl', ['-n', namespace, 'apply', '-f', manifestPath]);
+  } catch (err) {
+    const detail = `${err?.stderr || ''}\n${err?.message || ''}`;
+    if (options.replaceOnImmutable && /pod updates may not change fields/i.test(detail)) {
+      await exec('kubectl', ['-n', namespace, 'replace', '--force', '-f', manifestPath]);
+    } else {
+      throw err;
+    }
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true });
   }
@@ -2917,7 +2925,7 @@ async function getCurrentWorkerImage() {
   }
   const { stdout } = await exec('kubectl', [
     '-n',
-    WORKSPACE_POD_NAMESPACE,
+    WORKER_POD_NAMESPACE,
     'get',
     'pod',
     podName,
@@ -3102,7 +3110,7 @@ ${nodePlacementBlock}  restartPolicy: Always
           - key: rds-ca.pem
             path: rds-ca.pem
 `;
-  await applyManifest(namespace, podManifest, `${podName}.yaml`);
+  await applyManifest(namespace, podManifest, `${podName}.yaml`, { replaceOnImmutable: true });
   await ensureWorkspaceService(projectId, previewPort);
   await exec('kubectl', [
     '-n',
@@ -3486,6 +3494,36 @@ git clean -fdx >/dev/null 2>&1`
   return commitHash;
 }
 
+function isWorkspacePodMissingError(err) {
+  const text = [
+    err?.message || '',
+    err?.stderr || '',
+    err?.stdout || ''
+  ].join('\n');
+  return /Error from server \(NotFound\): pods? "/i.test(text) || /pods? ".*" not found/i.test(text);
+}
+
+async function exportStoredCommitArchive(projectId, commitHash, archiveLabel = `cache-${commitHash || 'current'}`) {
+  const loaded = await loadRepoFromStoredSource(projectId);
+  try {
+    if (commitHash) {
+      try {
+        await runGit(['checkout', commitHash], loaded.repoPath);
+      } catch {
+        throw new Error(`Commit ${commitHash} is unavailable for full build`);
+      }
+    }
+    const archived = await createSnapshotArchive(loaded.repoPath, archiveLabel);
+    return {
+      snapshotPath: archived.archivePath,
+      tempDir: archived.archiveDir,
+      commitHash: commitHash || await gitOutput(['rev-parse', 'HEAD'], loaded.repoPath).catch(() => commitHash || '')
+    };
+  } finally {
+    await fs.rm(loaded.tempDir, { recursive: true, force: true });
+  }
+}
+
 async function exportCommitArchive(projectId, commitHash) {
   if (!isLocalPlatform()) {
     const workspace = await loadWorkspace(projectId);
@@ -3512,26 +3550,7 @@ async function exportCommitArchive(projectId, commitHash) {
       await fs.rm(loaded.tempDir, { recursive: true, force: true });
     }
   }
-  const loaded = await loadRepoFromStoredSource(projectId);
-  try {
-    if (commitHash) {
-      try {
-        await runGit(['checkout', commitHash], loaded.repoPath);
-      } catch (err) {
-        throw new Error(`Commit ${commitHash} is unavailable for full build`);
-      }
-    }
-    const archived = await createSnapshotArchive(loaded.repoPath, `cache-${commitHash || 'current'}`);
-    await fs.rm(loaded.tempDir, { recursive: true, force: true });
-    return {
-      snapshotPath: archived.archivePath,
-      tempDir: archived.archiveDir,
-      commitHash: commitHash || await gitOutput(['rev-parse', 'HEAD'], loaded.repoPath).catch(() => commitHash || '')
-    };
-  } catch (err) {
-    await fs.rm(loaded.tempDir, { recursive: true, force: true });
-    throw err;
-  }
+  return exportStoredCommitArchive(projectId, commitHash, `cache-${commitHash || 'current'}`);
 }
 
 async function computeDevelopmentFullBuildCacheMeta(projectId, commitHash) {
@@ -3771,6 +3790,15 @@ git archive --format=tar.gz -o ${shellEscape(remotePath)} ${shellEscape(targetCo
     );
     await workspaceCopyFromPod(projectId, remotePath, snapshotPath);
     return { snapshotPath, tempDir, commitHash: targetCommit };
+  } catch (err) {
+    if (targetCommit && isWorkspacePodMissingError(err)) {
+      console.warn(
+        `Workspace pod vanished during archive export for ${projectId}; falling back to stored repo source`
+      );
+      await fs.rm(tempDir, { recursive: true, force: true });
+      return exportStoredCommitArchive(projectId, targetCommit, `workspace-fallback-${targetCommit}`);
+    }
+    throw err;
   } finally {
     try {
       await workspaceExec(projectId, `rm -f ${shellEscape(remotePath)}`);
@@ -3778,11 +3806,25 @@ git archive --format=tar.gz -o ${shellEscape(remotePath)} ${shellEscape(targetCo
   }
 }
 
+async function ensureWorkspaceCompleteHistory(projectId) {
+  await workspaceExec(
+    projectId,
+    `set -eu
+cd ${shellEscape(WORKSPACE_ROOT_PATH)}
+if [ "$(git rev-parse --is-shallow-repository 2>/dev/null || echo false)" = "true" ]; then
+  if git config --get remote.origin.url >/dev/null 2>&1; then
+    git fetch --unshallow --tags origin >/dev/null 2>&1 || git fetch --tags origin >/dev/null 2>&1 || true
+  fi
+fi`
+  );
+}
+
 async function exportWorkspaceRepoBundle(projectId) {
   const remotePath = `/tmp/workspace-${projectId}-${Date.now()}.bundle`;
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'vibes-workspace-bundle-'));
   const bundlePath = path.join(tempDir, 'repo.bundle');
   try {
+    await ensureWorkspaceCompleteHistory(projectId);
     await workspaceExec(
       projectId,
       `set -eu
@@ -4787,6 +4829,33 @@ async function gitOutput(args, cwd) {
   return stdout.trim();
 }
 
+async function ensureCompleteHistory(repoPath) {
+  let isShallow = false;
+  try {
+    isShallow = (await gitOutput(['rev-parse', '--is-shallow-repository'], repoPath)) === 'true';
+  } catch {
+    return;
+  }
+  if (!isShallow) return;
+
+  let remotes = '';
+  try {
+    remotes = await gitOutput(['remote'], repoPath);
+  } catch {
+    return;
+  }
+  if (!remotes.split(/\s+/).includes('origin')) return;
+
+  try {
+    await runGit(['fetch', '--unshallow', '--tags', 'origin'], repoPath);
+  } catch (error) {
+    const stderr = String(error?.stderr || '');
+    if (!stderr.includes('complete repository') && !stderr.includes('--unshallow on a complete repository')) {
+      throw error;
+    }
+  }
+}
+
 async function ensureRepo(repoPath) {
   try {
     await fs.access(path.join(repoPath, '.git'));
@@ -4843,6 +4912,7 @@ async function loadRepoFromStoredSource(projectId) {
 async function createRepoBundle(repoPath, namePrefix = 'repo') {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'vibes-repo-bundle-'));
   const bundlePath = path.join(tempDir, `${namePrefix}.bundle`);
+  await ensureCompleteHistory(repoPath);
   await runGit(['bundle', 'create', bundlePath, '--all'], repoPath);
   return { bundlePath, tempDir };
 }

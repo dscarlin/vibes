@@ -1,4 +1,4 @@
-.PHONY: setup dev certs stop logs worker-kustomize aws-dev-up aws-dev-down server-apply web-apply build-push deploy-all desktop-release status-check db-tunnel stop-db-tunnel
+.PHONY: setup dev certs stop logs worker-kustomize aws-dev-up aws-dev-down server-apply web-apply build-push deploy-all desktop-release status-check db-tunnel stop-db-tunnel replica-plan replica-up replica-destroy-plan replica-down replica-validate replica-seed-secrets-plan replica-seed-secrets
 
 AWS_REGION ?= us-east-1
 RDS_CA_FILE ?= ./rds-ca.pem
@@ -82,3 +82,24 @@ stop-db-tunnel:
 	else \
 		echo "No DB tunnel found on local port $(DB_TUNNEL_LOCAL_PORT)."; \
 	fi
+
+replica-plan:
+	./scripts/replica/up.sh plan
+
+replica-up:
+	./scripts/replica/up.sh apply
+
+replica-destroy-plan:
+	./scripts/replica/down.sh plan
+
+replica-down:
+	./scripts/replica/down.sh apply
+
+replica-validate:
+	node ./validation/run-replica-flow.mjs
+
+replica-seed-secrets-plan:
+	node ./scripts/replica/seed-secrets.mjs plan
+
+replica-seed-secrets:
+	node ./scripts/replica/seed-secrets.mjs apply

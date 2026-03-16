@@ -1,0 +1,5 @@
+bucket         = "vibes-replica-tfstate-123456789012-us-east-1"
+key            = "test-replica/layer2/terraform.tfstate"
+region         = "us-east-1"
+dynamodb_table = "vibes-replica-terraform-locks"
+encrypt        = true

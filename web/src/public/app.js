@@ -140,6 +140,8 @@ const state = {
     mobile: false
   },
   createProjectName: '',
+  authModalOpen: false,
+  authModalMode: 'register',
   desktopSettings: {
     useLocalApi: false,
     localApiUrl: '',
@@ -2640,10 +2642,11 @@ class AppShell extends HTMLElement {
           </section>
         </main>
 
-        <div class="auth-modal" aria-hidden="true">
+        <div class="auth-modal ${state.authModalOpen ? 'open' : ''}" aria-hidden="${state.authModalOpen ? 'false' : 'true'}">
           <div class="auth-dialog" role="dialog" aria-modal="true" aria-labelledby="auth-title">
             <button class="auth-close" type="button" aria-label="Close">Close</button>
-            <div class="auth-panel" data-auth-panel="register">
+            ${state.taskStatusMessage ? `<div class="notice plan-error">${state.taskStatusMessage}</div>` : ''}
+            <div class="auth-panel" data-auth-panel="register" ${state.authModalMode === 'register' ? '' : 'style="display:none;"'}>
               <h2 id="auth-title">Register your workspace</h2>
               <p>Start with a single prompt. Scale when it clicks.</p>
               <div class="grid">
@@ -2652,7 +2655,7 @@ class AppShell extends HTMLElement {
                 <button id="registerBtn">Register</button>
               </div>
             </div>
-            <div class="auth-panel" data-auth-panel="login">
+            <div class="auth-panel" data-auth-panel="login" ${state.authModalMode === 'login' ? '' : 'style="display:none;"'}>
               <h2>Welcome back</h2>
               <p>Pick up where your team left off.</p>
               <div class="grid">
@@ -3805,7 +3808,14 @@ class AppShell extends HTMLElement {
       try {
         const data = await api('/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) });
         localStorage.setItem('vibes_token', data.token);
-        setState({ token: data.token, user: data.user, desktopSettings: loadDesktopSettings(data.user?.id) });
+        setState({
+          token: data.token,
+          user: data.user,
+          desktopSettings: loadDesktopSettings(data.user?.id),
+          authModalOpen: false,
+          taskStatusMessage: '',
+          taskStatusPersistent: false
+        });
         await loadProjects();
         connectSocket(state.projectId);
       } catch (err) {
@@ -3819,7 +3829,14 @@ class AppShell extends HTMLElement {
       try {
         const data = await api('/auth/register', { method: 'POST', body: JSON.stringify({ email, password }) });
         localStorage.setItem('vibes_token', data.token);
-        setState({ token: data.token, user: data.user, desktopSettings: loadDesktopSettings(data.user?.id) });
+        setState({
+          token: data.token,
+          user: data.user,
+          desktopSettings: loadDesktopSettings(data.user?.id),
+          authModalOpen: false,
+          taskStatusMessage: '',
+          taskStatusPersistent: false
+        });
         await loadProjects();
         connectSocket(state.projectId);
       } catch (err) {
@@ -3829,37 +3846,26 @@ class AppShell extends HTMLElement {
 
     const authModal = this.querySelector('.auth-modal');
     if (authModal) {
-      const panels = Array.from(authModal.querySelectorAll('.auth-panel'));
-      const setPanel = (mode) => {
-        panels.forEach((panel) => {
-          panel.style.display = panel.getAttribute('data-auth-panel') === mode ? 'block' : 'none';
-        });
-      };
-      const closeAuth = () => {
-        authModal.classList.remove('open');
-        authModal.setAttribute('aria-hidden', 'true');
-      };
-      const openAuth = (mode) => {
-        setPanel(mode);
-        authModal.classList.add('open');
-        authModal.setAttribute('aria-hidden', 'false');
-      };
-
-      // Ensure the modal is closed on initial render.
-      closeAuth();
-      setPanel('register');
-
       this.querySelectorAll('[data-auth-target]').forEach((btn) => {
         btn.addEventListener('click', (event) => {
           event.preventDefault();
           const mode = btn.getAttribute('data-auth-target') || 'register';
-          openAuth(mode);
+          setState({
+            authModalOpen: true,
+            authModalMode: mode,
+            taskStatusMessage: '',
+            taskStatusPersistent: false
+          });
         });
       });
 
-      authModal.querySelector('.auth-close')?.addEventListener('click', closeAuth);
+      authModal.querySelector('.auth-close')?.addEventListener('click', () => {
+        setState({ authModalOpen: false });
+      });
       authModal.addEventListener('click', (event) => {
-        if (event.target === authModal) closeAuth();
+        if (event.target === authModal) {
+          setState({ authModalOpen: false });
+        }
       });
     }
 
@@ -3931,6 +3937,7 @@ class AppShell extends HTMLElement {
       }
       if (isProjectNameTaken(name)) return setTaskStatus('Project name already exists', { autoHide: true });
       try {
+        setState({ taskStatusMessage: '', taskStatusPersistent: false });
         const interfaces = [];
         if (state.createInterfaces.web) interfaces.push('web');
         if (state.createInterfaces.mobile) interfaces.push('mobile');
@@ -3947,6 +3954,8 @@ class AppShell extends HTMLElement {
           environment: 'development',
           nerdLevel: 'beginner',
           createProjectName: '',
+          taskStatusMessage: '',
+          taskStatusPersistent: false,
           appLogsByEnv: blankEnvMap(''),
           appLogSnapshotByEnv: blankEnvMap(''),
           appLogLoading: blankEnvMap(false),

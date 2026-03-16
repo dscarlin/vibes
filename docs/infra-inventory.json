@@ -1,0 +1,283 @@
+{
+  "account_id": "897297231794",
+  "region": "us-east-1",
+  "replica_domain": "replica.vibesplatform.ai",
+  "items": [
+    {
+      "layer": "cloud_foundation",
+      "resource_id": "vpc-0356c6e0d2e92ce90",
+      "kind": "aws_vpc",
+      "required": true,
+      "source_of_truth": "live_cluster",
+      "live_state": "eksctl-managed VPC backing vibes-platform",
+      "target_state": "terraform-managed replica VPC with public and private subnets",
+      "secrets": [],
+      "notes": "Do not mutate the live VPC."
+    },
+    {
+      "layer": "cloud_foundation",
+      "resource_id": "vibes-platform",
+      "kind": "aws_eks_cluster",
+      "required": true,
+      "source_of_truth": "live_cluster",
+      "live_state": "eksctl-managed live cluster",
+      "target_state": "terraform-managed replica EKS cluster",
+      "secrets": [],
+      "notes": "Replica omits the zero-sized customer-apps nodegroup."
+    },
+    {
+      "layer": "cloud_foundation",
+      "resource_id": "platform-core",
+      "kind": "aws_eks_nodegroup",
+      "required": true,
+      "source_of_truth": "live_cluster",
+      "live_state": "live nodegroup labelled role=platform,nodegroup=platform",
+      "target_state": "replica nodegroup with the same labels",
+      "secrets": [],
+      "notes": "Default size 1x t3.medium."
+    },
+    {
+      "layer": "cloud_foundation",
+      "resource_id": "customer-core",
+      "kind": "aws_eks_nodegroup",
+      "required": true,
+      "source_of_truth": "live_cluster",
+      "live_state": "live tainted customer nodegroup",
+      "target_state": "replica tainted customer nodegroup",
+      "secrets": [],
+      "notes": "Required by worker scheduling logic."
+    },
+    {
+      "layer": "cloud_foundation",
+      "resource_id": "customer-apps",
+      "kind": "aws_eks_nodegroup",
+      "required": false,
+      "source_of_truth": "live_cluster",
+      "live_state": "present but scaled to zero",
+      "target_state": "not recreated",
+      "secrets": [],
+      "notes": "Code depends on labels and taints, not a separate nodegroup."
+    },
+    {
+      "layer": "cloud_foundation",
+      "resource_id": "vibes-dev-db",
+      "kind": "aws_db_instance",
+      "required": true,
+      "source_of_truth": "live_cluster_and_code",
+      "live_state": "shared PostgreSQL 16 instance for platform and customer DBs",
+      "target_state": "fresh replica PostgreSQL 16 instance",
+      "secrets": [
+        "generated infra RDS credentials"
+      ],
+      "notes": "Replica creates platform and customer DB roles during bootstrap."
+    },
+    {
+      "layer": "cloud_foundation",
+      "resource_id": "vibes-server",
+      "kind": "aws_ecr_repository",
+      "required": true,
+      "source_of_truth": "live_cluster",
+      "live_state": "live server repository",
+      "target_state": "dedicated replica server repository",
+      "secrets": [],
+      "notes": "Replica uses separate repo name to avoid tag collisions."
+    },
+    {
+      "layer": "cloud_foundation",
+      "resource_id": "vibes-web",
+      "kind": "aws_ecr_repository",
+      "required": true,
+      "source_of_truth": "live_cluster",
+      "live_state": "live web repository",
+      "target_state": "dedicated replica web repository",
+      "secrets": [],
+      "notes": ""
+    },
+    {
+      "layer": "cloud_foundation",
+      "resource_id": "vibes-worker",
+      "kind": "aws_ecr_repository",
+      "required": true,
+      "source_of_truth": "live_cluster",
+      "live_state": "live worker repository",
+      "target_state": "dedicated replica worker repository",
+      "secrets": [],
+      "notes": ""
+    },
+    {
+      "layer": "cloud_foundation",
+      "resource_id": "vibes-app",
+      "kind": "aws_ecr_repository",
+      "required": true,
+      "source_of_truth": "worker_code",
+      "live_state": "customer app repository used by worker deploy flow",
+      "target_state": "dedicated replica customer app repository",
+      "secrets": [],
+      "notes": "Worker must have IRSA push access."
+    },
+    {
+      "layer": "cloud_foundation",
+      "resource_id": "vibes-workspace-snapshots-897297231794-us-east-1",
+      "kind": "aws_s3_bucket",
+      "required": true,
+      "source_of_truth": "worker_code",
+      "live_state": "workspace snapshot storage",
+      "target_state": "replica workspace snapshot bucket",
+      "secrets": [],
+      "notes": "Required for workspace restore and cleanup."
+    },
+    {
+      "layer": "cloud_foundation",
+      "resource_id": "vibes-alb-logs-897297231794-us-east-1",
+      "kind": "aws_s3_bucket",
+      "required": true,
+      "source_of_truth": "worker_code_and_live_lb",
+      "live_state": "ALB access logs enabled and actively ingested",
+      "target_state": "replica ALB log bucket with delivery policy",
+      "secrets": [],
+      "notes": "Needed for bandwidth accounting parity."
+    },
+    {
+      "layer": "cloud_foundation",
+      "resource_id": "arn:aws:acm:us-east-1:897297231794:certificate/e719aa33-62f3-4e86-bc38-50c5f2251aa3",
+      "kind": "aws_acm_certificate",
+      "required": true,
+      "source_of_truth": "live_cluster",
+      "live_state": "live wildcard certificate for prod hosts",
+      "target_state": "replica wildcard certificate for *.replica.vibesplatform.ai",
+      "secrets": [],
+      "notes": "Never reuse the live certificate in replica scripts."
+    },
+    {
+      "layer": "cloud_foundation",
+      "resource_id": "vibes-worker-irsa",
+      "kind": "aws_iam_role",
+      "required": true,
+      "source_of_truth": "worker_code_and_live_iam",
+      "live_state": "worker IRSA role with ECR, S3, Route53, and ELB permissions",
+      "target_state": "replica worker IRSA role with equivalent scoped permissions",
+      "secrets": [],
+      "notes": ""
+    },
+    {
+      "layer": "cluster_platform",
+      "resource_id": "aws-load-balancer-controller",
+      "kind": "helm_release",
+      "required": true,
+      "source_of_truth": "live_cluster",
+      "live_state": "Helm-managed in kube-system",
+      "target_state": "terraform-managed Helm release in replica cluster",
+      "secrets": [],
+      "notes": "Ingress class must remain `alb`."
+    },
+    {
+      "layer": "cluster_platform",
+      "resource_id": "aws-ebs-csi-driver",
+      "kind": "aws_eks_addon",
+      "required": true,
+      "source_of_truth": "live_cluster",
+      "live_state": "live addon using IRSA",
+      "target_state": "terraform-managed replica addon",
+      "secrets": [],
+      "notes": ""
+    },
+    {
+      "layer": "cluster_platform",
+      "resource_id": "vibes-platform",
+      "kind": "kubernetes_namespace",
+      "required": true,
+      "source_of_truth": "live_cluster",
+      "live_state": "platform namespace",
+      "target_state": "replica platform namespace",
+      "secrets": [
+        "/vibes/test-replica/server",
+        "/vibes/test-replica/web",
+        "/vibes/test-replica/worker"
+      ],
+      "notes": ""
+    },
+    {
+      "layer": "cluster_platform",
+      "resource_id": "vibes-development",
+      "kind": "kubernetes_namespace",
+      "required": true,
+      "source_of_truth": "worker_code",
+      "live_state": "workspace and customer app namespace",
+      "target_state": "replica development namespace",
+      "secrets": [],
+      "notes": "Dynamic worker-created resources live here."
+    },
+    {
+      "layer": "cluster_platform",
+      "resource_id": "gp3",
+      "kind": "kubernetes_storage_class",
+      "required": true,
+      "source_of_truth": "replica_design",
+      "live_state": "gp2 storage class only",
+      "target_state": "replica gp3 storage class",
+      "secrets": [],
+      "notes": "Replica intentionally upgrades storage class."
+    },
+    {
+      "layer": "application_deployables",
+      "resource_id": "redis",
+      "kind": "kubernetes_deployment",
+      "required": true,
+      "source_of_truth": "live_cluster_and_app_code",
+      "live_state": "hand-created live deployment",
+      "target_state": "codified replica deployment",
+      "secrets": [],
+      "notes": "Required by BullMQ."
+    },
+    {
+      "layer": "application_deployables",
+      "resource_id": "vibes-server",
+      "kind": "kubernetes_deployment",
+      "required": true,
+      "source_of_truth": "live_cluster_and_repo",
+      "live_state": "deployment + service + ingress",
+      "target_state": "deployment + ClusterIP service + shared ALB ingress",
+      "secrets": [
+        "/vibes/test-replica/server"
+      ],
+      "notes": "Replica does not keep the standalone LoadBalancer service."
+    },
+    {
+      "layer": "application_deployables",
+      "resource_id": "vibes-web",
+      "kind": "kubernetes_deployment",
+      "required": true,
+      "source_of_truth": "live_cluster_and_repo",
+      "live_state": "deployment + service + ingress",
+      "target_state": "deployment + ClusterIP service + shared ALB ingress",
+      "secrets": [
+        "/vibes/test-replica/web"
+      ],
+      "notes": "Replica also owns the apex replica host."
+    },
+    {
+      "layer": "application_deployables",
+      "resource_id": "vibes-worker",
+      "kind": "kubernetes_deployment",
+      "required": true,
+      "source_of_truth": "live_cluster_and_repo",
+      "live_state": "deployment with IRSA and broad cluster RBAC",
+      "target_state": "replica deployment with scoped IRSA and codified RBAC",
+      "secrets": [
+        "/vibes/test-replica/worker"
+      ],
+      "notes": ""
+    },
+    {
+      "layer": "application_deployables",
+      "resource_id": "validation/run-replica-flow.mjs",
+      "kind": "validation_script",
+      "required": true,
+      "source_of_truth": "replica_design",
+      "live_state": "no automated E2E validation in repo",
+      "target_state": "deterministic validation harness with evidence output",
+      "secrets": [],
+      "notes": "Uses real API flow and repo download verification."
+    }
+  ]
+}

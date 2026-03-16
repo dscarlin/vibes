@@ -226,7 +226,7 @@ async function detectStaticFullstackPreview(rootPkg) {
   );
   const webCommand = isolatedCommand(
     'web',
-    `NEXT_PUBLIC_API_URL='' PORT=3002 ${runScriptCommand(webPackageManager, 'dev')} -- --hostname 0.0.0.0 --port 3002`
+    `NEXT_PUBLIC_API_URL='' PORT=3002 ${runScriptCommand(webPackageManager, 'dev')} -- --host 0.0.0.0 --port 3002`
   );
   const proxyCommand = `node <<'NODE'
 const http = require('http');
@@ -236,19 +236,48 @@ const routes = {
   web: { hostname: '127.0.0.1', port: 3002 }
 };
 
-function targetFor(url = '/') {
-  return url === '/health' || url.startsWith('/api') ? routes.api : routes.web;
+function isAssetPath(pathname = '/') {
+  return (
+    pathname.startsWith('/@') ||
+    pathname.startsWith('/src/') ||
+    pathname.startsWith('/node_modules/') ||
+    pathname.startsWith('/assets/') ||
+    pathname.startsWith('/sockjs-node') ||
+    pathname === '/favicon.ico' ||
+    /\\.[A-Za-z0-9]+$/.test(pathname)
+  );
+}
+
+function prefersHtml(headers = {}) {
+  const accept = String(headers.accept || headers.Accept || '').toLowerCase();
+  return accept.includes('text/html');
+}
+
+function targetFor(req) {
+  const rawUrl = req.url || '/';
+  let pathname = '/';
+  try {
+    pathname = new URL(rawUrl, 'http://preview.local').pathname || '/';
+  } catch {
+    pathname = rawUrl;
+  }
+  if (pathname === '/' || pathname === '/index.html') return routes.web;
+  if (pathname === '/health' || pathname.startsWith('/api')) return routes.api;
+  if (String(req.headers.upgrade || '').toLowerCase() === 'websocket') return routes.web;
+  if (isAssetPath(pathname)) return routes.web;
+  return prefersHtml(req.headers) ? routes.web : routes.api;
 }
 
 const server = http.createServer((req, res) => {
-  const target = targetFor(req.url || '/');
+  const target = targetFor(req);
+  const headers = { ...req.headers, host: target.hostname + ':' + target.port };
   const proxyReq = http.request(
     {
       hostname: target.hostname,
       port: target.port,
       method: req.method,
       path: req.url,
-      headers: req.headers
+      headers
     },
     (proxyRes) => {
       res.writeHead(proxyRes.statusCode || 502, proxyRes.headers);

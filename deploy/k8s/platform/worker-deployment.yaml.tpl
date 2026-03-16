@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vibes-worker
+  namespace: vibes-platform
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: vibes-worker
+  template:
+    metadata:
+      annotations:
+        replica.vibesplatform.ai/config-hash: ${WORKER_CONFIG_HASH}
+      labels:
+        app: vibes-worker
+    spec:
+      serviceAccountName: worker-sa
+      containers:
+        - name: worker
+          image: ${WORKER_IMAGE}
+          imagePullPolicy: IfNotPresent
+          workingDir: /
+          envFrom:
+            - secretRef:
+                name: vibes-worker-env
+          env:
+            - name: GIT_SSL_CAINFO
+              value: /etc/ssl/certs/ca-certificates.crt
+            - name: PATH
+              value: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          volumeMounts:
+            - name: rds-ca
+              mountPath: /etc/ssl/certs/rds-ca.pem
+              subPath: rds-ca.pem
+              readOnly: true
+      volumes:
+        - name: rds-ca
+          secret:
+            secretName: rds-ca-bundle
