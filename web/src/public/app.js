@@ -142,6 +142,8 @@ const state = {
   createProjectName: '',
   authModalOpen: false,
   authModalMode: 'register',
+  authErrorMessage: '',
+  authErrorCode: '',
   desktopSettings: {
     useLocalApi: false,
     localApiUrl: '',
@@ -1044,6 +1046,38 @@ function formatPlanError(code, details = {}) {
     return `Bandwidth limit reached for this project.${planName ? ` <span class="plan-subtext">Current plan: ${planName}.</span>` : ''}${usage} <span class="plan-subtext">Upgrade to increase bandwidth limits.</span>${upgradeCta}`;
   }
   return null;
+}
+
+function formatAuthError(code) {
+  if (code === 'auth_registration_closed') {
+    return 'Sorry, customer registration is not yet open. We will let you know when it is and we hope to see you again soon!';
+  }
+  if (code === 'auth_email_required') {
+    return 'Please enter your email address.';
+  }
+  if (code === 'auth_invalid_credentials') {
+    return 'Invalid email or password.';
+  }
+  return 'Something went wrong. Please try again.';
+}
+
+function clearAuthError({ render = true } = {}) {
+  if (!state.authErrorMessage && !state.authErrorCode) return;
+  if (render) {
+    setState({ authErrorMessage: '', authErrorCode: '' });
+    return;
+  }
+  state.authErrorMessage = '';
+  state.authErrorCode = '';
+  document.querySelectorAll('.auth-panel-error').forEach((node) => node.remove());
+}
+
+function setAuthError(err) {
+  const code = String(err?.code || err?.details?.error || '');
+  setState({
+    authErrorCode: code,
+    authErrorMessage: formatAuthError(code)
+  });
 }
 
 async function api(path, options = {}) {
@@ -2451,6 +2485,7 @@ class AppShell extends HTMLElement {
           <section class="hero" aria-labelledby="hero-title">
             <div class="hero-content">
               <p class="eyebrow">The future of website development is here</p>
+              <div class="hero-ribbon" aria-label="Coming soon">Coming Soon!</div>
               <h1 id="hero-title">Zero Code Required</h1>
               <h1 id="hero-title">Scalable and Secure</h1>
               <h1 id="hero-title">AI Powered</h1>
@@ -2645,24 +2680,27 @@ class AppShell extends HTMLElement {
         <div class="auth-modal ${state.authModalOpen ? 'open' : ''}" aria-hidden="${state.authModalOpen ? 'false' : 'true'}">
           <div class="auth-dialog" role="dialog" aria-modal="true" aria-labelledby="auth-title">
             <button class="auth-close" type="button" aria-label="Close">Close</button>
-            ${state.taskStatusMessage ? `<div class="notice plan-error">${state.taskStatusMessage}</div>` : ''}
             <div class="auth-panel" data-auth-panel="register" ${state.authModalMode === 'register' ? '' : 'style="display:none;"'}>
               <h2 id="auth-title">Register your workspace</h2>
               <p>Start with a single prompt. Scale when it clicks.</p>
+              ${state.authModalMode === 'register' && state.authErrorMessage ? `<div class="notice plan-error auth-panel-error">${escapeHtml(state.authErrorMessage)}</div>` : ''}
               <div class="grid">
                 <input id="registerEmail" type="email" placeholder="Email" />
                 <input id="registerPassword" type="password" placeholder="Password (optional)" />
                 <button id="registerBtn">Register</button>
               </div>
+              <p class="auth-switch-copy">Already have access? <button class="auth-switch" type="button" data-auth-switch="login">Log in</button></p>
             </div>
             <div class="auth-panel" data-auth-panel="login" ${state.authModalMode === 'login' ? '' : 'style="display:none;"'}>
               <h2>Welcome back</h2>
               <p>Pick up where your team left off.</p>
+              ${state.authModalMode === 'login' && state.authErrorMessage ? `<div class="notice plan-error auth-panel-error">${escapeHtml(state.authErrorMessage)}</div>` : ''}
               <div class="grid">
                 <input id="loginEmail" type="email" placeholder="Email" />
                 <input id="loginPassword" type="password" placeholder="Password (optional)" />
                 <button id="loginBtn">Log in</button>
               </div>
+              <p class="auth-switch-copy">Need an invite? <button class="auth-switch" type="button" data-auth-switch="register">Register</button></p>
             </div>
           </div>
         </div>
@@ -3813,13 +3851,13 @@ class AppShell extends HTMLElement {
           user: data.user,
           desktopSettings: loadDesktopSettings(data.user?.id),
           authModalOpen: false,
-          taskStatusMessage: '',
-          taskStatusPersistent: false
+          authErrorMessage: '',
+          authErrorCode: ''
         });
         await loadProjects();
         connectSocket(state.projectId);
       } catch (err) {
-        showError(err);
+        setAuthError(err);
       }
     });
 
@@ -3834,14 +3872,20 @@ class AppShell extends HTMLElement {
           user: data.user,
           desktopSettings: loadDesktopSettings(data.user?.id),
           authModalOpen: false,
-          taskStatusMessage: '',
-          taskStatusPersistent: false
+          authErrorMessage: '',
+          authErrorCode: ''
         });
         await loadProjects();
         connectSocket(state.projectId);
       } catch (err) {
-        showError(err);
+        setAuthError(err);
       }
+    });
+
+    ['#loginEmail', '#loginPassword', '#registerEmail', '#registerPassword'].forEach((selector) => {
+      this.querySelector(selector)?.addEventListener('input', () => {
+        clearAuthError({ render: false });
+      });
     });
 
     const authModal = this.querySelector('.auth-modal');
@@ -3853,18 +3897,27 @@ class AppShell extends HTMLElement {
           setState({
             authModalOpen: true,
             authModalMode: mode,
-            taskStatusMessage: '',
-            taskStatusPersistent: false
+            authErrorMessage: '',
+            authErrorCode: ''
           });
         });
       });
 
       authModal.querySelector('.auth-close')?.addEventListener('click', () => {
-        setState({ authModalOpen: false });
+        setState({ authModalOpen: false, authErrorMessage: '', authErrorCode: '' });
+      });
+      authModal.querySelectorAll('[data-auth-switch]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          setState({
+            authModalMode: btn.getAttribute('data-auth-switch') || 'register',
+            authErrorMessage: '',
+            authErrorCode: ''
+          });
+        });
       });
       authModal.addEventListener('click', (event) => {
         if (event.target === authModal) {
-          setState({ authModalOpen: false });
+          setState({ authModalOpen: false, authErrorMessage: '', authErrorCode: '' });
         }
       });
     }
