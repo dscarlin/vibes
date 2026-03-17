@@ -2484,8 +2484,10 @@ class AppShell extends HTMLElement {
         <main>
           <section class="hero" aria-labelledby="hero-title">
             <div class="hero-content">
-              <p class="eyebrow">The future of website development is here</p>
-              <div class="hero-ribbon" aria-label="Coming soon">Coming Soon!</div>
+              <div class="hero-intro">
+                <div class="hero-ribbon" aria-label="Coming soon">Coming Soon!</div>
+                <p class="eyebrow">The future of website development is here</p>
+              </div>
               <h1 id="hero-title">Zero Code Required</h1>
               <h1 id="hero-title">Scalable and Secure</h1>
               <h1 id="hero-title">AI Powered</h1>
@@ -2643,38 +2645,6 @@ class AppShell extends HTMLElement {
             </div>
           </section>
 
-          <section class="section final-cta">
-            <div class="cta-panel">
-              <div>
-                <h2>Ready to build without the bottlenecks?</h2>
-                <p>
-                  Launch your next product with AI-managed architecture, instant iteration cycles, and zero
-                  lock-in.
-                </p>
-              </div>
-              <div class="download-panel">
-                <div class="download-header">
-                  <span class="tag">Desktop App</span>
-                  <p class="notice">Run projects locally with mobile simulators and device support.</p>
-                </div>
-                <div class="download-grid">
-                  <a class="ghost download-card" href="${API_URL}/downloads/desktop?platform=mac" target="_blank" rel="noreferrer">
-                    <strong>macOS</strong>
-                    <span>Download .dmg</span>
-                  </a>
-                  <a class="ghost download-card" href="${API_URL}/downloads/desktop?platform=windows" target="_blank" rel="noreferrer">
-                    <strong>Windows</strong>
-                    <span>Download .exe</span>
-                  </a>
-                  <a class="ghost download-card" href="${API_URL}/downloads/desktop?platform=linux" target="_blank" rel="noreferrer">
-                    <strong>Linux</strong>
-                    <span>Download .AppImage</span>
-                  </a>
-                </div>
-                <p class="notice">Downloads are hosted directly from the platform server.</p>
-              </div>
-            </div>
-          </section>
         </main>
 
         <div class="auth-modal ${state.authModalOpen ? 'open' : ''}" aria-hidden="${state.authModalOpen ? 'false' : 'true'}">
