@@ -73,6 +73,8 @@ test('notificationShouldSend matches requested mode', () => {
   assert.equal(notificationShouldSend('succeeded', 'success'), true);
   assert.equal(notificationShouldSend('failed', 'success'), false);
   assert.equal(notificationShouldSend('failed', 'failure'), true);
+  assert.equal(notificationShouldSend('published_with_validation_failures', 'failure'), true);
+  assert.equal(notificationShouldSend('published_with_validation_failures', 'success'), false);
   assert.equal(notificationShouldSend('succeeded', 'failure'), false);
   assert.equal(notificationShouldSend('failed', 'never'), false);
 });
@@ -269,6 +271,56 @@ test('overallRunStatus fails when push verification is missing', () => {
       }
     },
     stages: {
+      publish: { status: 'completed' },
+      cleanup: { status: 'completed' }
+    },
+    paths: {
+      runDir: '/tmp/run'
+    }
+  });
+
+  assert.equal(overallRunStatus(manifest, { warnings: [] }), 'failed');
+});
+
+test('overallRunStatus reports published_with_validation_failures after a pushed branch and failed feature validation', () => {
+  const manifest = ensureManifestDefaults({
+    cleanup: {
+      completedAt: '2026-03-16T00:00:00Z',
+      errors: []
+    },
+    status: {
+      publish: {
+        skipPush: false,
+        remoteVerifiedAt: '2026-03-16T00:00:00Z'
+      }
+    },
+    stages: {
+      'feature-validation': { status: 'failed' },
+      publish: { status: 'completed' },
+      cleanup: { status: 'completed' }
+    },
+    paths: {
+      runDir: '/tmp/run'
+    }
+  });
+
+  assert.equal(overallRunStatus(manifest, { warnings: [] }), 'published_with_validation_failures');
+});
+
+test('overallRunStatus still fails when a non-validation stage fails even if publish succeeded', () => {
+  const manifest = ensureManifestDefaults({
+    cleanup: {
+      completedAt: '2026-03-16T00:00:00Z',
+      errors: []
+    },
+    status: {
+      publish: {
+        skipPush: false,
+        remoteVerifiedAt: '2026-03-16T00:00:00Z'
+      }
+    },
+    stages: {
+      codex: { status: 'failed' },
       publish: { status: 'completed' },
       cleanup: { status: 'completed' }
     },

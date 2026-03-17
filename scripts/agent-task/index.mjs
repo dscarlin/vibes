@@ -38,6 +38,7 @@ const DEFAULT_NOTIFY_REPLY_TO = 'ottobotowner@gmail.com';
 const DEFAULT_NOTIFY_REGION = 'us-east-1';
 const NOTIFY_MODES = new Set(['always', 'success', 'failure', 'never']);
 const TASK_DATABASE_ENV_SUFFIXES = ['_development', '_testing', '_production'];
+const NON_BLOCKING_VALIDATION_STAGE_NAMES = new Set(['validation', 'feature-validation']);
 
 function usage() {
   console.error(
@@ -139,7 +140,9 @@ function notificationShouldSend(status, notifyOn) {
     return normalizedStatus === 'succeeded' || normalizedStatus === 'completed_unpublished';
   }
   if (normalizedNotifyOn === 'failure') {
-    return normalizedStatus === 'failed' || normalizedStatus === 'validation_warning';
+    return normalizedStatus === 'failed'
+      || normalizedStatus === 'validation_warning'
+      || normalizedStatus === 'published_with_validation_failures';
   }
   return true;
 }
@@ -298,8 +301,13 @@ async function runStage(manifest, stageName, work, { skipIfComplete = true, deta
   }
 }
 
-function stageFailed(manifest) {
-  return Object.values(manifest?.stages || {}).find((stage) => stage?.status === 'failed') || null;
+function failedStageEntries(manifest) {
+  return Object.entries(manifest?.stages || {}).filter(([, stage]) => stage?.status === 'failed');
+}
+
+function validationFailurePresent(manifest, validationAnalysis = { warnings: [] }) {
+  if (Array.isArray(validationAnalysis?.warnings) && validationAnalysis.warnings.length > 0) return true;
+  return failedStageEntries(manifest).some(([name]) => NON_BLOCKING_VALIDATION_STAGE_NAMES.has(name));
 }
 
 function cleanupHasErrors(manifest) {
@@ -1211,12 +1219,12 @@ kubectl -n ${shellQuote(manifest.task.namespaces.platform)} logs deploy/${shellQ
     '',
     `Run artifacts live in \`${runDir}\`.`,
     '',
-    '- `./.vp-task/bin/await-platform` blocks until the task platform deployments are available.',
+    '- `./.vp-task/bin/await-platform` is for manual replica debugging only.',
     '- `./.vp-task/bin/platform-urls` prints the task-scoped hosts.',
-    '- `./.vp-task/bin/redeploy-platform` rebuilds and reapplies the task platform from this clone.',
-    '- `./.vp-task/bin/validate-platform` runs the full user/project/task validation flow and writes evidence outside the clone.',
+    '- `./.vp-task/bin/redeploy-platform` is manual-only and intentionally not used by the CLI runner.',
+    '- `./.vp-task/bin/validate-platform` is manual-only and intentionally not used by the CLI runner.',
     '- `./.vp-task/bin/validate-feature` runs the optional feature-specific validation command for this run.',
-    '- `./.vp-task/bin/tail-server`, `tail-worker`, and `tail-web` stream platform logs.',
+    '- `./.vp-task/bin/tail-server`, `tail-worker`, and `tail-web` are for manual replica debugging only.',
     '- `./.vp-task/bin/status` prints the manifest path and current task context.'
   ].join('\n');
   await fs.writeFile(path.join(overlayDir, 'COMMANDS.md'), `${commandsDoc}\n`, 'utf8');
@@ -1460,37 +1468,60 @@ async function runFeatureValidation(manifest) {
   const evidenceDir = path.join(manifest.paths.runDir, 'validation', 'feature');
   await ensureDir(evidenceDir);
   const mergedEnv = parseEnv(await fs.readFile(path.join(manifest.repo.cloneDir, '.env'), 'utf8'));
-  await spawnLogged({
-    cmd: 'sh',
-    args: ['-lc', command],
-    cwd: manifest.repo.cloneDir,
-    env: {
-      ...process.env,
-      ...mergedEnv,
-      REPLICA_OUTPUT_DIR: manifest.paths.generatedDir,
-      VALIDATION_METADATA_ENV_FILE: path.join(manifest.paths.generatedDir, 'metadata.env'),
-      AGENT_TASK_MANIFEST_PATH: manifest.paths.manifestPath,
-      AGENT_TASK_RUN_DIR: manifest.paths.runDir,
-      AGENT_TASK_VALIDATION_SUMMARY_PATH: manifest.validation?.lastSummaryPath || '',
-      AGENT_TASK_VALIDATION_EVIDENCE_DIR: manifest.validation?.lastEvidenceDir || ''
-    },
-    stdoutPath: path.join(evidenceDir, 'feature-validation.stdout.log'),
-    stderrPath: path.join(evidenceDir, 'feature-validation.stderr.log'),
-    timeoutMs: 30 * 60 * 1000
-  });
   manifest.featureValidation = {
     command,
     evidenceDir,
     stdoutPath: path.join(evidenceDir, 'feature-validation.stdout.log'),
     stderrPath: path.join(evidenceDir, 'feature-validation.stderr.log'),
-    completedAt: new Date().toISOString()
+    startedAt: new Date().toISOString(),
+    completedAt: null,
+    failedAt: null,
+    error: null
   };
   await saveManifest(manifest);
-  return manifest.featureValidation;
+  try {
+    await spawnLogged({
+      cmd: 'sh',
+      args: ['-lc', command],
+      cwd: manifest.repo.cloneDir,
+      env: {
+        ...process.env,
+        ...mergedEnv,
+        REPLICA_OUTPUT_DIR: manifest.paths.generatedDir,
+        VALIDATION_METADATA_ENV_FILE: path.join(manifest.paths.generatedDir, 'metadata.env'),
+        AGENT_TASK_MANIFEST_PATH: manifest.paths.manifestPath,
+        AGENT_TASK_RUN_DIR: manifest.paths.runDir,
+        AGENT_TASK_VALIDATION_SUMMARY_PATH: manifest.validation?.lastSummaryPath || '',
+        AGENT_TASK_VALIDATION_EVIDENCE_DIR: manifest.validation?.lastEvidenceDir || ''
+      },
+      stdoutPath: path.join(evidenceDir, 'feature-validation.stdout.log'),
+      stderrPath: path.join(evidenceDir, 'feature-validation.stderr.log'),
+      timeoutMs: 30 * 60 * 1000
+    });
+    manifest.featureValidation = {
+      ...manifest.featureValidation,
+      completedAt: new Date().toISOString(),
+      failedAt: null,
+      error: null
+    };
+    await saveManifest(manifest);
+    return manifest.featureValidation;
+  } catch (error) {
+    manifest.featureValidation = {
+      ...manifest.featureValidation,
+      completedAt: null,
+      failedAt: new Date().toISOString(),
+      error: serializeError(error)
+    };
+    await saveManifest(manifest);
+    throw error;
+  }
 }
 
 function overallRunStatus(manifest, validationAnalysis) {
-  const failedStage = stageFailed(manifest);
+  const failedEntries = failedStageEntries(manifest);
+  const hardFailedStage = failedEntries.find(([name]) => !NON_BLOCKING_VALIDATION_STAGE_NAMES.has(name))?.[1] || null;
+  const validationFailure = validationFailurePresent(manifest, validationAnalysis);
   const publish = manifest.status?.publish || null;
   const cleanup = manifest.cleanup || {};
   const cleanupStage = stageRecord(manifest, 'cleanup');
@@ -1498,12 +1529,15 @@ function overallRunStatus(manifest, validationAnalysis) {
   if (cleanup.completedAt) {
     if (cleanupHasErrors(manifest)) return 'failed';
     if (publish && !publish.skipPush && !publish.remoteVerifiedAt) return 'failed';
-    if (failedStage) return 'failed';
+    if (hardFailedStage) return 'failed';
+    if (validationFailure) {
+      return publish?.skipPush ? 'validation_warning' : 'published_with_validation_failures';
+    }
     return publish?.skipPush ? 'completed_unpublished' : 'succeeded';
   }
-  if (failedStage || manifest.status?.lastError) return 'failed';
+  if (hardFailedStage || manifest.status?.lastError) return 'failed';
   if (publish?.committedAt) return 'cleaning_up';
-  if (validationAnalysis?.warnings?.length) return 'validation_warning';
+  if (validationFailure) return 'validation_warning';
   return 'running';
 }
 
@@ -1511,6 +1545,9 @@ function nextActionForReport(status) {
   if (status === 'running') return 'Wait for the active run to finish or resume it if interrupted.';
   if (status === 'cleaning_up') return 'Wait for cleanup to complete or rerun cleanup from the manifest.';
   if (status === 'validation_warning') return 'Review validation evidence and rerun after fixing the warning conditions.';
+  if (status === 'published_with_validation_failures') {
+    return 'Review the pushed branch and validation evidence before merge or follow-up deployment work.';
+  }
   if (status === 'completed_unpublished') return 'Review the branch and push manually if desired.';
   if (status === 'failed') return 'Inspect final-report.json and the stage evidence, then resume or run cleanup.';
   return 'Review the pushed branch and preserved evidence.';
@@ -1519,6 +1556,8 @@ function nextActionForReport(status) {
 async function writeRunReport(manifest) {
   if (!manifest?.paths?.reportPath) return;
   const validationAnalysis = await analyzeValidationArtifacts(manifest);
+  const validationStage = stageRecord(manifest, 'validation');
+  const featureValidationStage = stageRecord(manifest, 'feature-validation');
   const report = {
     version: 1,
     generatedAt: new Date().toISOString(),
@@ -1540,6 +1579,9 @@ async function writeRunReport(manifest) {
     stages: manifest.stages || {},
     publish: manifest.status?.publish || null,
     validation: {
+      stageStatus: validationStage?.status || null,
+      stageError: validationStage?.error || null,
+      skippedReason: validationStage?.reason || null,
       lastLabel: manifest.validation?.lastLabel || null,
       evidenceDir: manifest.validation?.lastEvidenceDir || null,
       summaryPath: manifest.validation?.lastSummaryPath || null,
@@ -1552,7 +1594,12 @@ async function writeRunReport(manifest) {
           }
         : null
     },
-    featureValidation: manifest.featureValidation || null,
+    featureValidation: {
+      ...(manifest.featureValidation || {}),
+      stageStatus: featureValidationStage?.status || null,
+      stageError: featureValidationStage?.error || manifest.featureValidation?.error || null,
+      skippedReason: featureValidationStage?.reason || null
+    },
     notifications: manifest.notifications || null,
     cleanup: manifest.cleanup || {},
     paths: {
@@ -1579,6 +1626,8 @@ function runNotificationSubject(command, manifest, report) {
 function runNotificationBody(command, manifest, report) {
   const validationWarnings = Array.isArray(report?.validation?.warnings) ? report.validation.warnings : [];
   const cleanupErrors = Array.isArray(report?.cleanup?.errors) ? report.cleanup.errors : [];
+  const validationStageStatus = report?.validation?.stageStatus || 'not-run';
+  const featureValidationStageStatus = report?.featureValidation?.stageStatus || 'not-run';
   return [
     'Vibes Platform agent-task notification',
     '',
@@ -1596,6 +1645,10 @@ function runNotificationBody(command, manifest, report) {
     '',
     `Commit: ${report.publish?.commitHash || 'not committed'}`,
     `Remote verified: ${report.publish?.remoteVerifiedAt || 'no'}`,
+    `Validation stage: ${validationStageStatus}`,
+    `Validation error: ${report.validation?.stageError?.message || 'none'}`,
+    `Feature validation stage: ${featureValidationStageStatus}`,
+    `Feature validation error: ${report.featureValidation?.stageError?.message || 'none'}`,
     `Cleanup completed: ${report.cleanup?.completedAt || 'no'}`,
     `Cleanup errors: ${cleanupErrors.length ? cleanupErrors.join(' | ') : 'none'}`,
     `Validation warnings: ${validationWarnings.length ? validationWarnings.join(', ') : 'none'}`,
@@ -2261,20 +2314,17 @@ async function executeRun(manifest, args = {}) {
       return { generatedDir: manifest.paths.generatedDir };
     });
 
-    await runStage(manifest, 'platform-capacity', async () => {
-      await ensurePlatformNodegroupCapacity(manifest);
-      return manifest.resources.platformNodegroupScaling || {};
-    });
+    if (!['completed', 'skipped'].includes(stageRecord(manifest, 'platform-capacity')?.status || '')) {
+      await skipStage(manifest, 'platform-capacity', 'Automatic replica capacity changes are disabled');
+    }
 
-    await runStage(manifest, 'worker-irsa-trust', async () => {
-      await ensureWorkerIrsaTrust(manifest);
-      return manifest.resources.workerIrsaTrust || {};
-    });
+    if (!['completed', 'skipped'].includes(stageRecord(manifest, 'worker-irsa-trust')?.status || '')) {
+      await skipStage(manifest, 'worker-irsa-trust', 'Automatic replica IRSA changes are disabled');
+    }
 
-    await runStage(manifest, 'deploy-pre-codex', async () => {
-      await deployPlatform(manifest, 'pre-codex');
-      return manifest.status.lastDeploy || {};
-    });
+    if (!['completed', 'skipped'].includes(stageRecord(manifest, 'deploy-pre-codex')?.status || '')) {
+      await skipStage(manifest, 'deploy-pre-codex', 'Automatic replica deploy is disabled');
+    }
 
     await runStage(
       manifest,
@@ -2291,25 +2341,26 @@ async function executeRun(manifest, args = {}) {
       }
     );
 
-    await runStage(manifest, 'deploy-post-codex', async () => {
-      await deployPlatform(manifest, 'post-codex');
-      return manifest.status.lastDeploy || {};
-    });
+    if (!['completed', 'skipped'].includes(stageRecord(manifest, 'deploy-post-codex')?.status || '')) {
+      await skipStage(manifest, 'deploy-post-codex', 'Automatic replica deploy is disabled');
+    }
 
-    await runStage(manifest, 'validation', async () => {
-      const summary = await runValidation(manifest, 'post-codex');
-      await assertValidationReadyForPublish(manifest);
-      return {
-        summaryPath: manifest.validation?.lastSummaryPath || null,
-        task: summary?.task || null,
-        fullBuild: summary?.full_build || null
-      };
-    });
+    if (!['completed', 'skipped'].includes(stageRecord(manifest, 'validation')?.status || '')) {
+      await skipStage(
+        manifest,
+        'validation',
+        'Full replica validation is disabled; rely on targeted validations instead'
+      );
+    }
 
     if (options.featureValidationCommand) {
-      await runStage(manifest, 'feature-validation', async () => {
-        return runFeatureValidation(manifest);
-      });
+      try {
+        await runStage(manifest, 'feature-validation', async () => {
+          return runFeatureValidation(manifest);
+        });
+      } catch (error) {
+        console.warn(`feature-validation failed but publish will continue: ${error.message}`);
+      }
     } else if (!stageRecord(manifest, 'feature-validation')) {
       await skipStage(manifest, 'feature-validation', 'No feature validation command configured');
     }
