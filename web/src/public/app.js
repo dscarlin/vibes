@@ -1,3 +1,7 @@
+import { BaseElement } from './ui/base-element.js';
+import { debugCounter, debugRender } from './ui/debug.js';
+import { createStore } from './ui/store.js';
+
 const API_URL = window.__API_URL__ || 'http://localhost:8000';
 const DOMAIN = window.__DOMAIN__ || 'localhost:8000';
 const UPGRADE_URL = window.__UPGRADE_URL__ || '';
@@ -9,7 +13,57 @@ const RUNTIME_LIMITS_FALLBACK = {
   agency: { development: 500, testing: 250, production: 750 }
 };
 
-const state = {
+function createDraftState() {
+  return {
+    auth: {
+      loginEmail: '',
+      loginPassword: '',
+      registerEmail: '',
+      registerPassword: '',
+      dirty: false
+    },
+    createProject: {
+      name: '',
+      dirty: false
+    },
+    taskPrompt: {
+      value: '',
+      dirty: false,
+      projectId: null
+    },
+    renameProject: {
+      value: '',
+      dirty: false,
+      projectId: null
+    },
+    sessionSave: {
+      value: '',
+      dirty: false,
+      projectId: null
+    },
+    deployWebhook: {
+      value: '',
+      dirty: false,
+      projectId: null
+    },
+    envVars: {
+      development: { value: '', dirty: false, projectId: null },
+      testing: { value: '', dirty: false, projectId: null },
+      production: { value: '', dirty: false, projectId: null }
+    },
+    settings: {
+      projectId: null,
+      dirty: false,
+      values: {}
+    },
+    promptModal: {
+      value: '',
+      dirty: false
+    }
+  };
+}
+
+const initialState = {
   token: localStorage.getItem('vibes_token') || '',
   user: null,
   projects: [],
@@ -210,8 +264,11 @@ const state = {
   runtimeUsage: { month: '', plan: '', usage: {} },
   runtimeUsageLoading: false,
   runtimeUsageError: '',
-  runtimeQuotaNotice: {}
+  runtimeQuotaNotice: {},
+  drafts: createDraftState()
 };
+const store = createStore(initialState);
+const state = store.state;
 
 let socketClient = null;
 let socketProjectId = null;
@@ -845,11 +902,67 @@ function restoreAppLogScrollAnchor() {
   pre.scrollTop = Math.max(0, pre.scrollHeight - pre.clientHeight - appLogScrollAnchor.distanceFromBottom);
 }
 
+function currentFocusState() {
+  const active = document.activeElement;
+  if (!active) return null;
+  return {
+    id: active.id || '',
+    tag: active.tagName,
+    value: 'value' in active ? active.value : ''
+  };
+}
+
 function setState(partial) {
   captureAppLogScrollAnchor();
-  Object.assign(state, partial);
-  document.querySelector('app-shell')?.render();
+  debugRender('set-state', {
+    changedKeys: Object.keys(partial || {}),
+    activeElementBefore: currentFocusState()
+  });
+  store.setState(partial);
   restoreAppLogScrollAnchor();
+}
+
+function seedDraft(path, value, context = null) {
+  const branch = path.reduce((acc, key) => acc?.[key], state.drafts);
+  if (!branch) return;
+  if (context != null && branch.contextKey !== undefined && branch.contextKey !== context) {
+    branch.dirty = false;
+  }
+  if (branch.projectId != null && context != null && branch.projectId !== context) {
+    branch.dirty = false;
+  }
+  if (!branch.dirty) {
+    if (Object.prototype.hasOwnProperty.call(branch, 'value')) {
+      branch.value = value ?? '';
+    } else if (value && typeof value === 'object') {
+      Object.assign(branch, value);
+    }
+    if (branch.projectId != null) branch.projectId = context;
+    if (branch.contextKey !== undefined) branch.contextKey = context;
+  }
+}
+
+function setDraft(path, value, { dirty = true, context = null } = {}) {
+  const branch = path.reduce((acc, key) => acc?.[key], state.drafts);
+  if (!branch) return;
+  if (Object.prototype.hasOwnProperty.call(branch, 'value')) {
+    branch.value = value ?? '';
+  } else if (value && typeof value === 'object') {
+    Object.assign(branch, value);
+  }
+  branch.dirty = dirty;
+  if (branch.projectId != null && context != null) branch.projectId = context;
+  if (branch.contextKey !== undefined && context != null) branch.contextKey = context;
+  setState({ drafts: state.drafts });
+}
+
+function draftValue(path, fallback = '') {
+  const branch = path.reduce((acc, key) => acc?.[key], state.drafts);
+  if (branch == null) return fallback;
+  if (Object.prototype.hasOwnProperty.call(branch, 'value')) {
+    return branch.value ?? fallback;
+  }
+  return branch;
 }
 
 function updateLocalRunLog(text, { append = false } = {}) {
@@ -914,6 +1027,8 @@ function showPrompt(message, {
 } = {}) {
   return new Promise((resolve) => {
     promptResolver = resolve;
+    state.drafts.promptModal.value = initialValue || '';
+    state.drafts.promptModal.dirty = false;
     setState({
       promptOpen: true,
       promptMessage: message,
@@ -1853,6 +1968,7 @@ function connectSocket(projectId) {
       if (socketProjectId) socketClient.emit('joinProject', socketProjectId);
     });
     socketClient.on('projectStatus', (payload) => {
+      debugCounter('socket:projectStatus', { projectId: payload?.projectId || null });
       if (!payload?.environments || payload.projectId !== state.projectId) return;
       const envs = payload.environments;
       const nextBuildStatus = {
@@ -1996,6 +2112,7 @@ function connectSocket(projectId) {
       }
     });
     socketClient.on('buildUpdated', (payload) => {
+      debugCounter('socket:buildUpdated', { environment: payload?.environment || null });
       const env = payload.environment;
       const prevStatus = state.buildStatus[env] || 'offline';
       const envState = projectEnvironmentState(state.projectId, env);
@@ -2082,6 +2199,7 @@ function connectSocket(projectId) {
       });
     });
     socketClient.on('runtimeQuotaExceeded', (payload) => {
+      debugCounter('socket:runtimeQuotaExceeded', { environment: payload?.environment || null });
       const env = payload?.environment;
       if (!env || !state.projectId) return;
       const message = formatRuntimeQuotaNotice(payload);
@@ -2100,9 +2218,42 @@ function connectSocket(projectId) {
   }
 }
 
-class AppShell extends HTMLElement {
+class HtmlRegionElement extends BaseElement {
+  setRenderer(renderer) {
+    this._renderer = renderer;
+    if (this._mounted) {
+      this.performUpdate(this._props || {}, null, new Set(['__renderer']));
+    }
+  }
+
+  renderStatic() {
+    this.innerHTML = '';
+  }
+
+  performUpdate(nextProps) {
+    if (!this._renderer) return;
+    this.patchHtml(this, this._renderer(nextProps));
+  }
+}
+
+customElements.define('landing-auth-region', HtmlRegionElement);
+customElements.define('app-header-region', HtmlRegionElement);
+customElements.define('app-main-region', HtmlRegionElement);
+customElements.define('app-settings-region', HtmlRegionElement);
+customElements.define('app-dialogs-region', HtmlRegionElement);
+
+class AppShell extends BaseElement {
   connectedCallback() {
-    this.render();
+    super.connectedCallback();
+    this._unsubscribe = store.subscribe(null, (_nextState, changedKeys) => {
+      this.update(state, this._prevStateSnapshot || null, changedKeys);
+      this._prevStateSnapshot = {
+        token: state.token,
+        projectId: state.projectId,
+        environment: state.environment
+      };
+    });
+    this.update(state, null, new Set(Object.keys(state)));
     if (state.token) {
       connectSocket(state.projectId);
       if (!this._ticker) {
@@ -2112,6 +2263,10 @@ class AppShell extends HTMLElement {
   }
 
   disconnectedCallback() {
+    if (this._unsubscribe) {
+      this._unsubscribe();
+      this._unsubscribe = null;
+    }
     if (this._ticker) {
       clearInterval(this._ticker);
       this._ticker = null;
@@ -2127,56 +2282,94 @@ class AppShell extends HTMLElement {
     });
   }
 
-  render() {
-    const project = state.projects.find((p) => p.id === state.projectId) || null;
-    const isAuthed = Boolean(state.token);
-    document.body.classList.toggle('app-dark', isAuthed && state.darkMode);
+  renderStatic() {
     this.innerHTML = `
       ${this.renderIconSprite()}
-      ${isAuthed ? `
+      <landing-auth-region></landing-auth-region>
+      <div data-authed-shell hidden>
+        <app-header-region></app-header-region>
+        <main>
+          <app-main-region></app-main-region>
+        </main>
+        <app-dialogs-region></app-dialogs-region>
+        <app-settings-region></app-settings-region>
+      </div>
+    `;
+  }
+
+  cacheRefs() {
+    this.refs = {
+      auth: this.querySelector('landing-auth-region'),
+      authedShell: this.querySelector('[data-authed-shell]'),
+      header: this.querySelector('app-header-region'),
+      main: this.querySelector('app-main-region'),
+      dialogs: this.querySelector('app-dialogs-region'),
+      settings: this.querySelector('app-settings-region')
+    };
+    this.refs.auth?.setRenderer(() => this.renderAuth());
+    this.refs.header?.setRenderer(() => {
+      const project = state.projects.find((p) => p.id === state.projectId) || null;
+      return `
         <header class="app-header">
           <div class="header-container">
-          <div class="header-grid">
-           <div class="brand">
-            <span class="brand-mark" aria-hidden="true">
-              <span class="brand-cube">
-                <span class="face"></span>
-                <span class="face"></span>
-                <span class="face"></span>
-                <span class="face"></span>
-                <span class="face"></span>
-                <span class="face"></span>
-              </span>
-            </span>
-            Vibes Platform
-          </div>
-          <div class="project-env">
-              ${this.renderEnvBadges()}
-              ${this.renderProjectSelect(project)}
-              ${this.renderNerdLevel()}
+            <div class="header-grid">
+              <div class="brand">
+                <span class="brand-mark" aria-hidden="true">
+                  <span class="brand-cube">
+                    <span class="face"></span>
+                    <span class="face"></span>
+                    <span class="face"></span>
+                    <span class="face"></span>
+                    <span class="face"></span>
+                    <span class="face"></span>
+                  </span>
+                </span>
+                Vibes Platform
+              </div>
+              <div class="project-env">
+                ${this.renderEnvBadges()}
+                ${this.renderProjectSelect(project)}
+                ${this.renderNerdLevel()}
+              </div>
+              <div class="header-actions">
+                ${this.renderPlanBadge()}
+                ${this.renderAccountMenu()}
+              </div>
             </div>
-            <div class="header-actions">
-              ${this.renderPlanBadge()}
-              ${this.renderAccountMenu()}
-            </div>
           </div>
-          </div>
-        ${this.renderHeaderProgress()}
+          ${this.renderHeaderProgress()}
         </header>
-        <main>
-          ${this.renderMain(project)}
-        </main>
-        ${this.renderModal()}
-        ${this.renderConfirmModal()}
-        ${this.renderPromptModal()}
-        ${this.renderAndroidSetupModal()}
-        ${this.renderIosSetupModal()}
-        ${this.renderDeletingModal()}
-        ${this.renderSettings()}
-      ` : `
-        ${this.renderAuth()}
-      `}
-    `;
+      `;
+    });
+    this.refs.main?.setRenderer(() => {
+      const project = state.projects.find((p) => p.id === state.projectId) || null;
+      return this.renderMain(project);
+    });
+    this.refs.dialogs?.setRenderer(() => [
+      this.renderModal(),
+      this.renderConfirmModal(),
+      this.renderPromptModal(),
+      this.renderAndroidSetupModal(),
+      this.renderIosSetupModal(),
+      this.renderDeletingModal()
+    ].join(''));
+    this.refs.settings?.setRenderer(() => this.renderSettings());
+  }
+
+  bindEvents() {
+    this.bind();
+  }
+
+  performUpdate(nextProps, prevProps, changedKeys) {
+    const isAuthed = Boolean(nextProps.token);
+    document.body.classList.toggle('app-dark', isAuthed && nextProps.darkMode);
+    if (this.refs?.auth) this.refs.auth.hidden = isAuthed;
+    if (this.refs?.authedShell) this.refs.authedShell.hidden = !isAuthed;
+    this.refs?.auth?.update(nextProps, prevProps, changedKeys);
+    this.refs?.header?.update(nextProps, prevProps, changedKeys);
+    this.refs?.main?.update(nextProps, prevProps, changedKeys);
+    this.refs?.dialogs?.update(nextProps, prevProps, changedKeys);
+    this.refs?.settings?.update(nextProps, prevProps, changedKeys);
     this.bind();
   }
 
@@ -2420,6 +2613,8 @@ class AppShell extends HTMLElement {
   }
 
   renderAuth() {
+    seedDraft(['auth'], state.drafts.auth, null);
+    const authDraft = state.drafts.auth;
     return `
       <div class="page landing">
         <header class="top-bar" aria-label="Primary">
@@ -2650,8 +2845,8 @@ class AppShell extends HTMLElement {
               <h2 id="auth-title">Register your workspace</h2>
               <p>Start with a single prompt. Scale when it clicks.</p>
               <div class="grid">
-                <input id="registerEmail" type="email" placeholder="Email" />
-                <input id="registerPassword" type="password" placeholder="Password (optional)" />
+                <input id="registerEmail" type="email" placeholder="Email" value="${escapeHtml(authDraft.registerEmail || '')}" />
+                <input id="registerPassword" type="password" placeholder="Password (optional)" value="${escapeHtml(authDraft.registerPassword || '')}" />
                 <button id="registerBtn">Register</button>
               </div>
             </div>
@@ -2659,8 +2854,8 @@ class AppShell extends HTMLElement {
               <h2>Welcome back</h2>
               <p>Pick up where your team left off.</p>
               <div class="grid">
-                <input id="loginEmail" type="email" placeholder="Email" />
-                <input id="loginPassword" type="password" placeholder="Password (optional)" />
+                <input id="loginEmail" type="email" placeholder="Email" value="${escapeHtml(authDraft.loginEmail || '')}" />
+                <input id="loginPassword" type="password" placeholder="Password (optional)" value="${escapeHtml(authDraft.loginPassword || '')}" />
                 <button id="loginBtn">Log in</button>
               </div>
             </div>
@@ -2735,6 +2930,8 @@ class AppShell extends HTMLElement {
   }
 
   renderCreateProject() {
+    seedDraft(['createProject'], state.createProjectName || '', 'create-project');
+    const createProjectName = draftValue(['createProject'], state.createProjectName || '');
     const mobileSelected = state.createInterfaces.mobile;
     return `
       <div class="card">
@@ -2765,7 +2962,7 @@ class AppShell extends HTMLElement {
           </div>
         </div>
         <div class="grid">
-          <input id="createProjectName" type="text" placeholder="Project name" value="${escapeHtml(state.createProjectName)}" maxlength="30" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" />
+          <input id="createProjectName" type="text" placeholder="Project name" value="${escapeHtml(createProjectName)}" maxlength="30" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" />
           <div class="interface-choice">
             <label class="checkbox">
               <input id="createInterfaceWeb" type="checkbox" ${state.createInterfaces.web ? 'checked' : ''} />
@@ -2823,6 +3020,8 @@ class AppShell extends HTMLElement {
   }
 
   renderSubmit(project) {
+    seedDraft(['taskPrompt'], state.taskPromptDraft || '', state.projectId || 'no-project');
+    const taskPromptValue = draftValue(['taskPrompt'], state.taskPromptDraft || '');
     const env = state.environment;
     const isBeginner = state.nerdLevel === 'beginner';
     const isDevelopment = env === 'development';
@@ -2908,7 +3107,7 @@ class AppShell extends HTMLElement {
             ` : ''}
           ` : ''}
         ` : ''}
-        <textarea id="taskPrompt" placeholder="A good title for the feature or fix you want to make...\n\nDescribe exactly what you want to see, what you expect \nto happen when you click somewhere etc...\n\nWatch your ideas come to life!\nIn moments you will be viewing the updates${isBeginner ? '.' : '\nand reading a summary of what we have done!'}">${state.taskPromptDraft || ''}</textarea>
+        <textarea id="taskPrompt" placeholder="A good title for the feature or fix you want to make...\n\nDescribe exactly what you want to see, what you expect \nto happen when you click somewhere etc...\n\nWatch your ideas come to life!\nIn moments you will be viewing the updates${isBeginner ? '.' : '\nand reading a summary of what we have done!'}">${taskPromptValue || ''}</textarea>
         <div class="row m-top-sm submit-controls">
           <div class="row">
             <button id="submitTask">Submit</button>
@@ -2937,7 +3136,10 @@ class AppShell extends HTMLElement {
   }
 
   renderAdvanced(project) {
-    const envText = state.envVarsMap[state.environment] || '';
+    seedDraft(['deployWebhook'], state.deployWebhookUrl || '', state.projectId || 'no-project');
+    seedDraft(['envVars', state.environment], state.envVarsMap[state.environment] || '', state.projectId || 'no-project');
+    const deployWebhookValue = draftValue(['deployWebhook'], state.deployWebhookUrl || '');
+    const envText = draftValue(['envVars', state.environment], state.envVarsMap[state.environment] || '');
     const envCount = envText.split('\n').map((line) => line.trim()).filter(Boolean).length;
     const envSummary = envCount === 0 ? 'No variables saved yet.' : `${envCount} variable${envCount === 1 ? '' : 's'} saved.`;
     const isEditingEnv = state.envEditing?.[state.environment];
@@ -2969,7 +3171,7 @@ class AppShell extends HTMLElement {
         </div>
         <div>
           <h3>Deploy Webhook</h3>
-          <input id="deployWebhookUrl" type="text" placeholder="https://example.com/webhook" value="${state.deployWebhookUrl || ''}" />
+          <input id="deployWebhookUrl" type="text" placeholder="https://example.com/webhook" value="${escapeHtml(deployWebhookValue || '')}" />
           <div class="row">
             <button id="saveDeployWebhook" ${state.deployWebhookBusy ? 'disabled' : ''}>${state.deployWebhookBusy ? 'Saving...' : 'Save'}</button>
             <button class="ghost" id="clearDeployWebhook" ${state.deployWebhookBusy ? 'disabled' : ''}>Clear</button>
@@ -3183,11 +3385,12 @@ class AppShell extends HTMLElement {
   }
 
   renderModal() {
+    seedDraft(['sessionSave'], '', state.projectId || 'no-project');
     return `
       <div class="modal" id="saveModal">
         <div class="modal-content">
           <h3>Save Development Session</h3>
-          <input id="saveMessage" type="text" placeholder="Summary of this session" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" />
+          <input id="saveMessage" type="text" placeholder="Summary of this session" value="${escapeHtml(draftValue(['sessionSave'], ''))}" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" />
           <div class="row">
             <button id="confirmSave">Save</button>
             <button class="ghost" id="cancelSave">Cancel</button>
@@ -3214,12 +3417,13 @@ class AppShell extends HTMLElement {
   }
 
   renderPromptModal() {
+    seedDraft(['promptModal'], state.promptValue || '', state.promptMessage || '');
     return `
       <div class="modal ${state.promptOpen ? 'open' : ''}" id="promptModal">
         <div class="modal-content">
           <h3>Input Required</h3>
           <p class="notice">${state.promptMessage || ''}</p>
-          <input id="promptModalInput" type="text" placeholder="${state.promptPlaceholder || ''}" value="${state.promptValue || ''}" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" />
+          <input id="promptModalInput" type="text" placeholder="${state.promptPlaceholder || ''}" value="${escapeHtml(draftValue(['promptModal'], state.promptValue || ''))}" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" />
           <div class="row">
             <button id="promptModalConfirm">${state.promptConfirmText || 'Save'}</button>
             <button class="ghost" id="promptModalCancel">${state.promptCancelText || 'Cancel'}</button>
@@ -3424,9 +3628,19 @@ class AppShell extends HTMLElement {
     const mobileEnabled = Boolean(project?.interface_mobile);
     const mobileStackType = project?.mobile_stack_type || 'expo';
     const desktopSettings = state.desktopSettings || {};
-    const demoOpenAiKeyValue = state.demoOpenAiKeyDraft == null
-      ? (state.demoOpenAiKey || '')
-      : state.demoOpenAiKeyDraft;
+    const settingsContext = `${state.projectId || 'no-project'}:${state.settingsOpen ? 'open' : 'closed'}`;
+    seedDraft(['renameProject'], project?.name || '', state.projectId || 'no-project');
+    seedDraft(['settings'], {
+      demoOpenAiKey: state.demoOpenAiKeyDraft == null ? (state.demoOpenAiKey || '') : state.demoOpenAiKeyDraft,
+      desktopUseLocalApi: Boolean(desktopSettings.useLocalApi),
+      desktopLocalApiUrl: desktopSettings.localApiUrl || '',
+      desktopIosCommand: desktopSettings.iosCommand || '',
+      desktopAndroidCommand: desktopSettings.androidCommand || '',
+      verifiedOnly: Boolean(state.deploymentPolicy?.verifiedOnly),
+      darkMode: Boolean(state.darkMode)
+    }, settingsContext);
+    const settingsDraft = draftValue(['settings'], {});
+    const demoOpenAiKeyValue = settingsDraft.demoOpenAiKey || '';
     return `
       <div class="modal ${state.settingsOpen ? 'open' : ''}" id="settingsModal">
         <div class="modal-content">
@@ -3434,7 +3648,7 @@ class AppShell extends HTMLElement {
           ${project ? `
             <div class="grid">
               <label for="projectNameInput" class="tag">Project Name</label>
-              <input id="projectNameInput" placeholder="Project name" value="${project.name}" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" />
+              <input id="projectNameInput" placeholder="Project name" value="${escapeHtml(draftValue(['renameProject'], project.name))}" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" />
               <div class="row">
                 <button id="renameProject">Update Name</button>
                 <button class="danger" id="deleteProject">Delete Project</button>
@@ -3477,7 +3691,7 @@ class AppShell extends HTMLElement {
           <div class="setting-row toggle-row">
             <span class="tag">Theme</span>
             <label class="toggle">
-              <input id="darkModeToggle" type="checkbox" ${state.darkMode ? 'checked' : ''} />
+              <input id="darkModeToggle" type="checkbox" ${settingsDraft.darkMode ? 'checked' : ''} />
               <span class="toggle-track"><span class="toggle-thumb"></span></span>
               <span class="toggle-label">Dark mode</span>
             </label>
@@ -3486,7 +3700,7 @@ class AppShell extends HTMLElement {
           <div class="setting-row toggle-row">
             <span class="tag">Verified-only deploys</span>
             <label class="toggle">
-              <input id="verifiedOnlyToggle" type="checkbox" ${state.deploymentPolicy?.verifiedOnly ? 'checked' : ''} />
+              <input id="verifiedOnlyToggle" type="checkbox" ${settingsDraft.verifiedOnly ? 'checked' : ''} />
               <span class="toggle-track"><span class="toggle-thumb"></span></span>
               <span class="toggle-label">Require full verified builds</span>
             </label>
@@ -3505,7 +3719,7 @@ class AppShell extends HTMLElement {
           <p class="notice">Used for tasks while demo mode is enabled.</p>
           <div class="setting-row">
             <span class="tag">OpenAI API Key</span>
-            <input id="demoOpenAiKey" type="password" placeholder="sk-..." value="${escapeHtml(demoOpenAiKeyValue)}" autocomplete="new-password" autocorrect="off" autocapitalize="off" spellcheck="false" />
+              <input id="demoOpenAiKey" type="password" placeholder="sk-..." value="${escapeHtml(demoOpenAiKeyValue)}" autocomplete="new-password" autocorrect="off" autocapitalize="off" spellcheck="false" />
           </div>
           ` : ''}
           ${DESKTOP_BRIDGE ? `
@@ -3514,22 +3728,22 @@ class AppShell extends HTMLElement {
           <div class="setting-row toggle-row">
             <span class="tag">Use Local API</span>
             <label class="toggle">
-              <input id="desktopUseLocalApi" type="checkbox" ${desktopSettings.useLocalApi ? 'checked' : ''} />
+              <input id="desktopUseLocalApi" type="checkbox" ${settingsDraft.desktopUseLocalApi ? 'checked' : ''} />
               <span class="toggle-track"><span class="toggle-thumb"></span></span>
               <span class="toggle-label">Local</span>
             </label>
           </div>
           <div class="setting-row">
             <span class="tag">Local API URL</span>
-            <input id="desktopLocalApiUrl" placeholder="http://localhost:4000" value="${desktopSettings.localApiUrl || ''}" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" />
+            <input id="desktopLocalApiUrl" placeholder="http://localhost:4000" value="${escapeHtml(settingsDraft.desktopLocalApiUrl || '')}" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" />
           </div>
           <div class="setting-row">
             <span class="tag">iOS Command</span>
-            <input id="desktopIosCommand" placeholder="npx expo run:ios" value="${desktopSettings.iosCommand || ''}" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" />
+            <input id="desktopIosCommand" placeholder="npx expo run:ios" value="${escapeHtml(settingsDraft.desktopIosCommand || '')}" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" />
           </div>
           <div class="setting-row">
             <span class="tag">Android Command</span>
-            <input id="desktopAndroidCommand" placeholder="npx expo run:android" value="${desktopSettings.androidCommand || ''}" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" />
+            <input id="desktopAndroidCommand" placeholder="npx expo run:android" value="${escapeHtml(settingsDraft.desktopAndroidCommand || '')}" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" />
           </div>
           ` : ''}
             ${false ? `
@@ -3747,6 +3961,9 @@ class AppShell extends HTMLElement {
     });
 
     this.querySelector('#demoOpenAiKey')?.addEventListener('input', (event) => {
+      const next = { ...draftValue(['settings'], {}) };
+      next.demoOpenAiKey = event.target.value;
+      setDraft(['settings'], next);
       state.demoOpenAiKeyDraft = event.target.value;
     });
 
@@ -3775,6 +3992,7 @@ class AppShell extends HTMLElement {
     });
     this.querySelector('#promptModalCancel')?.addEventListener('click', () => closePrompt(null));
     this.querySelector('#promptModalInput')?.addEventListener('input', (event) => {
+      setDraft(['promptModal'], event.target.value, { context: state.promptMessage || '' });
       state.promptValue = event.target.value;
     });
     promptModal?.addEventListener('click', (event) => {
@@ -3797,9 +4015,40 @@ class AppShell extends HTMLElement {
     });
 
     this.querySelector('#darkModeToggle')?.addEventListener('change', (event) => {
+      const next = { ...draftValue(['settings'], {}) };
+      next.darkMode = event.target.checked;
+      setDraft(['settings'], next);
       const enabled = event.target.checked;
       localStorage.setItem('vibes_dark_mode', enabled ? 'true' : 'false');
       setState({ darkMode: enabled });
+    });
+    this.querySelector('#verifiedOnlyToggle')?.addEventListener('change', (event) => {
+      const next = { ...draftValue(['settings'], {}) };
+      next.verifiedOnly = event.target.checked;
+      setDraft(['settings'], next);
+    });
+    this.querySelector('#desktopUseLocalApi')?.addEventListener('change', (event) => {
+      const next = { ...draftValue(['settings'], {}) };
+      next.desktopUseLocalApi = event.target.checked;
+      setDraft(['settings'], next);
+    });
+    this.querySelector('#desktopLocalApiUrl')?.addEventListener('input', (event) => {
+      const next = { ...draftValue(['settings'], {}) };
+      next.desktopLocalApiUrl = event.target.value;
+      setDraft(['settings'], next);
+    });
+    this.querySelector('#desktopIosCommand')?.addEventListener('input', (event) => {
+      const next = { ...draftValue(['settings'], {}) };
+      next.desktopIosCommand = event.target.value;
+      setDraft(['settings'], next);
+    });
+    this.querySelector('#desktopAndroidCommand')?.addEventListener('input', (event) => {
+      const next = { ...draftValue(['settings'], {}) };
+      next.desktopAndroidCommand = event.target.value;
+      setDraft(['settings'], next);
+    });
+    this.querySelector('#projectNameInput')?.addEventListener('input', (event) => {
+      setDraft(['renameProject'], event.target.value, { context: state.projectId || 'no-project' });
     });
 
     this.querySelector('#loginBtn')?.addEventListener('click', async () => {
@@ -3846,6 +4095,22 @@ class AppShell extends HTMLElement {
 
     const authModal = this.querySelector('.auth-modal');
     if (authModal) {
+      this.querySelector('#loginEmail')?.addEventListener('input', (event) => {
+        state.drafts.auth.loginEmail = event.target.value;
+        state.drafts.auth.dirty = true;
+      });
+      this.querySelector('#loginPassword')?.addEventListener('input', (event) => {
+        state.drafts.auth.loginPassword = event.target.value;
+        state.drafts.auth.dirty = true;
+      });
+      this.querySelector('#registerEmail')?.addEventListener('input', (event) => {
+        state.drafts.auth.registerEmail = event.target.value;
+        state.drafts.auth.dirty = true;
+      });
+      this.querySelector('#registerPassword')?.addEventListener('input', (event) => {
+        state.drafts.auth.registerPassword = event.target.value;
+        state.drafts.auth.dirty = true;
+      });
       this.querySelectorAll('[data-auth-target]').forEach((btn) => {
         btn.addEventListener('click', (event) => {
           event.preventDefault();
@@ -3977,6 +4242,7 @@ class AppShell extends HTMLElement {
     });
 
     this.querySelector('#createProjectName')?.addEventListener('input', (event) => {
+      setDraft(['createProject'], event.target.value, { context: 'create-project' });
       state.createProjectName = event.target.value || '';
     });
 
@@ -4530,6 +4796,7 @@ class AppShell extends HTMLElement {
     });
 
     this.querySelector('#taskPrompt')?.addEventListener('input', (e) => {
+      setDraft(['taskPrompt'], e.target.value, { context: state.projectId || 'no-project' });
       state.taskPromptDraft = e.target.value;
     });
 
@@ -4550,6 +4817,8 @@ class AppShell extends HTMLElement {
           body: JSON.stringify({ prompt, environment: state.environment })
         });
         setState({ tasks: [task, ...state.tasks], taskPromptDraft: '', activeTaskId: task.id });
+        state.drafts.taskPrompt.value = '';
+        state.drafts.taskPrompt.dirty = false;
         this.querySelector('#taskPrompt').value = '';
       } catch (err) {
         showError(err);
@@ -4634,6 +4903,7 @@ class AppShell extends HTMLElement {
         setTaskStatus('Add at least one task before saving a session.', { autoHide: true });
         return;
       }
+      seedDraft(['sessionSave'], '', state.projectId || 'no-project');
       this.querySelector('#saveModal').classList.add('open');
     });
 
@@ -4650,10 +4920,15 @@ class AppShell extends HTMLElement {
           body: JSON.stringify({ message })
         });
         setState({ sessions: [session, ...state.sessions] });
+        state.drafts.sessionSave.value = '';
+        state.drafts.sessionSave.dirty = false;
         this.querySelector('#saveModal').classList.remove('open');
       } catch (err) {
         showError(err);
       }
+    });
+    this.querySelector('#saveMessage')?.addEventListener('input', (event) => {
+      setDraft(['sessionSave'], event.target.value, { context: state.projectId || 'no-project' });
     });
 
     const uploadRepoFile = async (file) => {
@@ -4776,6 +5051,7 @@ class AppShell extends HTMLElement {
     };
 
     deployWebhookInput?.addEventListener('input', (event) => {
+      setDraft(['deployWebhook'], event.target.value, { context: state.projectId || 'no-project' });
       state.deployWebhookUrl = event.target.value;
     });
 
@@ -4791,6 +5067,8 @@ class AppShell extends HTMLElement {
 
     this.querySelector('#clearDeployWebhook')?.addEventListener('click', async () => {
       if (deployWebhookInput) deployWebhookInput.value = '';
+      state.drafts.deployWebhook.value = '';
+      state.drafts.deployWebhook.dirty = false;
       state.deployWebhookUrl = '';
       await persistDeployWebhook('');
     });
@@ -4813,6 +5091,7 @@ class AppShell extends HTMLElement {
       })
         .then(() => {
           state.envVarsMap[state.environment] = raw;
+          state.drafts.envVars[state.environment].dirty = false;
           setState({
             envVarsMap: { ...state.envVarsMap },
             envMessage: 'Saved',
@@ -4821,6 +5100,9 @@ class AppShell extends HTMLElement {
         })
         .catch((err) => setState({ envMessage: err.message }))
         .finally(() => setState({ envBusy: false }));
+    });
+    this.querySelector('#envVars')?.addEventListener('input', (event) => {
+      setDraft(['envVars', state.environment], event.target.value, { context: state.projectId || 'no-project' });
     });
 
     const runLocalCommand = async (command, { killExisting = false, env = null, cwd = '' } = {}) => {
