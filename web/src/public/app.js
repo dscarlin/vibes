@@ -142,6 +142,8 @@ const state = {
   createProjectName: '',
   authModalOpen: false,
   authModalMode: 'register',
+  authErrorMessage: '',
+  authErrorCode: '',
   desktopSettings: {
     useLocalApi: false,
     localApiUrl: '',
@@ -1251,6 +1253,38 @@ function formatPlanError(code, details = {}) {
     return `Bandwidth limit reached for this project.${planName ? ` <span class="plan-subtext">Current plan: ${planName}.</span>` : ''}${usage} <span class="plan-subtext">Upgrade to increase bandwidth limits.</span>${upgradeCta}`;
   }
   return null;
+}
+
+function formatAuthError(code) {
+  if (code === 'auth_registration_closed') {
+    return 'Sorry, customer registration is not yet open. We will let you know when it is and we hope to see you again soon!';
+  }
+  if (code === 'auth_email_required') {
+    return 'Please enter your email address.';
+  }
+  if (code === 'auth_invalid_credentials') {
+    return 'Invalid email or password.';
+  }
+  return 'Something went wrong. Please try again.';
+}
+
+function clearAuthError({ render = true } = {}) {
+  if (!state.authErrorMessage && !state.authErrorCode) return;
+  if (render) {
+    setState({ authErrorMessage: '', authErrorCode: '' });
+    return;
+  }
+  state.authErrorMessage = '';
+  state.authErrorCode = '';
+  document.querySelectorAll('.auth-panel-error').forEach((node) => node.remove());
+}
+
+function setAuthError(err) {
+  const code = String(err?.code || err?.details?.error || '');
+  setState({
+    authErrorCode: code,
+    authErrorMessage: formatAuthError(code)
+  });
 }
 
 async function api(path, options = {}) {
@@ -2664,7 +2698,10 @@ class AppShell extends HTMLElement {
         <main>
           <section class="hero" aria-labelledby="hero-title">
             <div class="hero-content">
-              <p class="eyebrow">The future of website development is here</p>
+              <div class="hero-intro">
+                <div class="hero-ribbon" aria-label="Coming soon">Coming Soon!</div>
+                <p class="eyebrow">The future of website development is here</p>
+              </div>
               <h1 id="hero-title">Zero Code Required</h1>
               <h1 id="hero-title">Scalable and Secure</h1>
               <h1 id="hero-title">AI Powered</h1>
@@ -2822,61 +2859,32 @@ class AppShell extends HTMLElement {
             </div>
           </section>
 
-          <section class="section final-cta">
-            <div class="cta-panel">
-              <div>
-                <h2>Ready to build without the bottlenecks?</h2>
-                <p>
-                  Launch your next product with AI-managed architecture, instant iteration cycles, and zero
-                  lock-in.
-                </p>
-              </div>
-              <div class="download-panel">
-                <div class="download-header">
-                  <span class="tag">Desktop App</span>
-                  <p class="notice">Run projects locally with mobile simulators and device support.</p>
-                </div>
-                <div class="download-grid">
-                  <a class="ghost download-card" href="${API_URL}/downloads/desktop?platform=mac" target="_blank" rel="noreferrer">
-                    <strong>macOS</strong>
-                    <span>Download .dmg</span>
-                  </a>
-                  <a class="ghost download-card" href="${API_URL}/downloads/desktop?platform=windows" target="_blank" rel="noreferrer">
-                    <strong>Windows</strong>
-                    <span>Download .exe</span>
-                  </a>
-                  <a class="ghost download-card" href="${API_URL}/downloads/desktop?platform=linux" target="_blank" rel="noreferrer">
-                    <strong>Linux</strong>
-                    <span>Download .AppImage</span>
-                  </a>
-                </div>
-                <p class="notice">Downloads are hosted directly from the platform server.</p>
-              </div>
-            </div>
-          </section>
         </main>
 
         <div class="auth-modal ${state.authModalOpen ? 'open' : ''}" aria-hidden="${state.authModalOpen ? 'false' : 'true'}">
           <div class="auth-dialog" role="dialog" aria-modal="true" aria-labelledby="auth-title">
             <button class="auth-close" type="button" aria-label="Close">Close</button>
-            ${state.authNotice ? `<div class="notice plan-error">${state.authNotice}</div>` : ''}
             <div class="auth-panel" data-auth-panel="register" ${state.authModalMode === 'register' ? '' : 'style="display:none;"'}>
               <h2 id="auth-title">Register your workspace</h2>
               <p>Start with a single prompt. Scale when it clicks.</p>
+              ${state.authModalMode === 'register' && state.authErrorMessage ? `<div class="notice plan-error auth-panel-error">${escapeHtml(state.authErrorMessage)}</div>` : ''}
               <div class="grid">
                 <input id="registerEmail" type="email" placeholder="Email" />
                 <input id="registerPassword" type="password" placeholder="Password (optional)" />
                 <button id="registerBtn">Register</button>
               </div>
+              <p class="auth-switch-copy">Already have access? <button class="auth-switch" type="button" data-auth-switch="login">Log in</button></p>
             </div>
             <div class="auth-panel" data-auth-panel="login" ${state.authModalMode === 'login' ? '' : 'style="display:none;"'}>
               <h2>Welcome back</h2>
               <p>Pick up where your team left off.</p>
+              ${state.authModalMode === 'login' && state.authErrorMessage ? `<div class="notice plan-error auth-panel-error">${escapeHtml(state.authErrorMessage)}</div>` : ''}
               <div class="grid">
                 <input id="loginEmail" type="email" placeholder="Email" />
                 <input id="loginPassword" type="password" placeholder="Password (optional)" />
                 <button id="loginBtn">Log in</button>
               </div>
+              <p class="auth-switch-copy">Need an invite? <button class="auth-switch" type="button" data-auth-switch="register">Register</button></p>
             </div>
           </div>
         </div>
@@ -4042,12 +4050,14 @@ class AppShell extends HTMLElement {
           authModalOpen: false,
           authNotice: '',
           createProjectNotice: '',
+          authErrorMessage: '',
+          authErrorCode: '',
           projectNotice: ''
         });
         await loadProjects();
         connectSocket(state.projectId);
       } catch (err) {
-        showError(err, { noticeField: 'authNotice' });
+        setAuthError(err);
       }
     });
 
@@ -4065,13 +4075,21 @@ class AppShell extends HTMLElement {
           authModalOpen: false,
           authNotice: '',
           createProjectNotice: '',
+          authErrorMessage: '',
+          authErrorCode: '',
           projectNotice: ''
         });
         await loadProjects();
         connectSocket(state.projectId);
       } catch (err) {
-        showError(err, { noticeField: 'authNotice' });
+        setAuthError(err);
       }
+    });
+
+    ['#loginEmail', '#loginPassword', '#registerEmail', '#registerPassword'].forEach((selector) => {
+      this.querySelector(selector)?.addEventListener('input', () => {
+        clearAuthError({ render: false });
+      });
     });
 
     const authModal = this.querySelector('.auth-modal');
@@ -4083,17 +4101,29 @@ class AppShell extends HTMLElement {
           setState({
             authModalOpen: true,
             authModalMode: mode,
-            authNotice: ''
+            authNotice: '',
+            authErrorMessage: '',
+            authErrorCode: ''
           });
         });
       });
 
       authModal.querySelector('.auth-close')?.addEventListener('click', () => {
-        setState({ authModalOpen: false, authNotice: '' });
+        setState({ authModalOpen: false, authNotice: '', authErrorMessage: '', authErrorCode: '' });
+      });
+      authModal.querySelectorAll('[data-auth-switch]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          setState({
+            authModalMode: btn.getAttribute('data-auth-switch') || 'register',
+            authNotice: '',
+            authErrorMessage: '',
+            authErrorCode: ''
+          });
+        });
       });
       authModal.addEventListener('click', (event) => {
         if (event.target === authModal) {
-          setState({ authModalOpen: false, authNotice: '' });
+          setState({ authModalOpen: false, authNotice: '', authErrorMessage: '', authErrorCode: '' });
         }
       });
     }

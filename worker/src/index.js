@@ -3939,7 +3939,7 @@ async function waitForIngressAlbHostname(namespace, ingressName) {
   return '';
 }
 
-async function applyIngressDnsRecord(appHost, ingressName) {
+async function applyIngressDnsRecord(appHost, ingressName, namespace = workspaceNamespace()) {
   if (!workspaceAutoDnsEnabled() || isLocalPlatform()) return;
   const route53Domain = workspaceRoute53Domain(appHost);
   let hostedZoneId = String(process.env.ROUTE53_HOSTED_ZONE_ID || '').trim();
@@ -3960,7 +3960,7 @@ async function applyIngressDnsRecord(appHost, ingressName) {
   }
   if (!hostedZoneId) return;
 
-  const albDns = await waitForIngressAlbHostname(workspaceNamespace(), ingressName);
+  const albDns = await waitForIngressAlbHostname(namespace, ingressName);
   if (!albDns) return;
 
   const region = process.env.AWS_REGION || 'us-east-1';
@@ -4004,12 +4004,11 @@ async function applyIngressDnsRecord(appHost, ingressName) {
   }
 }
 
-async function applyDevelopmentIngress(projectId, serviceName, appHost) {
+async function applyDevelopmentIngress(projectId, serviceName, appHost, namespace = workspaceNamespace()) {
   if (isLocalPlatform()) return;
   if (!process.env.ACM_CERT_ARN) {
     throw new Error('ACM_CERT_ARN required for development ingress');
   }
-  const namespace = workspaceNamespace();
   const appName = `vibes-app-${projectId}`;
   const groupName = process.env.ALB_GROUP_NAME || 'vibes-shared';
   const groupOrder = process.env.ALB_GROUP_ORDER || '50';
@@ -4045,12 +4044,21 @@ spec:
                 name: ${serviceName}
                 port:
                   number: ${WORKSPACE_SERVICE_CLUSTER_PORT}
-`;
+  `;
   await applyManifest(namespace, manifest, `${appName}-ingress.yaml`);
   try {
-    await applyIngressDnsRecord(appHost, appName);
+    await applyIngressDnsRecord(appHost, appName, namespace);
   } catch (err) {
     console.warn(`Development DNS update failed for ${appHost}`, err?.message || err);
+  }
+}
+
+async function removeInactiveDevelopmentIngresses(projectId, activeNamespace) {
+  const ingressName = `vibes-app-${projectId}`;
+  const namespaces = new Set([workspaceNamespace(), runtimeNamespace('development')]);
+  namespaces.delete(activeNamespace);
+  for (const namespace of namespaces) {
+    await deleteResource(namespace, 'ingress', ingressName);
   }
 }
 
@@ -4060,11 +4068,13 @@ async function switchDevelopmentRoute(projectId, target = 'workspace') {
   const project = projectRes.rows[0];
   if (!project) throw new Error('Project not found');
   const workspace = await loadWorkspace(projectId);
+  const namespace = target === 'workspace' ? workspaceNamespace() : runtimeNamespace('development');
   const serviceName =
     target === 'workspace'
       ? (workspace?.service_name || workspaceNames(projectId).serviceName)
       : `vibes-app-${projectId}`;
-  await applyDevelopmentIngress(projectId, serviceName, hostFor(project, 'development'));
+  await applyDevelopmentIngress(projectId, serviceName, hostFor(project, 'development'), namespace);
+  await removeInactiveDevelopmentIngresses(projectId, namespace);
   await upsertWorkspace(projectId, { preview_mode: target === 'workspace' ? 'workspace' : 'verified' });
 }
 
