@@ -823,11 +823,11 @@ app.put('/settings/deployment-policy', requireAuth, async (req, res) => {
 
 app.post('/auth/register', authRateLimit, async (req, res) => {
   const { email, password } = req.body || {};
+  if (!email) return res.status(400).json({ error: 'auth_email_required' });
   const demoUsers = (process.env.DEMO_USERS || '').split(',').map((e) => e.trim().toLowerCase()).filter((e) => e);
   if (demoUsers.length > 0 && !demoUsers.includes(email.toLowerCase())) {
-    return res.status(403).json({ error: 'Registration is not yet open but come back soon!' });
+    return res.status(403).json({ error: 'auth_registration_closed' });
   }
-  if (!email) return res.status(400).json({ error: 'email required' });
   const user = await registerUser(email, password || null);
   const token = signToken({ userId: user.id, email: user.email });
   const planName = user.plan || DEFAULT_PLAN;
@@ -842,9 +842,9 @@ app.post('/auth/register', authRateLimit, async (req, res) => {
 
 app.post('/auth/login', authRateLimit, async (req, res) => {
   const { email, password } = req.body || {};
-  if (!email) return res.status(400).json({ error: 'email required' });
+  if (!email) return res.status(400).json({ error: 'auth_email_required' });
   const user = await authenticateUser(email, password || null);
-  if (!user) return res.status(401).json({ error: 'invalid credentials' });
+  if (!user) return res.status(401).json({ error: 'auth_invalid_credentials' });
   const token = signToken({ userId: user.id, email: user.email });
   res.json({
     token,

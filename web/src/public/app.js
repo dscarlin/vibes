@@ -142,6 +142,8 @@ const state = {
   createProjectName: '',
   authModalOpen: false,
   authModalMode: 'register',
+  authErrorMessage: '',
+  authErrorCode: '',
   desktopSettings: {
     useLocalApi: false,
     localApiUrl: '',
@@ -204,9 +206,16 @@ const state = {
   taskDetails: {},
   sessionDetails: {},
   taskPromptDraft: '',
-  activeTaskId: null,
-  taskStatusMessage: '',
-  taskStatusPersistent: false,
+  taskSubmissionPending: null,
+  taskProcessingHydration: {
+    projectId: null,
+    tasksLoaded: false,
+    buildLoaded: false
+  },
+  toasts: [],
+  authNotice: '',
+  createProjectNotice: '',
+  projectNotice: '',
   runtimeUsage: { month: '', plan: '', usage: {} },
   runtimeUsageLoading: false,
   runtimeUsageError: '',
@@ -265,7 +274,6 @@ const state = {
 let socketClient = null;
 let socketProjectId = null;
 let runtimeUsageTimer = null;
-let taskStatusTimer = null;
 let headerProgressTimer = null;
 let confirmResolver = null;
 let promptResolver = null;
@@ -277,6 +285,9 @@ let appLogTypewriter = null;
 let appLogLineQueue = [];
 let appLogQueueEnv = '';
 let appLogScrollAnchor = null;
+let toastCounter = 0;
+const toastTimers = new Map();
+const recentToastKeys = new Map();
 const APP_LOG_POLL_INTERVAL_MS = 2000;
 const APP_LOG_FETCH_LINES = 2000;
 const APP_LOG_TYPE_INTERVAL_MS = 40;
@@ -807,7 +818,7 @@ async function ensureDesktopRepo(projectId) {
     });
     return localPath;
   } catch (err) {
-    setTaskStatus(`Repo sync failed: ${err?.message || err}`, { autoHide: true });
+    pushToast({ message: `Repo sync failed: ${err?.message || err}`, tone: 'error', dedupeKey: `repo-sync:${projectId}` });
     return '';
   } finally {
     setState({ localRunBusy: false });
@@ -860,7 +871,7 @@ async function forceSyncDesktopRepo(projectId) {
     });
     return true;
   } catch (err) {
-    setTaskStatus(`Repo refresh failed: ${err?.message || err}`, { autoHide: true });
+    pushToast({ message: `Repo refresh failed: ${err?.message || err}`, tone: 'error', dedupeKey: `repo-refresh:${projectId}` });
     return false;
   } finally {
     setState({ localRunBusy: false });
@@ -930,23 +941,221 @@ function updateLocalRunLog(text, { append = false } = {}) {
   setState({ localRunLog: next });
 }
 
-function setTaskStatus(message, { autoHide = false, persistent = false } = {}) {
-  if (taskStatusTimer) {
-    clearTimeout(taskStatusTimer);
-    taskStatusTimer = null;
-  }
-  setState({ taskStatusMessage: message, taskStatusPersistent: persistent });
-  if (autoHide) {
-    taskStatusTimer = setTimeout(() => {
-      setState({ taskStatusMessage: '', taskStatusPersistent: false });
-    }, 3000);
+function clearExpiredToastKeys() {
+  const now = Date.now();
+  for (const [key, expiresAt] of recentToastKeys.entries()) {
+    if (expiresAt <= now) recentToastKeys.delete(key);
   }
 }
 
-function showError(err, { autoHide = true, persistent = false } = {}) {
+function dismissToast(id) {
+  const timer = toastTimers.get(id);
+  if (timer) {
+    clearTimeout(timer);
+    toastTimers.delete(id);
+  }
+  if (!state.toasts.some((toast) => toast.id === id)) return;
+  setState({ toasts: state.toasts.filter((toast) => toast.id !== id) });
+}
+
+function clearAllToasts() {
+  for (const timer of toastTimers.values()) {
+    clearTimeout(timer);
+  }
+  toastTimers.clear();
+  setState({ toasts: [] });
+}
+
+function pushToast({ message, tone = 'info', durationMs = 3000, dedupeKey = '', html = '', allowHtml = false } = {}) {
+  const text = String(message || '').trim();
+  const trustedHtml = allowHtml ? String(html || text || '').trim() : '';
+  if (!text && !trustedHtml) return null;
+  clearExpiredToastKeys();
+  if (dedupeKey) {
+    const active = state.toasts.some((toast) => toast.dedupeKey === dedupeKey);
+    const recent = recentToastKeys.has(dedupeKey);
+    if (active || recent) return null;
+  }
+  const id = `toast-${Date.now()}-${++toastCounter}`;
+  const createdAt = Date.now();
+  const expiresAt = createdAt + Math.max(500, Number(durationMs) || 3000);
+  const nextToast = {
+    id,
+    tone,
+    message: text,
+    html: trustedHtml,
+    allowHtml: Boolean(allowHtml && trustedHtml),
+    createdAt,
+    expiresAt,
+    dedupeKey
+  };
+  const nextToasts = [...state.toasts, nextToast].slice(-3);
+  const dropped = state.toasts.filter((toast) => !nextToasts.some((item) => item.id === toast.id));
+  dropped.forEach((toast) => {
+    const timer = toastTimers.get(toast.id);
+    if (timer) {
+      clearTimeout(timer);
+      toastTimers.delete(toast.id);
+    }
+  });
+  setState({ toasts: nextToasts });
+  if (dedupeKey) recentToastKeys.set(dedupeKey, expiresAt);
+  const timer = setTimeout(() => dismissToast(id), expiresAt - Date.now());
+  toastTimers.set(id, timer);
+  return id;
+}
+
+function setTaskProcessingHydration(projectId, patch = {}) {
+  const nextProjectId = projectId ?? state.projectId ?? null;
+  const base =
+    state.taskProcessingHydration?.projectId === nextProjectId
+      ? state.taskProcessingHydration
+      : { projectId: nextProjectId, tasksLoaded: false, buildLoaded: false };
+  setState({
+    taskProcessingHydration: {
+      ...base,
+      ...patch,
+      projectId: nextProjectId
+    }
+  });
+}
+
+function resetTaskProcessingState(projectId = state.projectId) {
+  setState({
+    taskSubmissionPending: null,
+    taskProcessingHydration: {
+      projectId: projectId ?? null,
+      tasksLoaded: false,
+      buildLoaded: false
+    }
+  });
+}
+
+function currentDevelopmentTask(tasks = state.tasks) {
+  return (Array.isArray(tasks) ? tasks : []).find((task) => String(task?.environment || 'development').toLowerCase() === 'development') || null;
+}
+
+function taskById(taskId, tasks = state.tasks) {
+  if (!taskId) return null;
+  return (Array.isArray(tasks) ? tasks : []).find((task) => String(task?.id) === String(taskId)) || null;
+}
+
+function taskBuildMatchesProcessingFlow(
+  task,
+  envState = projectEnvironmentState(state.projectId, 'development'),
+  latestBuild = state.latestBuild.development
+) {
+  if (!task?.commit_hash || !envState || !latestBuild?.ref_commit) return false;
+  const taskId = String(task.id || '');
+  const commitHash = String(task.commit_hash || '');
+  const selectedTaskMatches = String(envState.selected_task_id || '') === taskId;
+  const liveTaskMatches = String(envState.live_task_id || '') === taskId;
+  const selectedCommitMatches = String(envState.selected_commit_sha || '') === commitHash;
+  const liveCommitMatches = String(envState.live_commit_sha || '') === commitHash;
+  return latestBuild.ref_commit === commitHash && (selectedTaskMatches || liveTaskMatches || selectedCommitMatches || liveCommitMatches);
+}
+
+function currentDevelopmentTaskForBuild(
+  envState = projectEnvironmentState(state.projectId, 'development'),
+  latestBuild = state.latestBuild.development
+) {
+  const byLiveTask = taskById(envState?.live_task_id);
+  if (byLiveTask && taskBuildMatchesProcessingFlow(byLiveTask, envState, latestBuild)) return byLiveTask;
+  const bySelectedTask = taskById(envState?.selected_task_id);
+  if (bySelectedTask && taskBuildMatchesProcessingFlow(bySelectedTask, envState, latestBuild)) return bySelectedTask;
+  const latestTask = currentDevelopmentTask();
+  if (latestTask && taskBuildMatchesProcessingFlow(latestTask, envState, latestBuild)) return latestTask;
+  return null;
+}
+
+function deriveTaskProcessingView() {
+  if (state.environment !== 'development' || !state.projectId) return null;
+  const pending = state.taskSubmissionPending;
+  if (pending?.projectId === state.projectId && pending.environment === 'development') {
+    return { state: 'submission_pending', message: 'Reading Request', taskId: null };
+  }
+  const hydration = state.taskProcessingHydration || {};
+  if (hydration.projectId !== state.projectId || !hydration.tasksLoaded || !hydration.buildLoaded) {
+    return null;
+  }
+  const task = currentDevelopmentTask();
+  if (!task) return null;
+  const status = String(task.status || '').toLowerCase();
+  if (status === 'queued') {
+    return { state: 'queued', message: 'Reading Request', taskId: task.id };
+  }
+  if (status === 'running') {
+    return { state: 'running', message: 'Designing and implementing changes', taskId: task.id };
+  }
+  if (status !== 'completed') return null;
+  const envState = projectEnvironmentState(state.projectId, 'development');
+  const latestBuild = state.latestBuild.development;
+  if (!envState) return null;
+  const workspaceState = String(envState.workspace_state || '').toLowerCase();
+  const buildStatus = String(envState.build_status || '').toLowerCase();
+  const verifyStatus = String(latestBuild?.status || '').toLowerCase();
+  const taskLinkedBuild = taskBuildMatchesProcessingFlow(task, envState, latestBuild);
+  const followOnActive =
+    workspaceState === 'starting' ||
+    buildStatus === 'building' ||
+    (taskLinkedBuild && verifyStatus === 'building');
+  if (!followOnActive) return null;
+  return { state: 'deploying_or_verifying', message: 'Deploying your update', taskId: task.id };
+}
+
+function setInlineNotice(field, message = '') {
+  if (!field) return;
+  setState({ [field]: message || '' });
+}
+
+function showError(err, { noticeField = '', tone = 'error', dedupeKey = '' } = {}) {
   const message = err?.message || String(err || '');
   const isPlanError = Boolean(err?.code && String(err.code).startsWith('plan_'));
-  setTaskStatus(message, { autoHide: !isPlanError && autoHide, persistent: isPlanError || persistent });
+  if (noticeField) {
+    setInlineNotice(noticeField, message);
+    return;
+  }
+  if (isPlanError && state.projectId) {
+    setInlineNotice('projectNotice', message);
+    return;
+  }
+  pushToast({ message, tone, dedupeKey });
+}
+
+function notifyTaskTerminalResult(task, status) {
+  const normalizedStatus = String(status || '').toLowerCase();
+  if (!task?.id || !['failed', 'cancelled'].includes(normalizedStatus)) return;
+  pushToast({
+    message: normalizedStatus === 'failed' ? 'Task failed before deployment completed' : 'Task cancelled',
+    tone: normalizedStatus === 'failed' ? 'error' : 'warning',
+    dedupeKey: `task-result:${task.id}:${normalizedStatus}`
+  });
+}
+
+function notifyDevelopmentBuildTerminal(payload) {
+  if (payload?.environment !== 'development') return;
+  const status = String(payload.status || '').toLowerCase();
+  if (!['live', 'failed', 'cancelled'].includes(status)) return;
+  const envState = projectEnvironmentState(state.projectId, 'development');
+  const latestBuild = {
+    ...(state.latestBuild.development || {}),
+    ...(payload?.refCommit ? { ref_commit: payload.refCommit } : {}),
+    ...(payload?.status ? { status: payload.status } : {})
+  };
+  const task = currentDevelopmentTaskForBuild(envState, latestBuild);
+  if (!task?.id) return;
+  const tone = status === 'live' ? 'success' : status === 'failed' ? 'error' : 'warning';
+  const message =
+    status === 'live'
+      ? 'Your update is live'
+      : status === 'failed'
+        ? 'Deployment failed for the latest task'
+        : 'Deployment cancelled for the latest task';
+  pushToast({
+    message,
+    tone,
+    dedupeKey: `build-result:${state.projectId}:development:${latestBuild.ref_commit || ''}:${status}`
+  });
 }
 
 function showConfirmChoices(message, {
@@ -1112,6 +1321,38 @@ function formatPlanError(code, details = {}) {
   return null;
 }
 
+function formatAuthError(code) {
+  if (code === 'auth_registration_closed') {
+    return 'Sorry, customer registration is not yet open. We will let you know when it is and we hope to see you again soon!';
+  }
+  if (code === 'auth_email_required') {
+    return 'Please enter your email address.';
+  }
+  if (code === 'auth_invalid_credentials') {
+    return 'Invalid email or password.';
+  }
+  return 'Something went wrong. Please try again.';
+}
+
+function clearAuthError({ render = true } = {}) {
+  if (!state.authErrorMessage && !state.authErrorCode) return;
+  if (render) {
+    setState({ authErrorMessage: '', authErrorCode: '' });
+    return;
+  }
+  state.authErrorMessage = '';
+  state.authErrorCode = '';
+  document.querySelectorAll('.auth-panel-error').forEach((node) => node.remove());
+}
+
+function setAuthError(err) {
+  const code = String(err?.code || err?.details?.error || '');
+  setState({
+    authErrorCode: code,
+    authErrorMessage: formatAuthError(code)
+  });
+}
+
 async function api(path, options = {}) {
   const { timeoutMs, ...fetchOptions } = options;
   const controller = timeoutMs ? new AbortController() : null;
@@ -1156,6 +1397,7 @@ async function loadProjects() {
     if (projectId) storeProject(state.user?.id, projectId);
     const projectChanged = Boolean(state.projectId && projectId && state.projectId !== projectId);
     if (projectChanged) stopAppLogPolling();
+    if (projectChanged || !projectId) resetTaskProcessingState(projectId);
     setState({
       projects,
       projectId,
@@ -1197,6 +1439,7 @@ async function loadProjects() {
         appLogFrozenByEnv: blankEnvMap(false),
         environment: 'development',
         nerdLevel: 'beginner',
+        createProjectNotice: '',
         database: createDatabaseState()
       });
       return;
@@ -1679,6 +1922,9 @@ function ensureAppLogPolling() {
 async function loadTasks(projectId) {
   const tasks = await api(`/projects/${projectId}/tasks`);
   setState({ tasks });
+  if (projectId === state.projectId) {
+    setTaskProcessingHydration(projectId, { tasksLoaded: true });
+  }
 }
 
 async function loadSessions(projectId) {
@@ -1717,6 +1963,9 @@ async function loadLatestBuild(projectId, environment, options = {}) {
     latestBuild: { ...state.latestBuild },
     buildStatus: { ...state.buildStatus }
   });
+  if (projectId === state.projectId && environment === 'development') {
+    setTaskProcessingHydration(projectId, { buildLoaded: true });
+  }
   if (environment === state.environment) {
     ensureBuildLogPolling();
     if (
@@ -2284,6 +2533,7 @@ function connectSocket(projectId) {
       const nextRuntimeNotice = { ...(state.runtimeQuotaNotice || {}) };
       if (nextRuntimeNotice[payload.projectId]) delete nextRuntimeNotice[payload.projectId];
       stopAppLogPolling();
+      resetTaskProcessingState(nextProjectId);
       setState({
         projects: remaining,
         projectId: nextProjectId,
@@ -2316,7 +2566,8 @@ function connectSocket(projectId) {
           appLogSnapshotByEnv: blankEnvMap(''),
           appLogLoading: blankEnvMap(false),
           appLogError: blankEnvMap(''),
-          appLogFrozenByEnv: blankEnvMap(false)
+          appLogFrozenByEnv: blankEnvMap(false),
+          createProjectNotice: ''
         });
       } else {
         loadTasks(nextProjectId);
@@ -2329,18 +2580,16 @@ function connectSocket(projectId) {
     });
     socketClient.on('taskUpdated', (payload) => {
       const idx = state.tasks.findIndex((t) => t.id === payload.id);
+      let nextTask = payload;
       if (idx >= 0) {
         state.tasks[idx] = { ...state.tasks[idx], ...payload };
+        nextTask = state.tasks[idx];
         setState({ tasks: [...state.tasks] });
       }
-      if (payload.id && payload.id === state.activeTaskId) {
-        if (payload.status === 'running') {
-          setTaskStatus('Designing and implementing changes', { persistent: true });
-        }
-        if (payload.status === 'completed') {
-          setTaskStatus('Deploying your update', { persistent: true });
-        }
+      if (payload.id && state.taskSubmissionPending?.projectId === state.projectId) {
+        setState({ taskSubmissionPending: null });
       }
+      notifyTaskTerminalResult(nextTask, payload.status);
     });
     socketClient.on('taskDeleted', (payload) => {
       const nextTasks = state.tasks.filter((t) => t.id !== payload.id);
@@ -2394,21 +2643,6 @@ function connectSocket(projectId) {
         state.progressVisibleUntil[env] = Date.now() + 3000;
         scheduleHeaderProgressRefresh();
       }
-      if (env === state.environment && state.taskStatusPersistent) {
-        if (payload.status === 'building' && !keepPreviewState) {
-          setTaskStatus('Deploying your update', { persistent: true });
-        }
-        if (payload.status === 'live' && !keepPreviewState) {
-          setTaskStatus('Your application is ready to view at the link to the left', { autoHide: true });
-          setState({ activeTaskId: null });
-        }
-        if (payload.status === 'cancelled') {
-          setTaskStatus('Build cancelled', { autoHide: true });
-        }
-        if (keepPreviewState && payload.status === 'building') {
-          setTaskStatus('Preview live. Verifying in background', { persistent: true });
-        }
-      }
       if (env === state.environment && (payload.status === 'failed' || payload.status === 'live' || payload.status === 'cancelled' || payload.status === 'building')) {
         loadLatestBuild(state.projectId, env);
       }
@@ -2437,6 +2671,7 @@ function connectSocket(projectId) {
         progressVisibleUntil: { ...state.progressVisibleUntil },
         runtimeQuotaNotice: nextRuntimeNotice
       });
+      notifyDevelopmentBuildTerminal(payload);
     });
     socketClient.on('runtimeQuotaExceeded', (payload) => {
       const env = payload?.environment;
@@ -2447,9 +2682,6 @@ function connectSocket(projectId) {
       projectNotices[env] = message;
       nextRuntimeNotice[state.projectId] = projectNotices;
       setState({ runtimeQuotaNotice: nextRuntimeNotice });
-      if (env === state.environment) {
-        setTaskStatus(message, { persistent: true });
-      }
     });
   }
   if (socketClient.connected && socketProjectId) {
@@ -2523,6 +2755,7 @@ class AppShell extends HTMLElement {
         <main>
           ${this.renderMain(project)}
         </main>
+        ${this.renderToasts()}
         ${this.renderModal()}
         ${this.renderConfirmModal()}
         ${this.renderPromptModal()}
@@ -2532,9 +2765,24 @@ class AppShell extends HTMLElement {
         ${this.renderSettings()}
       ` : `
         ${this.renderAuth()}
+        ${this.renderToasts()}
       `}
     `;
     this.bind();
+  }
+
+  renderToasts() {
+    if (!state.toasts.length) return '';
+    return `
+      <div class="toast-stack" aria-live="polite" aria-atomic="true">
+        ${state.toasts.map((toast) => `
+          <div class="toast toast-${escapeHtml(toast.tone || 'info')}" data-toast-id="${toast.id}">
+            <div class="toast-body">${toast.allowHtml ? toast.html : escapeHtml(toast.message || '')}</div>
+            <button class="toast-dismiss" type="button" data-dismiss-toast="${toast.id}" aria-label="Dismiss notification">Close</button>
+          </div>
+        `).join('')}
+      </div>
+    `;
   }
 
   renderIconSprite() {
@@ -2807,7 +3055,10 @@ class AppShell extends HTMLElement {
         <main>
           <section class="hero" aria-labelledby="hero-title">
             <div class="hero-content">
-              <p class="eyebrow">The future of website development is here</p>
+              <div class="hero-intro">
+                <div class="hero-ribbon" aria-label="Coming soon">Coming Soon!</div>
+                <p class="eyebrow">The future of website development is here</p>
+              </div>
               <h1 id="hero-title">Zero Code Required</h1>
               <h1 id="hero-title">Scalable and Secure</h1>
               <h1 id="hero-title">AI Powered</h1>
@@ -2965,61 +3216,32 @@ class AppShell extends HTMLElement {
             </div>
           </section>
 
-          <section class="section final-cta">
-            <div class="cta-panel">
-              <div>
-                <h2>Ready to build without the bottlenecks?</h2>
-                <p>
-                  Launch your next product with AI-managed architecture, instant iteration cycles, and zero
-                  lock-in.
-                </p>
-              </div>
-              <div class="download-panel">
-                <div class="download-header">
-                  <span class="tag">Desktop App</span>
-                  <p class="notice">Run projects locally with mobile simulators and device support.</p>
-                </div>
-                <div class="download-grid">
-                  <a class="ghost download-card" href="${API_URL}/downloads/desktop?platform=mac" target="_blank" rel="noreferrer">
-                    <strong>macOS</strong>
-                    <span>Download .dmg</span>
-                  </a>
-                  <a class="ghost download-card" href="${API_URL}/downloads/desktop?platform=windows" target="_blank" rel="noreferrer">
-                    <strong>Windows</strong>
-                    <span>Download .exe</span>
-                  </a>
-                  <a class="ghost download-card" href="${API_URL}/downloads/desktop?platform=linux" target="_blank" rel="noreferrer">
-                    <strong>Linux</strong>
-                    <span>Download .AppImage</span>
-                  </a>
-                </div>
-                <p class="notice">Downloads are hosted directly from the platform server.</p>
-              </div>
-            </div>
-          </section>
         </main>
 
         <div class="auth-modal ${state.authModalOpen ? 'open' : ''}" aria-hidden="${state.authModalOpen ? 'false' : 'true'}">
           <div class="auth-dialog" role="dialog" aria-modal="true" aria-labelledby="auth-title">
             <button class="auth-close" type="button" aria-label="Close">Close</button>
-            ${state.taskStatusMessage ? `<div class="notice plan-error">${state.taskStatusMessage}</div>` : ''}
             <div class="auth-panel" data-auth-panel="register" ${state.authModalMode === 'register' ? '' : 'style="display:none;"'}>
               <h2 id="auth-title">Register your workspace</h2>
               <p>Start with a single prompt. Scale when it clicks.</p>
+              ${state.authModalMode === 'register' && state.authErrorMessage ? `<div class="notice plan-error auth-panel-error">${escapeHtml(state.authErrorMessage)}</div>` : ''}
               <div class="grid">
                 <input id="registerEmail" type="email" placeholder="Email" />
                 <input id="registerPassword" type="password" placeholder="Password (optional)" />
                 <button id="registerBtn">Register</button>
               </div>
+              <p class="auth-switch-copy">Already have access? <button class="auth-switch" type="button" data-auth-switch="login">Log in</button></p>
             </div>
             <div class="auth-panel" data-auth-panel="login" ${state.authModalMode === 'login' ? '' : 'style="display:none;"'}>
               <h2>Welcome back</h2>
               <p>Pick up where your team left off.</p>
+              ${state.authModalMode === 'login' && state.authErrorMessage ? `<div class="notice plan-error auth-panel-error">${escapeHtml(state.authErrorMessage)}</div>` : ''}
               <div class="grid">
                 <input id="loginEmail" type="email" placeholder="Email" />
                 <input id="loginPassword" type="password" placeholder="Password (optional)" />
                 <button id="loginBtn">Log in</button>
               </div>
+              <p class="auth-switch-copy">Need an invite? <button class="auth-switch" type="button" data-auth-switch="register">Register</button></p>
             </div>
           </div>
         </div>
@@ -3068,6 +3290,7 @@ class AppShell extends HTMLElement {
     return `
       <div class="content">
         ${quotaNotice ? `<div class="notice quota-notice">${quotaNotice}</div>` : ''}
+        ${state.projectNotice ? `<div class="notice plan-error">${state.projectNotice}</div>` : ''}
         <div class="grid">
           ${showAdvanced ? this.renderAdvanced(project) : ''}
           ${showSubmit ? this.renderSubmit(project) : ''}
@@ -3097,7 +3320,7 @@ class AppShell extends HTMLElement {
       <div class="card">
         <h2>Launch the Future of Your SMB Website</h2>
         <p class="notice">Describe your business in plain English. We design, build, and deploy a site that grows with you.</p>
-        ${state.taskStatusMessage ? `<div class="notice plan-error">${state.taskStatusMessage}</div>` : ''}
+        ${state.createProjectNotice ? `<div class="notice plan-error">${state.createProjectNotice}</div>` : ''}
         <div class="stepper">
           <div class="step">
             <div class="step-num">1</div>
@@ -3206,13 +3429,14 @@ class AppShell extends HTMLElement {
     const appLogError = state.appLogError[env] || '';
     const appLogLoading = Boolean(state.appLogLoading[env]);
     const appLogPreview = appLogText || (appLogLoading ? 'Connecting to application logs...' : (appLogError || 'No application logs yet.'));
+    const processingView = deriveTaskProcessingView();
     return `
       <div class="card">
         <div class="section-title">
           <h2>Submit Task</h2>
           <span class="badge ${badgeClass(state.buildStatus[env])}">${state.buildStatus[env]}</span>
         </div>
-        ${state.taskStatusMessage  ? `
+        ${processingView ? `
           <div class="task-status">
             <div class="status-cube" aria-hidden="true">
               <div class="cube">
@@ -3224,7 +3448,7 @@ class AppShell extends HTMLElement {
                 <span class="face"></span>
               </div>
             </div>
-            <div class="status-text">${state.taskStatusMessage}</div>
+            <div class="status-text">${processingView.message}</div>
           </div>
         ` : ''}
         <p class="notice"><a class="tag view-project-link" href="${projectProtocol()}://${projectUrl(project, env)}" target="_blank" rel="noreferrer">${isDevelopment ? 'Open Development' : 'View your project'}</a></p>
@@ -4127,6 +4351,11 @@ class AppShell extends HTMLElement {
         openExternalLink(link.getAttribute('href'));
       });
     });
+    this.querySelectorAll('[data-dismiss-toast]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        dismissToast(btn.getAttribute('data-dismiss-toast'));
+      });
+    });
     this.querySelector('#logout')?.addEventListener('click', () => {
       localStorage.removeItem('vibes_token');
       const key = projectStorageKey(state.user?.id);
@@ -4138,6 +4367,8 @@ class AppShell extends HTMLElement {
       }
       stopRuntimeUsagePolling();
       stopAppLogPolling();
+      resetTaskProcessingState(null);
+      clearAllToasts();
       setState({
         token: '',
         user: null,
@@ -4156,7 +4387,10 @@ class AppShell extends HTMLElement {
         appLogLoading: blankEnvMap(false),
         appLogError: blankEnvMap(''),
         appLogFrozenByEnv: blankEnvMap(false),
-        runtimeQuotaNotice: {}
+        runtimeQuotaNotice: {},
+        authNotice: '',
+        createProjectNotice: '',
+        projectNotice: ''
       });
     });
 
@@ -4328,6 +4562,7 @@ class AppShell extends HTMLElement {
     this.querySelector('#loginBtn')?.addEventListener('click', async () => {
       const email = this.querySelector('#loginEmail').value;
       const password = this.querySelector('#loginPassword').value;
+      setState({ authNotice: '' });
       try {
         const data = await api('/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) });
         localStorage.setItem('vibes_token', data.token);
@@ -4336,19 +4571,23 @@ class AppShell extends HTMLElement {
           user: data.user,
           desktopSettings: loadDesktopSettings(data.user?.id),
           authModalOpen: false,
-          taskStatusMessage: '',
-          taskStatusPersistent: false
+          authNotice: '',
+          createProjectNotice: '',
+          authErrorMessage: '',
+          authErrorCode: '',
+          projectNotice: ''
         });
         await loadProjects();
         connectSocket(state.projectId);
       } catch (err) {
-        showError(err);
+        setAuthError(err);
       }
     });
 
     this.querySelector('#registerBtn')?.addEventListener('click', async () => {
       const email = this.querySelector('#registerEmail').value;
       const password = this.querySelector('#registerPassword').value;
+      setState({ authNotice: '' });
       try {
         const data = await api('/auth/register', { method: 'POST', body: JSON.stringify({ email, password }) });
         localStorage.setItem('vibes_token', data.token);
@@ -4357,14 +4596,23 @@ class AppShell extends HTMLElement {
           user: data.user,
           desktopSettings: loadDesktopSettings(data.user?.id),
           authModalOpen: false,
-          taskStatusMessage: '',
-          taskStatusPersistent: false
+          authNotice: '',
+          createProjectNotice: '',
+          authErrorMessage: '',
+          authErrorCode: '',
+          projectNotice: ''
         });
         await loadProjects();
         connectSocket(state.projectId);
       } catch (err) {
-        showError(err);
+        setAuthError(err);
       }
+    });
+
+    ['#loginEmail', '#loginPassword', '#registerEmail', '#registerPassword'].forEach((selector) => {
+      this.querySelector(selector)?.addEventListener('input', () => {
+        clearAuthError({ render: false });
+      });
     });
 
     const authModal = this.querySelector('.auth-modal');
@@ -4376,18 +4624,29 @@ class AppShell extends HTMLElement {
           setState({
             authModalOpen: true,
             authModalMode: mode,
-            taskStatusMessage: '',
-            taskStatusPersistent: false
+            authNotice: '',
+            authErrorMessage: '',
+            authErrorCode: ''
           });
         });
       });
 
       authModal.querySelector('.auth-close')?.addEventListener('click', () => {
-        setState({ authModalOpen: false });
+        setState({ authModalOpen: false, authNotice: '', authErrorMessage: '', authErrorCode: '' });
+      });
+      authModal.querySelectorAll('[data-auth-switch]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          setState({
+            authModalMode: btn.getAttribute('data-auth-switch') || 'register',
+            authNotice: '',
+            authErrorMessage: '',
+            authErrorCode: ''
+          });
+        });
       });
       authModal.addEventListener('click', (event) => {
         if (event.target === authModal) {
-          setState({ authModalOpen: false });
+          setState({ authModalOpen: false, authNotice: '', authErrorMessage: '', authErrorCode: '' });
         }
       });
     }
@@ -4396,6 +4655,7 @@ class AppShell extends HTMLElement {
       const projectId = e.target.value;
       if (projectId === '__new__') {
         stopAppLogPolling();
+        resetTaskProcessingState(null);
         setState({
           projectId: null,
           environment: 'development',
@@ -4413,7 +4673,9 @@ class AppShell extends HTMLElement {
           appLogError: blankEnvMap(''),
           appLogFrozenByEnv: blankEnvMap(false),
           deployWebhookUrl: '',
-          deployWebhookMessage: ''
+          deployWebhookMessage: '',
+          createProjectNotice: '',
+          projectNotice: ''
         });
         localStorage.setItem('vibes_nerd_level', 'beginner');
         const key = projectStorageKey(state.user?.id);
@@ -4423,6 +4685,7 @@ class AppShell extends HTMLElement {
       const storedEnv = loadStoredEnv(state.user?.id, projectId);
       storeProject(state.user?.id, projectId);
       stopAppLogPolling();
+      resetTaskProcessingState(projectId);
       setState({
         projectId,
         environment: storedEnv || state.environment,
@@ -4439,6 +4702,8 @@ class AppShell extends HTMLElement {
         appLogError: blankEnvMap(''),
         appLogFrozenByEnv: blankEnvMap(false),
         deployWebhookMessage: '',
+        createProjectNotice: '',
+        projectNotice: '',
         database: createDatabaseState()
       });
       await loadTasks(projectId);
@@ -4457,13 +4722,13 @@ class AppShell extends HTMLElement {
 
     this.querySelector('#createProjectBtn')?.addEventListener('click', async () => {
       const name = this.querySelector('#createProjectName')?.value?.trim();
-      if (!name) return setTaskStatus('Enter a project name', { autoHide: true });
+      if (!name) return setInlineNotice('createProjectNotice', 'Enter a project name');
       if (name.length > 30) {
-        return setTaskStatus('Project name must be 30 characters or fewer', { autoHide: true });
+        return setInlineNotice('createProjectNotice', 'Project name must be 30 characters or fewer');
       }
-      if (isProjectNameTaken(name)) return setTaskStatus('Project name already exists', { autoHide: true });
+      if (isProjectNameTaken(name)) return setInlineNotice('createProjectNotice', 'Project name already exists');
       try {
-        setState({ taskStatusMessage: '', taskStatusPersistent: false });
+        setState({ createProjectNotice: '' });
         const interfaces = [];
         if (state.createInterfaces.web) interfaces.push('web');
         if (state.createInterfaces.mobile) interfaces.push('mobile');
@@ -4475,13 +4740,14 @@ class AppShell extends HTMLElement {
         await loadProjects();
         storeEnv(state.user?.id, project.id, 'development');
         stopAppLogPolling();
+        resetTaskProcessingState(project.id);
         setState({
           projectId: project.id,
           environment: 'development',
           nerdLevel: 'beginner',
           createProjectName: '',
-          taskStatusMessage: '',
-          taskStatusPersistent: false,
+          createProjectNotice: '',
+          projectNotice: '',
           appLogsByEnv: blankEnvMap(''),
           appLogSnapshotByEnv: blankEnvMap(''),
           appLogLoading: blankEnvMap(false),
@@ -4495,15 +4761,16 @@ class AppShell extends HTMLElement {
         }
       } catch (err) {
         if (String(err.message || '').toLowerCase().includes('already exists')) {
-          setTaskStatus('Project name already exists. Please choose another.', { autoHide: true });
+          setInlineNotice('createProjectNotice', 'Project name already exists. Please choose another.');
           return;
         }
-        showError(err);
+        showError(err, { noticeField: 'createProjectNotice' });
       }
     });
 
     this.querySelector('#createProjectName')?.addEventListener('input', (event) => {
       state.createProjectName = event.target.value || '';
+      if (state.createProjectNotice) setState({ createProjectNotice: '' });
     });
 
     this.querySelector('#createInterfaceWeb')?.addEventListener('change', (event) => {
@@ -4603,6 +4870,7 @@ class AppShell extends HTMLElement {
         });
         if (!nextProjectId) {
           stopAppLogPolling();
+          resetTaskProcessingState(null);
           setState({
             tasks: [],
             sessions: [],
@@ -4616,15 +4884,18 @@ class AppShell extends HTMLElement {
             appLogsByEnv: blankEnvMap(''),
             appLogSnapshotByEnv: blankEnvMap(''),
             appLogLoading: blankEnvMap(false),
-            appLogError: blankEnvMap(''),
-            appLogFrozenByEnv: blankEnvMap(false),
-            environment: 'development',
-            nerdLevel: 'beginner'
-          });
+          appLogError: blankEnvMap(''),
+          appLogFrozenByEnv: blankEnvMap(false),
+          environment: 'development',
+          nerdLevel: 'beginner',
+          createProjectNotice: '',
+          projectNotice: ''
+        });
           return;
         }
         const storedEnv = loadStoredEnv(state.user?.id, nextProjectId);
-        setState({ environment: storedEnv || state.environment });
+        resetTaskProcessingState(nextProjectId);
+        setState({ environment: storedEnv || state.environment, projectNotice: '' });
         await loadTasks(nextProjectId);
         await loadSessions(nextProjectId);
         await loadEnvVars(nextProjectId, state.environment);
@@ -4642,14 +4913,20 @@ class AppShell extends HTMLElement {
       const project = state.projects.find((p) => p.id === state.projectId);
       if (!project) return;
       const name = this.querySelector('#projectNameInput')?.value?.trim();
-      if (!name) return setTaskStatus('Enter a project name', { autoHide: true });
-      if (isProjectNameTaken(name, project.id)) return setTaskStatus('Project name already exists', { autoHide: true });
+      if (!name) {
+        pushToast({ message: 'Enter a project name', tone: 'warning', dedupeKey: 'project-rename:empty' });
+        return;
+      }
+      if (isProjectNameTaken(name, project.id)) {
+        pushToast({ message: 'Project name already exists', tone: 'warning', dedupeKey: 'project-rename:duplicate' });
+        return;
+      }
       try {
         await api(`/projects/${project.id}`, { method: 'PUT', body: JSON.stringify({ name }) });
         await loadProjects();
       } catch (err) {
         if (String(err.message || '').toLowerCase().includes('already exists')) {
-          setTaskStatus('Project name already exists. Please choose another.', { autoHide: true });
+          pushToast({ message: 'Project name already exists. Please choose another.', tone: 'warning', dedupeKey: 'project-rename:duplicate' });
           return;
         }
         showError(err);
@@ -4679,8 +4956,11 @@ class AppShell extends HTMLElement {
     this.querySelectorAll('input[name="env"]').forEach((input) => {
       input.addEventListener('change', (e) => {
         const env = e.target.value;
-        setState({ environment: env });
+        setState({ environment: env, taskSubmissionPending: null, projectNotice: '' });
         storeEnv(state.user?.id, state.projectId, env);
+        if (env === 'development') {
+          setTaskProcessingHydration(state.projectId, { buildLoaded: false });
+        }
         if (state.projectId) {
           loadEnvVars(state.projectId, env);
           loadLatestBuild(state.projectId, env);
@@ -4703,9 +4983,14 @@ class AppShell extends HTMLElement {
       setState({
         environment: env,
         envEditing: { ...state.envEditing, [env]: false },
-        envMessage: ''
+        envMessage: '',
+        taskSubmissionPending: null,
+        projectNotice: ''
       });
       storeEnv(state.user?.id, state.projectId, env);
+      if (env === 'development') {
+        setTaskProcessingHydration(state.projectId, { buildLoaded: false });
+      }
       if (state.projectId) {
         loadEnvVars(state.projectId, env);
         loadLatestBuild(state.projectId, env);
@@ -4806,18 +5091,22 @@ class AppShell extends HTMLElement {
         body: JSON.stringify(body)
       });
       if (response?.status === 'already_live') {
-        setTaskStatus(`${modeLabel} is already live`, { autoHide: true });
+        pushToast({ message: `${modeLabel} is already live`, tone: 'info', dedupeKey: `env-action:${state.projectId}:development:already-live:${modeKey}` });
       } else if (response?.status === 'already_starting') {
-        setTaskStatus(`Development is already starting in ${modeLabel}`, { autoHide: true });
+        pushToast({ message: `Development is already starting in ${modeLabel}`, tone: 'info', dedupeKey: `env-action:${state.projectId}:development:already-starting:${modeKey}` });
       } else {
-        setTaskStatus(`${wasAwake ? 'Switching Development to' : 'Waking Development in'} ${modeLabel}`, { autoHide: true });
+        pushToast({
+          message: `${wasAwake ? 'Switching Development to' : 'Waking Development in'} ${modeLabel}`,
+          tone: 'info',
+          dedupeKey: `env-action:${state.projectId}:development:wake:${modeKey}`
+        });
       }
       return response;
     };
 
     const runDevelopmentTaskAction = async (mode, commitHash, taskId) => {
       if (!commitHash) {
-        setTaskStatus('No commit hash available', { autoHide: true });
+        pushToast({ message: 'No commit hash available', tone: 'warning', dedupeKey: 'task-action:missing-commit' });
         return;
       }
       const modeLabel = developmentModeText(mode);
@@ -4828,7 +5117,7 @@ class AppShell extends HTMLElement {
           taskId: taskId || null,
           commitHash
         });
-        setTaskStatus(`Starting ${modeLabel}`, { autoHide: true });
+        pushToast({ message: `Starting ${modeLabel}`, tone: 'info', dedupeKey: `env-action:${state.projectId}:development:start:${mode}:${commitHash}` });
       } catch (err) {
         showError(err);
         loadProjects();
@@ -4843,19 +5132,20 @@ class AppShell extends HTMLElement {
         return;
       }
       if (env === 'development' && (action === 'select-preview' || action === 'select-full-build')) {
-        const project = currentProjectState();
-        const envState = projectEnvironmentState(project, env);
-        const modeKey = action === 'select-preview' ? 'workspace' : 'verified';
-        const modeLabel = developmentModeText(modeKey);
-        if (state.deploymentPolicy?.verifiedOnly && modeKey === 'workspace') {
-          setTaskStatus('Preview Mode is disabled by verified-only deploys', { autoHide: true });
+      const project = currentProjectState();
+      const envState = projectEnvironmentState(project, env);
+      const modeKey = action === 'select-preview' ? 'workspace' : 'verified';
+      const modeLabel = developmentModeText(modeKey);
+      setState({ projectNotice: '' });
+      if (state.deploymentPolicy?.verifiedOnly && modeKey === 'workspace') {
+          pushToast({ message: 'Preview Mode is disabled by verified-only deploys', tone: 'warning', dedupeKey: 'env-action:development:verified-only' });
           return;
         }
         if (developmentSelectedMode(project) === modeKey) return;
         if (!isDevelopmentAwake(envState)) {
           try {
             await saveDevelopmentSelection({ mode: modeKey });
-            setTaskStatus(`${modeLabel} selected`, { autoHide: true });
+            pushToast({ message: `${modeLabel} selected`, tone: 'info', dedupeKey: `env-action:${state.projectId}:development:select:${modeKey}` });
           } catch (err) {
             showError(err);
           }
@@ -4886,7 +5176,7 @@ class AppShell extends HTMLElement {
               live_task_id: null,
               live_commit_sha: null
             });
-            setTaskStatus(`${modeLabel} selected`, { autoHide: true });
+            pushToast({ message: `${modeLabel} selected`, tone: 'info', dedupeKey: `env-action:${state.projectId}:development:select:${modeKey}` });
           }
         } catch (err) {
           showError(err);
@@ -4896,6 +5186,7 @@ class AppShell extends HTMLElement {
       }
       if (env === 'development' && action === 'wake-development') {
         try {
+          setState({ projectNotice: '' });
           const selectedMode = developmentSelectedMode(currentProjectState());
           await wakeDevelopment({ mode: selectedMode });
         } catch (err) {
@@ -4907,7 +5198,8 @@ class AppShell extends HTMLElement {
       if (env === 'development' && action === 'sleep-development') {
         const ok = await showConfirm('Sleep Development?', { confirmText: 'Sleep' });
         if (!ok) return;
-        setTaskStatus('Sleeping Development…', { autoHide: true });
+        setState({ projectNotice: '' });
+        pushToast({ message: 'Sleeping Development...', tone: 'info', dedupeKey: `env-action:${state.projectId}:development:sleep` });
         try {
           await api(`/projects/${state.projectId}/stop`, {
             method: 'POST',
@@ -4925,11 +5217,12 @@ class AppShell extends HTMLElement {
         return;
       }
       if (action === 'cancel') {
+        setState({ projectNotice: '' });
         if (state.buildStatus[env] === 'canceling') {
-          setTaskStatus('Build cancel is already in progress.', { autoHide: true });
+          pushToast({ message: 'Build cancel is already in progress.', tone: 'info', dedupeKey: `env-action:${state.projectId}:${env}:cancel-pending` });
           return;
         }
-        setTaskStatus('Canceling build…', { autoHide: true });
+        pushToast({ message: 'Canceling build...', tone: 'info', dedupeKey: `env-action:${state.projectId}:${env}:cancel` });
         state.buildStatus[env] = 'canceling';
         setState({ buildStatus: { ...state.buildStatus } });
         try {
@@ -4948,7 +5241,8 @@ class AppShell extends HTMLElement {
       if (action === 'stop') {
         const ok = await showConfirm(`Stop the ${titleCase(env)} environment?`, { confirmText: 'Stop' });
         if (!ok) return;
-        setTaskStatus('Stopping environment…', { autoHide: true });
+        setState({ projectNotice: '' });
+        pushToast({ message: 'Stopping environment...', tone: 'info', dedupeKey: `env-action:${state.projectId}:${env}:stop` });
         try {
           await api(`/projects/${state.projectId}/stop`, {
             method: 'POST',
@@ -5045,10 +5339,12 @@ class AppShell extends HTMLElement {
           nerdLevel: level,
           environment: 'development',
           envEditing: { ...state.envEditing, development: false },
-          envMessage: ''
+          envMessage: '',
+          taskSubmissionPending: null
         });
         storeEnv(state.user?.id, state.projectId, 'development');
         if (state.projectId) {
+          setTaskProcessingHydration(state.projectId, { buildLoaded: false });
           loadEnvVars(state.projectId, 'development');
           loadLatestBuild(state.projectId, 'development');
         }
@@ -5063,23 +5359,34 @@ class AppShell extends HTMLElement {
 
     this.querySelector('#submitTask')?.addEventListener('click', async () => {
       const prompt = this.querySelector('#taskPrompt').value;
-      if (!prompt) return setTaskStatus('Enter a task prompt', { autoHide: true });
+      if (!prompt) {
+        pushToast({ message: 'Enter a task prompt', tone: 'warning', dedupeKey: 'task-submit:empty' });
+        return;
+      }
       const submitEnv = state.environment;
+      setState({ projectNotice: '' });
       prepareAppLogsForDeploy(submitEnv);
       if (state.appLogsVisible) {
         // Keep the panel cleared while waiting for the next build to start.
         stopAppLogPolling();
         updateAppLogPanel({ forceScroll: true });
       }
-      setTaskStatus('Reading Request', { persistent: true });
+      setState({
+        taskSubmissionPending: {
+          projectId: state.projectId,
+          environment: submitEnv,
+          createdAt: Date.now()
+        }
+      });
       try {
         const task = await api(`/projects/${state.projectId}/tasks`, {
           method: 'POST',
           body: JSON.stringify({ prompt, environment: state.environment })
         });
-        setState({ tasks: [task, ...state.tasks], taskPromptDraft: '', activeTaskId: task.id });
+        setState({ tasks: [task, ...state.tasks], taskPromptDraft: '', taskSubmissionPending: null });
         this.querySelector('#taskPrompt').value = '';
       } catch (err) {
+        setState({ taskSubmissionPending: null });
         showError(err);
       }
     });
@@ -5100,12 +5407,12 @@ class AppShell extends HTMLElement {
     this.querySelector('#copyAppLogs')?.addEventListener('click', async () => {
       const text = state.appLogsByEnv[state.environment] || '';
       if (!text) {
-        setTaskStatus('No application logs to copy yet.', { autoHide: true });
+        pushToast({ message: 'No application logs to copy yet.', tone: 'warning', dedupeKey: `copy-app-logs:${state.projectId}:${state.environment}:empty` });
         return;
       }
       try {
         await navigator.clipboard.writeText(text);
-        setTaskStatus('Copied application logs', { autoHide: true });
+        pushToast({ message: 'Copied application logs', tone: 'success', dedupeKey: `copy-app-logs:${state.projectId}:${state.environment}` });
       } catch {
         const temp = document.createElement('textarea');
         temp.value = text;
@@ -5113,7 +5420,7 @@ class AppShell extends HTMLElement {
         temp.select();
         document.execCommand('copy');
         temp.remove();
-        setTaskStatus('Copied application logs', { autoHide: true });
+        pushToast({ message: 'Copied application logs', tone: 'success', dedupeKey: `copy-app-logs:${state.projectId}:${state.environment}` });
       }
     });
 
@@ -5139,12 +5446,12 @@ class AppShell extends HTMLElement {
     this.querySelector('#copyVerifyLogs')?.addEventListener('click', async () => {
       const text = state.failedBuildLog[state.environment] || '';
       if (!text) {
-        setTaskStatus('No full build logs to copy yet.', { autoHide: true });
+        pushToast({ message: 'No full build logs to copy yet.', tone: 'warning', dedupeKey: `copy-verify-logs:${state.projectId}:${state.environment}:empty` });
         return;
       }
       try {
         await navigator.clipboard.writeText(text);
-        setTaskStatus('Copied full build logs', { autoHide: true });
+        pushToast({ message: 'Copied full build logs', tone: 'success', dedupeKey: `copy-verify-logs:${state.projectId}:${state.environment}` });
       } catch {
         const temp = document.createElement('textarea');
         temp.value = text;
@@ -5152,14 +5459,14 @@ class AppShell extends HTMLElement {
         temp.select();
         document.execCommand('copy');
         temp.remove();
-        setTaskStatus('Copied full build logs', { autoHide: true });
+        pushToast({ message: 'Copied full build logs', tone: 'success', dedupeKey: `copy-verify-logs:${state.projectId}:${state.environment}` });
       }
     });
 
     this.querySelector('#saveSession')?.addEventListener('click', () => {
       const canSaveSession = state.tasks.some((t) => t.environment === 'development' && !t.session_id);
       if (!canSaveSession) {
-        setTaskStatus('Add at least one task before saving a session.', { autoHide: true });
+        pushToast({ message: 'Add at least one task before saving a session.', tone: 'warning', dedupeKey: 'save-session:empty' });
         return;
       }
       this.querySelector('#saveModal').classList.add('open');
@@ -5171,7 +5478,10 @@ class AppShell extends HTMLElement {
 
     this.querySelector('#confirmSave')?.addEventListener('click', async () => {
       const message = this.querySelector('#saveMessage').value;
-      if (!message) return setTaskStatus('Enter a message', { autoHide: true });
+      if (!message) {
+        pushToast({ message: 'Enter a message', tone: 'warning', dedupeKey: 'save-session:missing-message' });
+        return;
+      }
       try {
         const session = await api(`/projects/${state.projectId}/sessions`, {
           method: 'POST',
@@ -5804,7 +6114,11 @@ class AppShell extends HTMLElement {
     this.querySelectorAll('.deploy-button').forEach((btn) => {
       btn.addEventListener('click', async () => {
         const commitHash = btn.getAttribute('data-commit');
-        if (!commitHash) return setTaskStatus('No commit hash available', { autoHide: true });
+        if (!commitHash) {
+          pushToast({ message: 'No commit hash available', tone: 'warning', dedupeKey: 'deploy:missing-commit' });
+          return;
+        }
+        setState({ projectNotice: '' });
         prepareAppLogsForDeploy(state.environment);
         if (state.appLogsVisible) {
           fetchApplicationLogs({ force: true });
@@ -5820,7 +6134,7 @@ class AppShell extends HTMLElement {
             setState({
               pendingDeployCommit: { ...state.pendingDeployCommit }
             });
-            setTaskStatus('This commit is already live', { autoHide: true });
+            pushToast({ message: 'This commit is already live', tone: 'info', dedupeKey: `deploy:${state.projectId}:${state.environment}:${commitHash}:already-live` });
             return;
           }
           if (response?.status === 'already_building') {
@@ -5828,7 +6142,7 @@ class AppShell extends HTMLElement {
             setState({
               pendingDeployCommit: { ...state.pendingDeployCommit }
             });
-            setTaskStatus('A deploy for this commit is already in progress', { autoHide: true });
+            pushToast({ message: 'A deploy for this commit is already in progress', tone: 'info', dedupeKey: `deploy:${state.projectId}:${state.environment}:${commitHash}:already-building` });
             return;
           }
           state.pendingDeployCommit[state.environment] = commitHash;
@@ -5855,10 +6169,13 @@ class AppShell extends HTMLElement {
         const block = btn.closest('.detail-block');
         const pre = block?.querySelector('pre');
         const text = pre?.textContent || '';
-        if (!text) return setTaskStatus('Nothing to copy', { autoHide: true });
+        if (!text) {
+          pushToast({ message: 'Nothing to copy', tone: 'warning', dedupeKey: 'copy-task:empty' });
+          return;
+        }
         try {
           await navigator.clipboard.writeText(text);
-          setTaskStatus('Copied', { autoHide: true });
+          pushToast({ message: 'Copied', tone: 'success', dedupeKey: 'copy-task:success' });
         } catch {
           const temp = document.createElement('textarea');
           temp.value = text;
@@ -5866,7 +6183,7 @@ class AppShell extends HTMLElement {
           temp.select();
           document.execCommand('copy');
           temp.remove();
-          setTaskStatus('Copied', { autoHide: true });
+          pushToast({ message: 'Copied', tone: 'success', dedupeKey: 'copy-task:success' });
         }
       });
     });

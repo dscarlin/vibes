@@ -17,6 +17,14 @@ IMAGE_FILE="${IMAGE_FILE:-.last-build-images}"
 if [ -z "$TAG" ]; then
   if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     TAG="$(git rev-parse --short HEAD)"
+    DIRTY_STATUS="$(
+      git status --porcelain --untracked-files=all 2>/dev/null | \
+        grep -vE '^[ MARCUD?!][ MARCUD?!] (\.last-build-tag|\.last-build-images)$' || true
+    )"
+    if [ -n "$DIRTY_STATUS" ]; then
+      TAG="${TAG}-dirty-$(date +%Y%m%d%H%M%S)"
+      echo "Git working tree has local changes; using unique tag: ${TAG}"
+    fi
   else
     TAG="$(date +%Y%m%d%H%M%S)"
   fi
