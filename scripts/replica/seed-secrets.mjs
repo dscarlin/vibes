@@ -172,6 +172,16 @@ const serverPayload = {
   ADMIN_API_KEY: serverSource.ADMIN_API_KEY || '',
   CORS_ORIGIN_EXTRA: serverSource.CORS_ORIGIN_EXTRA || 'tauri://localhost,http://localhost',
   UPGRADE_URL: webSource.UPGRADE_URL || `https://${rootHost}/pricing`,
+  ...pick(mergedShared, [
+    'CUSTOMER_DB_ADMIN_URL',
+    'CUSTOMER_DB_HOST',
+    'CUSTOMER_DB_PORT',
+    'CUSTOMER_DB_USER',
+    'CUSTOMER_DB_PASSWORD',
+    'CUSTOMER_DB_SSLMODE',
+    'CUSTOMER_DB_SSLROOTCERT',
+    'PROJECT_DATABASE_PREFIX'
+  ]),
   ...pick(serverSource, [
     'ALLOW_PASSWORD_BYPASS',
     'MAX_UPLOAD_MB',

@@ -5,7 +5,7 @@ SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(CDPATH='' cd -- "$SCRIPT_DIR/.." && pwd)"
 . "$REPO_ROOT/scripts/replica/lib.sh"
 
-require_cmd kubectl envsubst curl
+require_cmd kubectl envsubst curl node
 
 source_env_file "$METADATA_ENV_FILE"
 source_env_file "$IMAGES_ENV_FILE"
@@ -44,6 +44,56 @@ hash_paths() {
   die "missing checksum tool: need shasum or sha256sum"
 }
 
+merge_server_env_file() {
+  output_path="$1"
+  node --input-type=module - "$SERVER_ENV_FILE" "$WORKER_ENV_FILE" "$output_path" <<'EOF'
+import fs from 'node:fs';
+
+const [, , serverPath, workerPath, outputPath] = process.argv;
+const inheritedKeys = [
+  'CUSTOMER_DB_ADMIN_URL',
+  'CUSTOMER_DB_HOST',
+  'CUSTOMER_DB_PORT',
+  'CUSTOMER_DB_USER',
+  'CUSTOMER_DB_PASSWORD',
+  'CUSTOMER_DB_SSLMODE',
+  'CUSTOMER_DB_SSLROOTCERT',
+  'PROJECT_DATABASE_PREFIX'
+];
+
+function parseEnvFile(filePath) {
+  const values = {};
+  const order = [];
+  for (const rawLine of fs.readFileSync(filePath, 'utf8').split('\n')) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) continue;
+    const index = line.indexOf('=');
+    if (index === -1) continue;
+    const key = line.slice(0, index).trim().replace(/^export\s+/, '');
+    const value = line.slice(index + 1);
+    if (!Object.prototype.hasOwnProperty.call(values, key)) order.push(key);
+    values[key] = value;
+  }
+  return { values, order };
+}
+
+const server = parseEnvFile(serverPath);
+const worker = parseEnvFile(workerPath);
+const merged = { ...server.values };
+const order = [...server.order];
+
+for (const key of inheritedKeys) {
+  if (String(merged[key] || '').trim()) continue;
+  const workerValue = worker.values[key];
+  if (!String(workerValue || '').trim()) continue;
+  merged[key] = workerValue;
+  order.push(key);
+}
+
+fs.writeFileSync(outputPath, `${order.map((key) => `${key}=${merged[key]}`).join('\n')}\n`, 'utf8');
+EOF
+}
+
 export ACM_CERT_ARN
 export ALB_GROUP_NAME
 export SERVER_HOST="$API_HOST"
@@ -56,7 +106,9 @@ export WORKER_IRSA_ROLE_ARN
 export SERVER_IMAGE
 export WEB_IMAGE
 export WORKER_IMAGE
-export SERVER_CONFIG_HASH="$(hash_paths "$SERVER_ENV_FILE" "$REPO_ROOT/rds-ca.pem")"
+MERGED_SERVER_ENV_FILE="$GENERATED_DIR/server.merged.env"
+merge_server_env_file "$MERGED_SERVER_ENV_FILE"
+export SERVER_CONFIG_HASH="$(hash_paths "$MERGED_SERVER_ENV_FILE" "$REPO_ROOT/rds-ca.pem")"
 export WEB_CONFIG_HASH="$(hash_paths "$WEB_ENV_FILE")"
 export WORKER_CONFIG_HASH="$(hash_paths "$WORKER_ENV_FILE" "$REPO_ROOT/rds-ca.pem")"
 
@@ -67,7 +119,7 @@ apply_manifest() {
 kubectl_retry create namespace "$PLATFORM_NAMESPACE" --dry-run=client -o yaml | kubectl_retry apply -f - >/dev/null
 
 kubectl_retry -n "$PLATFORM_NAMESPACE" create secret generic "$PLATFORM_SERVER_ENV_SECRET_NAME" \
-  --from-env-file="$SERVER_ENV_FILE" \
+  --from-env-file="$MERGED_SERVER_ENV_FILE" \
   --dry-run=client -o yaml | kubectl_retry apply -f -
 
 kubectl_retry -n "$PLATFORM_NAMESPACE" create secret generic "$PLATFORM_WEB_ENV_SECRET_NAME" \

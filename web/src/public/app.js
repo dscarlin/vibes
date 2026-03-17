@@ -8,6 +8,8 @@ const RUNTIME_LIMITS_FALLBACK = {
   business: { development: 200, testing: 100, production: 750 },
   agency: { development: 500, testing: 250, production: 750 }
 };
+const DATABASE_PAGE_SIZE_OPTIONS = [5, 10, 25, 50, 100];
+const DEFAULT_DATABASE_PAGE_SIZE = DATABASE_PAGE_SIZE_OPTIONS[0];
 
 const state = {
   token: localStorage.getItem('vibes_token') || '',
@@ -247,11 +249,7 @@ const state = {
     },
     rowLoading: blankEnvMap(false),
     rowError: blankEnvMap(''),
-    controls: {
-      development: { page: 1, pageSize: 100, sortColumn: '', sortDirection: 'asc', filterColumn: '', filterValue: '' },
-      testing: { page: 1, pageSize: 100, sortColumn: '', sortDirection: 'asc', filterColumn: '', filterValue: '' },
-      production: { page: 1, pageSize: 100, sortColumn: '', sortDirection: 'asc', filterColumn: '', filterValue: '' }
-    },
+    controls: blankDbControls(),
     sqlDraft: blankEnvMap(''),
     queryResult: {
       development: null,
@@ -1584,9 +1582,9 @@ function blankDbSelection() {
 
 function blankDbControls() {
   return {
-    development: { page: 1, pageSize: 100, sortColumn: '', sortDirection: 'asc', filterColumn: '', filterValue: '' },
-    testing: { page: 1, pageSize: 100, sortColumn: '', sortDirection: 'asc', filterColumn: '', filterValue: '' },
-    production: { page: 1, pageSize: 100, sortColumn: '', sortDirection: 'asc', filterColumn: '', filterValue: '' }
+    development: { page: 1, pageSize: DEFAULT_DATABASE_PAGE_SIZE, sortColumn: '', sortDirection: 'asc', filterColumn: '', filterValue: '' },
+    testing: { page: 1, pageSize: DEFAULT_DATABASE_PAGE_SIZE, sortColumn: '', sortDirection: 'asc', filterColumn: '', filterValue: '' },
+    production: { page: 1, pageSize: DEFAULT_DATABASE_PAGE_SIZE, sortColumn: '', sortDirection: 'asc', filterColumn: '', filterValue: '' }
   };
 }
 
@@ -1643,7 +1641,7 @@ function databaseSelection(env = state.environment) {
 }
 
 function databaseControls(env = state.environment) {
-  return state.database?.controls?.[env] || { page: 1, pageSize: 100, sortColumn: '', sortDirection: 'asc', filterColumn: '', filterValue: '' };
+  return state.database?.controls?.[env] || { page: 1, pageSize: DEFAULT_DATABASE_PAGE_SIZE, sortColumn: '', sortDirection: 'asc', filterColumn: '', filterValue: '' };
 }
 
 function setDatabaseState(patch = {}) {
@@ -2127,7 +2125,7 @@ async function loadDatabaseCatalog(projectId, environment, { force = false } = {
         ...fallback,
         tab: current?.tab || 'browse'
       };
-      state.database.controls[environment] = { page: 1, pageSize: 100, sortColumn: '', sortDirection: 'asc', filterColumn: '', filterValue: '' };
+      state.database.controls[environment] = { page: 1, pageSize: DEFAULT_DATABASE_PAGE_SIZE, sortColumn: '', sortDirection: 'asc', filterColumn: '', filterValue: '' };
     }
     setDatabaseState({
       catalogs,
@@ -2187,7 +2185,7 @@ async function loadDatabaseRows(projectId, environment) {
   const controls = databaseControls(environment);
   const params = new URLSearchParams({
     page: String(controls.page || 1),
-    pageSize: String(controls.pageSize || 100)
+    pageSize: String(controls.pageSize || DEFAULT_DATABASE_PAGE_SIZE)
   });
   if (controls.sortColumn) params.set('sortColumn', controls.sortColumn);
   if (controls.sortDirection) params.set('sortDirection', controls.sortDirection);
@@ -3623,10 +3621,16 @@ class AppShell extends HTMLElement {
                       <option value="desc" ${controls.sortDirection === 'desc' ? 'selected' : ''}>Desc</option>
                     </select>
                   </label>
+                  <label>
+                    <span>Rows</span>
+                    <select id="dbPageSize">
+                      ${DATABASE_PAGE_SIZE_OPTIONS.map((size) => `<option value="${size}" ${Number(controls.pageSize || DEFAULT_DATABASE_PAGE_SIZE) === size ? 'selected' : ''}>${size}</option>`).join('')}
+                    </select>
+                  </label>
                   <button id="applyDbBrowse" ${!selection.object ? 'disabled' : ''}>Apply</button>
                 </div>
                 <div class="db-toolbar db-pagination">
-                  <span class="meta">Page ${rows?.page || controls.page || 1}${rows?.hasMore ? ' • more rows available' : ''}</span>
+                  <span class="meta">Page ${rows?.page || controls.page || 1} • ${rows?.pageSize || controls.pageSize || DEFAULT_DATABASE_PAGE_SIZE} rows per page${rows?.hasMore ? ' • more rows available' : ''}</span>
                   <div class="row">
                     <button class="ghost" id="dbPrevPage" ${(controls.page || 1) <= 1 || state.database.rowLoading[env] ? 'disabled' : ''}>Previous</button>
                     <button class="ghost" id="dbNextPage" ${!rows?.hasMore || state.database.rowLoading[env] ? 'disabled' : ''}>Next</button>
@@ -6023,6 +6027,7 @@ class AppShell extends HTMLElement {
       const nextControls = {
         ...databaseControls(env),
         page: 1,
+        pageSize: Number(this.querySelector('#dbPageSize')?.value || DEFAULT_DATABASE_PAGE_SIZE),
         filterColumn: this.querySelector('#dbFilterColumn')?.value || '',
         filterValue: this.querySelector('#dbFilterValue')?.value || '',
         sortColumn: this.querySelector('#dbSortColumn')?.value || '',
