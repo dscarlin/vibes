@@ -4,8 +4,10 @@ import assert from 'node:assert/strict';
 import {
   agentTaskGuardEnv,
   buildTaskContext,
+  cleanupValidation,
   cleanupCompletedCleanly,
   domainFromEmailAddress,
+  dropDatabases,
   deriveTaskSlug,
   ensureManifestDefaults,
   normalizeNotifyOn,
@@ -13,6 +15,7 @@ import {
   overallRunStatus,
   parseArgs,
   resolveNotificationSettings,
+  resolveTaskDatabaseCleanupPlan,
   sesSenderIdentityCandidates,
   shouldRunCleanupStage,
   validationWarningsFromArtifacts
@@ -352,4 +355,177 @@ test('overallRunStatus reports cleaning_up when cleanup stage is active', () => 
   });
 
   assert.equal(overallRunStatus(manifest, { warnings: [] }), 'cleaning_up');
+});
+
+test('resolveTaskDatabaseCleanupPlan prefers validation summary databases', async () => {
+  const manifest = ensureManifestDefaults({
+    cleanup: {},
+    status: {
+      overlayReady: true
+    },
+    task: {
+      projectDatabasePrefix: 'vibes_task_demo'
+    },
+    database: {
+      customerAdminUrl: 'postgresql://user:pass@example.com:5432/postgres'
+    },
+    paths: {
+      runDir: '/tmp/run'
+    }
+  });
+
+  const plan = await resolveTaskDatabaseCleanupPlan(manifest, {
+    summary: {
+      project: {
+        databases: [
+          { db_name: 'vibes_task_demo_abcd_development' },
+          { db_name: 'vibes_task_demo_abcd_development' },
+          { db_name: 'other_project_abcd_development' }
+        ]
+      }
+    },
+    listDatabasesByPrefix: async () => {
+      throw new Error('prefix scan should not run when validation summary databases are present');
+    }
+  });
+
+  assert.deepEqual(plan, {
+    attempted: true,
+    source: 'summary',
+    databases: ['vibes_task_demo_abcd_development']
+  });
+});
+
+test('resolveTaskDatabaseCleanupPlan falls back to prefix scan without validation metadata', async () => {
+  const manifest = ensureManifestDefaults({
+    cleanup: {},
+    status: {
+      overlayReady: true
+    },
+    task: {
+      projectDatabasePrefix: 'vibes_task_demo'
+    },
+    database: {
+      customerAdminUrl: 'postgresql://user:pass@example.com:5432/postgres'
+    },
+    paths: {
+      runDir: '/tmp/run'
+    }
+  });
+
+  const plan = await resolveTaskDatabaseCleanupPlan(manifest, {
+    listDatabasesByPrefix: async () => ['vibes_task_demo_abcd_testing']
+  });
+
+  assert.deepEqual(plan, {
+    attempted: true,
+    source: 'prefix_scan',
+    databases: ['vibes_task_demo_abcd_testing']
+  });
+});
+
+test('resolveTaskDatabaseCleanupPlan filters prefix-scan results to task databases only', async () => {
+  const manifest = ensureManifestDefaults({
+    cleanup: {},
+    status: {
+      overlayReady: true
+    },
+    task: {
+      projectDatabasePrefix: 'vibes_task_demo'
+    },
+    database: {
+      customerAdminUrl: 'postgresql://user:pass@example.com:5432/postgres'
+    },
+    paths: {
+      runDir: '/tmp/run'
+    }
+  });
+
+  const plan = await resolveTaskDatabaseCleanupPlan(manifest, {
+    listDatabasesByPrefix: async () => [
+      'vibes_task_demo_abcd_development',
+      'vibes_task_demo_abcd_development',
+      'vibes_task_demo_abcd_staging',
+      'vibes_task_demo',
+      'other_task_abcd_development',
+      'vibes_task_demo_abcd_production'
+    ]
+  });
+
+  assert.deepEqual(plan.databases, [
+    'vibes_task_demo_abcd_development',
+    'vibes_task_demo_abcd_production'
+  ]);
+});
+
+test('dropDatabases fails cleanup when a database cannot be dropped after both attempts', async () => {
+  const calls = [];
+  await assert.rejects(
+    () =>
+      dropDatabases(
+        {
+          cluster: {
+            sharedPlatformNamespace: 'vibes-platform'
+          }
+        },
+        'postgresql://user:pass@example.com:5432/postgres',
+        ['good_db', 'bad_db', 'bad_db'],
+        {
+          runSql: async (_manifest, _adminUrl, sql) => {
+            calls.push(sql);
+            if (sql.includes('"bad_db"')) {
+              throw new Error('drop failed');
+            }
+            return '';
+          }
+        }
+      ),
+    (error) => {
+      assert.match(error.message, /Failed to drop task databases: bad_db/);
+      assert.deepEqual(error.failedDatabases, ['bad_db']);
+      return true;
+    }
+  );
+
+  assert.equal(calls.filter((sql) => sql.includes('"bad_db"')).length, 2);
+});
+
+test('cleanupValidation records prefix-scan cleanup details even without validation artifacts', async () => {
+  const manifest = ensureManifestDefaults({
+    cleanup: {},
+    status: {
+      overlayReady: true
+    },
+    task: {
+      projectDatabasePrefix: 'vibes_task_demo',
+      schema: 'task_demo'
+    },
+    database: {
+      customerAdminUrl: 'postgresql://user:pass@example.com:5432/postgres',
+      baseDatabaseUrl: 'postgresql://user:pass@example.com:5432/postgres'
+    },
+    paths: {
+      runDir: '/tmp/run',
+      manifestPath: '/tmp/run/manifest.json'
+    }
+  });
+
+  const saveSnapshots = [];
+  const dropCalls = [];
+  await cleanupValidation(manifest, {
+    listDatabasesByPrefix: async () => [],
+    dropTaskDatabases: async (_manifest, _adminUrl, databases) => {
+      dropCalls.push([...databases]);
+    },
+    save: async (nextManifest) => {
+      saveSnapshots.push(JSON.parse(JSON.stringify(nextManifest.cleanup.validation || null)));
+    }
+  });
+
+  assert.deepEqual(dropCalls, [[]]);
+  assert.equal(manifest.cleanup.validation.databaseSource, 'prefix_scan');
+  assert.deepEqual(manifest.cleanup.validation.databases, []);
+  assert.deepEqual(manifest.cleanup.validation.failedDatabases, []);
+  assert.ok(manifest.cleanup.validation.completedAt);
+  assert.ok(saveSnapshots.length >= 2);
 });

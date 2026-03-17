@@ -37,6 +37,7 @@ const DEFAULT_NOTIFY_FROM_EMAIL = 'noreply@vibesplatform.ai';
 const DEFAULT_NOTIFY_REPLY_TO = 'ottobotowner@gmail.com';
 const DEFAULT_NOTIFY_REGION = 'us-east-1';
 const NOTIFY_MODES = new Set(['always', 'success', 'failure', 'never']);
+const TASK_DATABASE_ENV_SUFFIXES = ['_development', '_testing', '_production'];
 
 function usage() {
   console.error(
@@ -551,7 +552,7 @@ async function restoreWorkerIrsaTrust(manifest) {
   await saveManifest(manifest);
 }
 
-async function runSqlThroughCluster(manifest, databaseUrl, sql, { namespace = '' } = {}) {
+async function runSqlThroughCluster(manifest, databaseUrl, sql, { namespace = '', tuplesOnly = false } = {}) {
   const kubeNamespace = namespace || manifest.cluster?.sharedPlatformNamespace || 'vibes-platform';
   const parts = dbParts(databaseUrl);
   const podName = `agent-task-db-${manifest.task?.slug || 'task'}-${shortRandom(4)}`;
@@ -576,7 +577,7 @@ async function runSqlThroughCluster(manifest, databaseUrl, sql, { namespace = ''
       ].join(' ')
     ]);
     await runCommand('kubectl', ['-n', kubeNamespace, 'wait', '--for=condition=Ready', `pod/${podName}`, '--timeout=180s']);
-    await runCommand('kubectl', [
+    const result = await runCommand('kubectl', [
       '-n',
       kubeNamespace,
       'exec',
@@ -584,8 +585,9 @@ async function runSqlThroughCluster(manifest, databaseUrl, sql, { namespace = ''
       '--',
       'sh',
       '-lc',
-      `psql -v ON_ERROR_STOP=1 -d ${shellQuote(parts.database)} <<'SQL'\n${sql}\nSQL`
+      `psql ${tuplesOnly ? '-tA ' : ''}-v ON_ERROR_STOP=1 -d ${shellQuote(parts.database)} <<'SQL'\n${sql}\nSQL`
     ]);
+    return result.stdout;
   } finally {
     await runCommand('kubectl', [
       '-n',
@@ -630,25 +632,150 @@ async function deleteValidationUser(manifest, databaseUrl, schema, email) {
   );
 }
 
-async function dropDatabases(manifest, adminUrl, databases = []) {
-  if (!databases.length) return;
-  for (const database of databases) {
-    if (!database) continue;
+function quoteLiteral(value) {
+  return `'${String(value ?? '').replace(/'/g, "''")}'`;
+}
+
+function escapeLikePattern(value) {
+  return String(value ?? '').replace(/[\\%_]/g, '\\$&');
+}
+
+function taskDatabaseNameMatchesPrefix(databaseName, projectDatabasePrefix) {
+  const database = String(databaseName || '').trim();
+  const prefix = String(projectDatabasePrefix || '').trim();
+  if (!database || !prefix) return false;
+  return database.startsWith(`${prefix}_`) && TASK_DATABASE_ENV_SUFFIXES.some((suffix) => database.endsWith(suffix));
+}
+
+function normalizeTaskDatabaseNames(databases = [], { projectDatabasePrefix = '' } = {}) {
+  const prefix = String(projectDatabasePrefix || '').trim();
+  const seen = new Set();
+  const normalized = [];
+  for (const database of Array.isArray(databases) ? databases : []) {
+    const name = String(database || '').trim();
+    if (!name) continue;
+    if (prefix && !taskDatabaseNameMatchesPrefix(name, prefix)) continue;
+    if (seen.has(name)) continue;
+    seen.add(name);
+    normalized.push(name);
+  }
+  return normalized;
+}
+
+function summaryTaskDatabaseNames(summary) {
+  return Array.isArray(summary?.project?.databases)
+    ? summary.project.databases.map((entry) => entry?.db_name)
+    : [];
+}
+
+async function listTaskDatabasesByPrefix(
+  manifest,
+  adminUrl,
+  projectDatabasePrefix,
+  { runSql = runSqlThroughCluster } = {}
+) {
+  const prefix = String(projectDatabasePrefix || '').trim();
+  if (!prefix) return [];
+  const prefixPattern = `${escapeLikePattern(prefix)}\\_%`;
+  const suffixFilter = TASK_DATABASE_ENV_SUFFIXES
+    .map((suffix) => `datname like ${quoteLiteral(`%${escapeLikePattern(suffix)}`)} escape '\\'`)
+    .join(' or ');
+  const sql = [
+    'select datname',
+    'from pg_database',
+    `where datname like ${quoteLiteral(prefixPattern)} escape '\\'`,
+    `  and (${suffixFilter})`,
+    'order by datname;'
+  ].join('\n');
+  const stdout = await runSql(manifest, adminUrl, sql, {
+    namespace: manifest.cluster?.sharedPlatformNamespace,
+    tuplesOnly: true
+  });
+  return String(stdout || '')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
+async function resolveTaskDatabaseCleanupPlan(
+  manifest,
+  { summary = null, listDatabasesByPrefix = listTaskDatabasesByPrefix } = {}
+) {
+  const persistedCleanup = manifest.cleanup?.validation;
+  const projectDatabasePrefix = String(manifest.task?.projectDatabasePrefix || '').trim();
+  if (persistedCleanup && Array.isArray(persistedCleanup.databases)) {
+    return {
+      attempted: true,
+      source: String(persistedCleanup.databaseSource || 'manifest'),
+      databases: normalizeTaskDatabaseNames(persistedCleanup.databases, { projectDatabasePrefix })
+    };
+  }
+
+  if (Array.isArray(summary?.project?.databases)) {
+    return {
+      attempted: true,
+      source: 'summary',
+      databases: normalizeTaskDatabaseNames(summaryTaskDatabaseNames(summary), { projectDatabasePrefix })
+    };
+  }
+
+  if (!manifest.status?.overlayReady) {
+    return {
+      attempted: false,
+      source: null,
+      databases: []
+    };
+  }
+
+  if (!projectDatabasePrefix) {
+    throw new Error('Task database cleanup requires manifest.task.projectDatabasePrefix after overlay setup');
+  }
+
+  const adminUrl = String(manifest.database?.customerAdminUrl || '').trim();
+  if (!adminUrl) {
+    throw new Error('Task database cleanup requires manifest.database.customerAdminUrl after overlay setup');
+  }
+
+  const discovered = await listDatabasesByPrefix(manifest, adminUrl, projectDatabasePrefix);
+  return {
+    attempted: true,
+    source: 'prefix_scan',
+    databases: normalizeTaskDatabaseNames(discovered, { projectDatabasePrefix })
+  };
+}
+
+async function dropDatabases(manifest, adminUrl, databases = [], { runSql = runSqlThroughCluster } = {}) {
+  const uniqueDatabases = normalizeTaskDatabaseNames(databases);
+  if (!uniqueDatabases.length) return;
+  if (!adminUrl) {
+    throw new Error('Task database cleanup requires a customer admin database URL');
+  }
+  const failedDatabases = [];
+  for (const database of uniqueDatabases) {
     try {
-      await runSqlThroughCluster(
+      await runSql(
         manifest,
         adminUrl,
         `drop database if exists ${quoteIdent(database)} with (force);`,
         { namespace: manifest.cluster?.sharedPlatformNamespace }
       );
     } catch {
-      await runSqlThroughCluster(
-        manifest,
-        adminUrl,
-        `drop database if exists ${quoteIdent(database)};`,
-        { namespace: manifest.cluster?.sharedPlatformNamespace }
-      ).catch(() => null);
+      try {
+        await runSql(
+          manifest,
+          adminUrl,
+          `drop database if exists ${quoteIdent(database)};`,
+          { namespace: manifest.cluster?.sharedPlatformNamespace }
+        );
+      } catch {
+        failedDatabases.push(database);
+      }
     }
+  }
+  if (failedDatabases.length) {
+    const error = new Error(`Failed to drop task databases: ${failedDatabases.join(', ')}`);
+    error.failedDatabases = failedDatabases;
+    throw error;
   }
 }
 
@@ -1684,14 +1811,36 @@ async function sendJanitorNotification(args, details) {
   }
 }
 
-async function cleanupValidation(manifest) {
-  if (!manifest.validation?.lastEvidenceDir || !manifest.validation?.lastSummaryPath) return;
-  const summary = await readJson(manifest.validation.lastSummaryPath);
-  const registerPath = path.join(manifest.validation.lastEvidenceDir, '01-register.json');
+async function cleanupValidation(
+  manifest,
+  {
+    readJsonFile = readJson,
+    pathExistsFn = pathExists,
+    listDatabasesByPrefix = listTaskDatabasesByPrefix,
+    dropTaskDatabases = dropDatabases,
+    deleteTaskValidationUser = deleteValidationUser,
+    save = saveManifest
+  } = {}
+) {
+  const summaryPath = String(manifest.validation?.lastSummaryPath || '').trim();
+  const evidenceDir = String(manifest.validation?.lastEvidenceDir || '').trim();
+  const summary = summaryPath ? await readJsonFile(summaryPath).catch(() => null) : null;
+  const validationCleanup = {
+    ...(manifest.cleanup?.validation || {}),
+    projectId: summary?.project?.id || manifest.cleanup?.validation?.projectId || null,
+    userEmail: summary?.user?.email || manifest.cleanup?.validation?.userEmail || null,
+    failedDatabases: Array.isArray(manifest.cleanup?.validation?.failedDatabases)
+      ? manifest.cleanup.validation.failedDatabases
+      : []
+  };
+
   let token = '';
-  if (await pathExists(registerPath)) {
-    const register = await readJson(registerPath);
-    token = String(register?.body?.token || '').trim();
+  if (evidenceDir) {
+    const registerPath = path.join(evidenceDir, '01-register.json');
+    if (await pathExistsFn(registerPath)) {
+      const register = await readJsonFile(registerPath).catch(() => null);
+      token = String(register?.body?.token || '').trim();
+    }
   }
 
   if (token && summary?.project?.id) {
@@ -1706,19 +1855,56 @@ async function cleanupValidation(manifest) {
     }, { timeoutMs: 10 * 60 * 1000, intervalMs: 5000 }).catch(() => null);
   }
 
-  const databaseNames = Array.isArray(summary?.project?.databases)
-    ? summary.project.databases.map((entry) => entry.db_name).filter(Boolean)
-    : [];
-  await dropDatabases(manifest, manifest.database.customerAdminUrl, databaseNames);
-  const validationUserEmail = summary?.user?.email || '';
-  await deleteValidationUser(manifest, manifest.database.baseDatabaseUrl, manifest.task.schema, validationUserEmail);
-  manifest.cleanup.validation = {
-    completedAt: new Date().toISOString(),
-    projectId: summary?.project?.id || null,
-    userEmail: validationUserEmail || null,
-    databases: databaseNames
-  };
-  await saveManifest(manifest);
+  let databasePlan = null;
+  let databaseError = null;
+  try {
+    databasePlan = await resolveTaskDatabaseCleanupPlan(manifest, { summary, listDatabasesByPrefix });
+  } catch (error) {
+    databaseError = error;
+    validationCleanup.failedDatabases = Array.isArray(error.failedDatabases) ? error.failedDatabases : [];
+  }
+
+  if (databasePlan?.attempted) {
+    validationCleanup.databases = databasePlan.databases;
+    validationCleanup.databaseSource = databasePlan.source;
+    validationCleanup.failedDatabases = [];
+    manifest.cleanup.validation = validationCleanup;
+    await save(manifest);
+    try {
+      await dropTaskDatabases(manifest, manifest.database?.customerAdminUrl, databasePlan.databases);
+    } catch (error) {
+      databaseError = error;
+      validationCleanup.failedDatabases = Array.isArray(error.failedDatabases) ? error.failedDatabases : [];
+    }
+  }
+
+  let validationUserError = null;
+  if (summary?.user?.email) {
+    try {
+      await deleteTaskValidationUser(manifest, manifest.database.baseDatabaseUrl, manifest.task.schema, summary.user.email);
+    } catch (error) {
+      validationUserError = error;
+    }
+  }
+
+  if (databasePlan?.attempted || summary) {
+    manifest.cleanup.validation = {
+      ...validationCleanup,
+      completedAt: new Date().toISOString()
+    };
+    await save(manifest);
+  }
+
+  const cleanupErrors = [];
+  if (databaseError) cleanupErrors.push(databaseError.message);
+  if (validationUserError) cleanupErrors.push(`validation user cleanup: ${validationUserError.message}`);
+  if (cleanupErrors.length) {
+    const error = new Error(cleanupErrors.join(' | '));
+    if (Array.isArray(databaseError?.failedDatabases)) {
+      error.failedDatabases = databaseError.failedDatabases;
+    }
+    throw error;
+  }
 }
 
 function forbiddenValuesForManifest(manifest) {
@@ -2359,13 +2545,16 @@ export {
   domainFromEmailAddress,
   sesSenderIdentityCandidates,
   buildTaskContext,
+  cleanupValidation,
   cleanupCompletedCleanly,
+  dropDatabases,
   deriveTaskSlug,
   ensureManifestDefaults,
   normalizeNotifyOn,
   overallRunStatus,
   parseArgs,
   agentTaskGuardEnv,
+  resolveTaskDatabaseCleanupPlan,
   shouldRunCleanupStage,
   validationWarningsFromArtifacts
 };
