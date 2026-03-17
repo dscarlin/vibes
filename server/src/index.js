@@ -14,6 +14,15 @@ import { authenticateUser, registerUser, requireAuth, signToken } from './auth.j
 import { query } from './db.js';
 import { taskQueue } from './queue.js';
 import {
+  browseDatabaseRows,
+  databaseErrorPayload,
+  executeDatabaseQuery,
+  getDatabaseCatalog,
+  getDatabaseObjectDetails,
+  loadDatabaseHistory,
+  writeDatabaseAudit
+} from './database-ui.js';
+import {
   bundleRepo,
   detectRepoRoot,
   ensureGitRepo,
@@ -2117,7 +2126,152 @@ app.post('/projects/:projectId/env/:environment/empty-db', requireAuth, async (r
   if (!ok) return res.status(404).json({ error: 'project not found' });
   if (!(await ensurePlanEnvAllowed(req, res, env))) return;
   await taskQueue.add('empty-db', { projectId: req.params.projectId, environment: env });
+  await writeDatabaseAudit(req, {
+    projectId: req.params.projectId,
+    environment: env,
+    action: 'empty_database_requested',
+    success: true
+  }).catch((err) => {
+    console.warn('Database audit write failed', err?.message || err);
+  });
   res.json({ ok: true });
+});
+
+async function withDatabaseRoute(req, res, env, action, work) {
+  const startedAt = Date.now();
+  try {
+    const result = await work();
+    await writeDatabaseAudit(req, {
+      projectId: req.params.projectId,
+      environment: env,
+      action,
+      schemaName: result?.audit?.schemaName || null,
+      objectName: result?.audit?.objectName || null,
+      queryText: result?.audit?.queryText || '',
+      success: true,
+      durationMs: Date.now() - startedAt,
+      rowCount: result?.audit?.rowCount ?? null
+    }).catch((err) => {
+      console.warn('Database audit write failed', err?.message || err);
+    });
+    return res.json(result?.body ?? result);
+  } catch (err) {
+    await writeDatabaseAudit(req, {
+      projectId: req.params.projectId,
+      environment: env,
+      action,
+      schemaName: req.params.schema || null,
+      objectName: req.params.object || null,
+      queryText: req.body?.sql || '',
+      success: false,
+      durationMs: Date.now() - startedAt,
+      errorCode: err.code || 'database_request_failed'
+    }).catch((auditErr) => {
+      console.warn('Database audit write failed', auditErr?.message || auditErr);
+    });
+    const payload = databaseErrorPayload(err);
+    return res.status(err.status || 500).json({
+      error: payload.code,
+      message: payload.message,
+      retryable: payload.retryable,
+      details: payload.details
+    });
+  }
+}
+
+app.get('/projects/:projectId/database/:environment/catalog', requireAuth, async (req, res) => {
+  const env = normalizeEnv(req.params.environment);
+  if (!env) return res.status(400).json({ error: 'invalid environment' });
+  const ok = await ensureProjectOwner(req.params.projectId, req.user.userId);
+  if (!ok) return res.status(404).json({ error: 'project not found' });
+  if (!(await ensurePlanEnvAllowed(req, res, env))) return;
+  return withDatabaseRoute(req, res, env, 'catalog_view', async () => {
+    const body = await getDatabaseCatalog(req.params.projectId, env);
+    return { body };
+  });
+});
+
+app.get('/projects/:projectId/database/:environment/objects/:schema/:object', requireAuth, async (req, res) => {
+  const env = normalizeEnv(req.params.environment);
+  if (!env) return res.status(400).json({ error: 'invalid environment' });
+  const ok = await ensureProjectOwner(req.params.projectId, req.user.userId);
+  if (!ok) return res.status(404).json({ error: 'project not found' });
+  if (!(await ensurePlanEnvAllowed(req, res, env))) return;
+  return withDatabaseRoute(req, res, env, 'object_view', async () => {
+    const body = await getDatabaseObjectDetails(req.params.projectId, env, req.params.schema, req.params.object);
+    return {
+      body,
+      audit: {
+        schemaName: req.params.schema,
+        objectName: req.params.object
+      }
+    };
+  });
+});
+
+app.get('/projects/:projectId/database/:environment/objects/:schema/:object/rows', requireAuth, async (req, res) => {
+  const env = normalizeEnv(req.params.environment);
+  if (!env) return res.status(400).json({ error: 'invalid environment' });
+  const ok = await ensureProjectOwner(req.params.projectId, req.user.userId);
+  if (!ok) return res.status(404).json({ error: 'project not found' });
+  if (!(await ensurePlanEnvAllowed(req, res, env))) return;
+  return withDatabaseRoute(req, res, env, 'rows_browse', async () => {
+    const body = await browseDatabaseRows(req.params.projectId, env, req.params.schema, req.params.object, {
+      page: req.query.page,
+      pageSize: req.query.pageSize,
+      sortColumn: req.query.sortColumn,
+      sortDirection: req.query.sortDirection,
+      filterColumn: req.query.filterColumn,
+      filterValue: req.query.filterValue
+    });
+    return {
+      body,
+      audit: {
+        schemaName: req.params.schema,
+        objectName: req.params.object,
+        rowCount: Array.isArray(body.rows) ? body.rows.length : null
+      }
+    };
+  });
+});
+
+app.post('/projects/:projectId/database/:environment/query', requireAuth, async (req, res) => {
+  const env = normalizeEnv(req.params.environment);
+  if (!env) return res.status(400).json({ error: 'invalid environment' });
+  const ok = await ensureProjectOwner(req.params.projectId, req.user.userId);
+  if (!ok) return res.status(404).json({ error: 'project not found' });
+  if (!(await ensurePlanEnvAllowed(req, res, env))) return;
+  return withDatabaseRoute(req, res, env, 'query_execute', async () => {
+    const sql = String(req.body?.sql || '');
+    const body = await executeDatabaseQuery(req.params.projectId, env, sql);
+    return {
+      body,
+      audit: {
+        queryText: sql,
+        rowCount: body.rowCount
+      }
+    };
+  });
+});
+
+app.get('/projects/:projectId/database/:environment/history', requireAuth, async (req, res) => {
+  const env = normalizeEnv(req.params.environment);
+  if (!env) return res.status(400).json({ error: 'invalid environment' });
+  const ok = await ensureProjectOwner(req.params.projectId, req.user.userId);
+  if (!ok) return res.status(404).json({ error: 'project not found' });
+  if (!(await ensurePlanEnvAllowed(req, res, env))) return;
+  try {
+    const entries = await loadDatabaseHistory(req.params.projectId, env, req.query.limit);
+    return res.json({ entries });
+  } catch (err) {
+    const payload = databaseErrorPayload(err);
+    return res.status(err.status || 500).json({
+      error: payload.code,
+      message: payload.message,
+      retryable: payload.retryable,
+      details: payload.details
+    });
+  }
 });
 
 app.post('/projects/:projectId/deploy', requireAuth, async (req, res) => {

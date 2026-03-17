@@ -22,6 +22,13 @@ if (missing.length) {
 export const config = {
   port: Number(process.env.PORT || 8000),
   databaseUrl: process.env.DATABASE_URL,
+  customerDbAdminUrl: process.env.CUSTOMER_DB_ADMIN_URL || '',
+  customerDbHost: process.env.CUSTOMER_DB_HOST || 'localhost',
+  customerDbPort: Number(process.env.CUSTOMER_DB_PORT || 5432),
+  customerDbUser: process.env.CUSTOMER_DB_USER || 'app_user',
+  customerDbPassword: process.env.CUSTOMER_DB_PASSWORD || '',
+  customerDbSslMode: process.env.CUSTOMER_DB_SSLMODE || 'disable',
+  customerDbSslRootCert: process.env.CUSTOMER_DB_SSLROOTCERT || '',
   jwtSecret: process.env.JWT_SECRET,
   domain: process.env.DOMAIN || 'localhost:8000',
   openAiApiKey: process.env.OPENAI_API_KEY,

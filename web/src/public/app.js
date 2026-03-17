@@ -210,7 +210,56 @@ const state = {
   runtimeUsage: { month: '', plan: '', usage: {} },
   runtimeUsageLoading: false,
   runtimeUsageError: '',
-  runtimeQuotaNotice: {}
+  runtimeQuotaNotice: {},
+  database: {
+    catalogs: {
+      development: null,
+      testing: null,
+      production: null
+    },
+    catalogLoading: blankEnvMap(false),
+    catalogError: blankEnvMap(''),
+    selected: {
+      development: { schema: '', object: '', type: '', tab: 'browse' },
+      testing: { schema: '', object: '', type: '', tab: 'browse' },
+      production: { schema: '', object: '', type: '', tab: 'browse' }
+    },
+    objectDetails: {
+      development: null,
+      testing: null,
+      production: null
+    },
+    objectLoading: blankEnvMap(false),
+    objectError: blankEnvMap(''),
+    rows: {
+      development: null,
+      testing: null,
+      production: null
+    },
+    rowLoading: blankEnvMap(false),
+    rowError: blankEnvMap(''),
+    controls: {
+      development: { page: 1, pageSize: 100, sortColumn: '', sortDirection: 'asc', filterColumn: '', filterValue: '' },
+      testing: { page: 1, pageSize: 100, sortColumn: '', sortDirection: 'asc', filterColumn: '', filterValue: '' },
+      production: { page: 1, pageSize: 100, sortColumn: '', sortDirection: 'asc', filterColumn: '', filterValue: '' }
+    },
+    sqlDraft: blankEnvMap(''),
+    queryResult: {
+      development: null,
+      testing: null,
+      production: null
+    },
+    queryLoading: blankEnvMap(false),
+    queryError: blankEnvMap(''),
+    history: {
+      development: [],
+      testing: [],
+      production: []
+    },
+    historyLoading: blankEnvMap(false),
+    historyError: blankEnvMap(''),
+    notice: ''
+  }
 };
 
 let socketClient = null;
@@ -249,6 +298,23 @@ function envStorageKey(userId, projectId) {
 function projectStorageKey(userId) {
   if (!userId) return null;
   return `vibes_project_${userId}`;
+}
+
+function databaseSqlStorageKey(userId, projectId, environment) {
+  if (!userId || !projectId || !environment) return null;
+  return `vibes_db_sql_${userId}_${projectId}_${environment}`;
+}
+
+function loadStoredDatabaseSql(userId, projectId, environment) {
+  const key = databaseSqlStorageKey(userId, projectId, environment);
+  if (!key) return '';
+  return localStorage.getItem(key) || '';
+}
+
+function storeDatabaseSql(userId, projectId, environment, sql) {
+  const key = databaseSqlStorageKey(userId, projectId, environment);
+  if (!key) return;
+  localStorage.setItem(key, sql || '');
 }
 
 function userFromToken(token) {
@@ -1096,6 +1162,7 @@ async function loadProjects() {
       environment: storedEnv || state.environment,
       ...(projectChanged
         ? {
+            database: createDatabaseState(),
             appLogsByEnv: blankEnvMap(''),
             appLogSnapshotByEnv: blankEnvMap(''),
             appLogLoading: blankEnvMap(false),
@@ -1129,7 +1196,8 @@ async function loadProjects() {
         appLogError: blankEnvMap(''),
         appLogFrozenByEnv: blankEnvMap(false),
         environment: 'development',
-        nerdLevel: 'beginner'
+        nerdLevel: 'beginner',
+        database: createDatabaseState()
       });
       return;
     }
@@ -1160,6 +1228,8 @@ async function loadProjects() {
         }
       });
     }
+    setDatabaseState(resetDatabaseStateForProject());
+    await loadDatabaseCatalog(projectId, state.environment);
   } catch (err) {
     const message = err?.name === 'AbortError'
       ? 'Projects request timed out. Check your connection or API URL.'
@@ -1259,6 +1329,87 @@ function blankEnvMap(value = '') {
     testing: value,
     production: value
   };
+}
+
+function blankDbSelection() {
+  return {
+    development: { schema: '', object: '', type: '', tab: 'browse' },
+    testing: { schema: '', object: '', type: '', tab: 'browse' },
+    production: { schema: '', object: '', type: '', tab: 'browse' }
+  };
+}
+
+function blankDbControls() {
+  return {
+    development: { page: 1, pageSize: 100, sortColumn: '', sortDirection: 'asc', filterColumn: '', filterValue: '' },
+    testing: { page: 1, pageSize: 100, sortColumn: '', sortDirection: 'asc', filterColumn: '', filterValue: '' },
+    production: { page: 1, pageSize: 100, sortColumn: '', sortDirection: 'asc', filterColumn: '', filterValue: '' }
+  };
+}
+
+function blankDbRows() {
+  return {
+    development: null,
+    testing: null,
+    production: null
+  };
+}
+
+function blankDbHistory() {
+  return {
+    development: [],
+    testing: [],
+    production: []
+  };
+}
+
+function createDatabaseState() {
+  return {
+    catalogs: blankDbRows(),
+    catalogLoading: blankEnvMap(false),
+    catalogError: blankEnvMap(''),
+    selected: blankDbSelection(),
+    objectDetails: blankDbRows(),
+    objectLoading: blankEnvMap(false),
+    objectError: blankEnvMap(''),
+    rows: blankDbRows(),
+    rowLoading: blankEnvMap(false),
+    rowError: blankEnvMap(''),
+    controls: blankDbControls(),
+    sqlDraft: blankEnvMap(''),
+    queryResult: blankDbRows(),
+    queryLoading: blankEnvMap(false),
+    queryError: blankEnvMap(''),
+    history: blankDbHistory(),
+    historyLoading: blankEnvMap(false),
+    historyError: blankEnvMap(''),
+    notice: ''
+  };
+}
+
+function resetDatabaseStateForProject() {
+  const next = createDatabaseState();
+  for (const env of ['development', 'testing', 'production']) {
+    next.sqlDraft[env] = loadStoredDatabaseSql(state.user?.id, state.projectId, env);
+  }
+  return next;
+}
+
+function databaseSelection(env = state.environment) {
+  return state.database?.selected?.[env] || { schema: '', object: '', type: '', tab: 'browse' };
+}
+
+function databaseControls(env = state.environment) {
+  return state.database?.controls?.[env] || { page: 1, pageSize: 100, sortColumn: '', sortDirection: 'asc', filterColumn: '', filterValue: '' };
+}
+
+function setDatabaseState(patch = {}) {
+  setState({
+    database: {
+      ...state.database,
+      ...patch
+    }
+  });
 }
 
 function stopAppLogTypewriter() {
@@ -1693,6 +1844,175 @@ async function loadEnvVars(projectId, environment) {
   setState({ envVarsMap: { ...state.envVarsMap } });
 }
 
+function chooseDefaultDatabaseObject(catalog) {
+  for (const schema of catalog?.schemas || []) {
+    if (schema?.objects?.length) {
+      const object = schema.objects[0];
+      return {
+        schema: schema.name,
+        object: object.name,
+        type: object.type
+      };
+    }
+  }
+  return { schema: '', object: '', type: '' };
+}
+
+async function loadDatabaseCatalog(projectId, environment, { force = false } = {}) {
+  if (!projectId || !environment) return;
+  if (state.database.catalogLoading[environment]) return;
+  if (!force && state.database.catalogs[environment]) return;
+  const nextLoading = { ...state.database.catalogLoading, [environment]: true };
+  const nextError = { ...state.database.catalogError, [environment]: '' };
+  setDatabaseState({ catalogLoading: nextLoading, catalogError: nextError, notice: '' });
+  try {
+    const data = await api(`/projects/${projectId}/database/${environment}/catalog`, { timeoutMs: 15000 });
+    const catalogs = { ...state.database.catalogs, [environment]: data };
+    const selected = { ...state.database.selected };
+    const current = selected[environment];
+    const exists = data?.schemas?.some((schema) => schema.name === current.schema && schema.objects?.some((object) => object.name === current.object));
+    if (!exists) {
+      const fallback = chooseDefaultDatabaseObject(data);
+      selected[environment] = {
+        ...current,
+        ...fallback,
+        tab: current?.tab || 'browse'
+      };
+      state.database.controls[environment] = { page: 1, pageSize: 100, sortColumn: '', sortDirection: 'asc', filterColumn: '', filterValue: '' };
+    }
+    setDatabaseState({
+      catalogs,
+      selected,
+      controls: { ...state.database.controls },
+      catalogLoading: { ...state.database.catalogLoading, [environment]: false }
+    });
+    if (selected[environment]?.schema && selected[environment]?.object) {
+      await Promise.all([
+        loadDatabaseObject(projectId, environment, selected[environment].schema, selected[environment].object),
+        loadDatabaseRows(projectId, environment),
+        loadDatabaseHistory(projectId, environment)
+      ]);
+    }
+  } catch (err) {
+    setDatabaseState({
+      catalogLoading: { ...state.database.catalogLoading, [environment]: false },
+      catalogError: { ...state.database.catalogError, [environment]: err.message || 'Failed to load database catalog.' }
+    });
+  }
+}
+
+async function loadDatabaseObject(projectId, environment, schemaName, objectName) {
+  if (!projectId || !schemaName || !objectName) return;
+  setDatabaseState({
+    objectLoading: { ...state.database.objectLoading, [environment]: true },
+    objectError: { ...state.database.objectError, [environment]: '' }
+  });
+  try {
+    const data = await api(
+      `/projects/${projectId}/database/${environment}/objects/${encodeURIComponent(schemaName)}/${encodeURIComponent(objectName)}`,
+      { timeoutMs: 15000 }
+    );
+    const objectDetails = { ...state.database.objectDetails, [environment]: data };
+    const controls = { ...state.database.controls };
+    const nextControls = { ...(controls[environment] || databaseControls(environment)) };
+    if (!nextControls.sortColumn && data?.primaryKey?.[0]) {
+      nextControls.sortColumn = data.primaryKey[0];
+    }
+    controls[environment] = nextControls;
+    setDatabaseState({
+      objectDetails,
+      controls,
+      objectLoading: { ...state.database.objectLoading, [environment]: false }
+    });
+  } catch (err) {
+    setDatabaseState({
+      objectLoading: { ...state.database.objectLoading, [environment]: false },
+      objectError: { ...state.database.objectError, [environment]: err.message || 'Failed to load object details.' }
+    });
+  }
+}
+
+async function loadDatabaseRows(projectId, environment) {
+  const selected = databaseSelection(environment);
+  if (!projectId || !selected.schema || !selected.object) return;
+  const controls = databaseControls(environment);
+  const params = new URLSearchParams({
+    page: String(controls.page || 1),
+    pageSize: String(controls.pageSize || 100)
+  });
+  if (controls.sortColumn) params.set('sortColumn', controls.sortColumn);
+  if (controls.sortDirection) params.set('sortDirection', controls.sortDirection);
+  if (controls.filterColumn) params.set('filterColumn', controls.filterColumn);
+  if (controls.filterValue) params.set('filterValue', controls.filterValue);
+  setDatabaseState({
+    rowLoading: { ...state.database.rowLoading, [environment]: true },
+    rowError: { ...state.database.rowError, [environment]: '' }
+  });
+  try {
+    const data = await api(
+      `/projects/${projectId}/database/${environment}/objects/${encodeURIComponent(selected.schema)}/${encodeURIComponent(selected.object)}/rows?${params.toString()}`,
+      { timeoutMs: 15000 }
+    );
+    setDatabaseState({
+      rows: { ...state.database.rows, [environment]: data },
+      rowLoading: { ...state.database.rowLoading, [environment]: false }
+    });
+  } catch (err) {
+    setDatabaseState({
+      rowLoading: { ...state.database.rowLoading, [environment]: false },
+      rowError: { ...state.database.rowError, [environment]: err.message || 'Failed to load rows.' }
+    });
+  }
+}
+
+async function loadDatabaseHistory(projectId, environment) {
+  if (!projectId || !environment) return;
+  setDatabaseState({
+    historyLoading: { ...state.database.historyLoading, [environment]: true },
+    historyError: { ...state.database.historyError, [environment]: '' }
+  });
+  try {
+    const data = await api(`/projects/${projectId}/database/${environment}/history?limit=12`, { timeoutMs: 12000 });
+    setDatabaseState({
+      history: { ...state.database.history, [environment]: data?.entries || [] },
+      historyLoading: { ...state.database.historyLoading, [environment]: false }
+    });
+  } catch (err) {
+    setDatabaseState({
+      historyLoading: { ...state.database.historyLoading, [environment]: false },
+      historyError: { ...state.database.historyError, [environment]: err.message || 'Failed to load query history.' }
+    });
+  }
+}
+
+async function runDatabaseQuery(projectId, environment) {
+  if (!projectId || !environment) return;
+  const sql = state.database.sqlDraft[environment] || '';
+  setDatabaseState({
+    queryLoading: { ...state.database.queryLoading, [environment]: true },
+    queryError: { ...state.database.queryError, [environment]: '' },
+    notice: ''
+  });
+  try {
+    const data = await api(`/projects/${projectId}/database/${environment}/query`, {
+      method: 'POST',
+      body: JSON.stringify({ sql }),
+      timeoutMs: 15000
+    });
+    setDatabaseState({
+      queryResult: { ...state.database.queryResult, [environment]: data },
+      queryLoading: { ...state.database.queryLoading, [environment]: false },
+      notice: `Query completed in ${data.durationMs}ms.`
+    });
+    await loadDatabaseHistory(projectId, environment);
+  } catch (err) {
+    setDatabaseState({
+      queryLoading: { ...state.database.queryLoading, [environment]: false },
+      queryError: { ...state.database.queryError, [environment]: err.message || 'Query failed.' }
+    });
+  }
+}
+
 function formatDate(value) {
   if (!value) return '—';
   return new Date(value).toLocaleString();
@@ -1773,6 +2093,43 @@ function renderDevelopmentTaskStateBadge(item, project) {
     return '<span class="badge building">Starting</span>';
   }
   return '';
+}
+
+function formatBytes(value) {
+  const num = Number(value || 0);
+  if (!Number.isFinite(num) || num <= 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let size = num;
+  let idx = 0;
+  while (size >= 1024 && idx < units.length - 1) {
+    size /= 1024;
+    idx += 1;
+  }
+  return `${size >= 10 || idx === 0 ? Math.round(size) : size.toFixed(1)} ${units[idx]}`;
+}
+
+function formatCellValue(value) {
+  if (value == null) return '<span class="db-null">NULL</span>';
+  if (typeof value === 'object') return escapeHtml(JSON.stringify(value));
+  return escapeHtml(String(value));
+}
+
+function renderDataGrid(columns = [], rows = [], emptyMessage = 'No rows returned.') {
+  if (!columns.length) return `<div class="db-empty">${emptyMessage}</div>`;
+  return `
+    <div class="db-grid-wrap">
+      <table class="db-grid">
+        <thead>
+          <tr>${columns.map((column) => `<th>${escapeHtml(column.name || column)}</th>`).join('')}</tr>
+        </thead>
+        <tbody>
+          ${rows.length ? rows.map((row) => `
+            <tr>${columns.map((column) => `<td>${formatCellValue(row[column.name || column])}</td>`).join('')}</tr>
+          `).join('') : `<tr><td colspan="${columns.length}">${emptyMessage}</td></tr>`}
+        </tbody>
+      </table>
+    </div>
+  `;
 }
 
 function hostProjectName(name) {
@@ -2932,8 +3289,177 @@ class AppShell extends HTMLElement {
     `;
   }
 
-  renderDatabaseCard() {
-    return '';
+  renderDatabaseCard(project) {
+    if (!project) return '';
+    const env = state.environment;
+    const catalog = state.database.catalogs[env];
+    const selection = databaseSelection(env);
+    const details = state.database.objectDetails[env];
+    const rows = state.database.rows[env];
+    const history = state.database.history[env] || [];
+    const controls = databaseControls(env);
+    const sqlDraft = state.database.sqlDraft[env] || '';
+    const queryResult = state.database.queryResult[env];
+    const isProduction = env === 'production';
+    const modeLabel = isProduction ? 'Read-only production' : 'Read-only';
+    return `
+      <section class="card database-workspace">
+        <div class="section-title database-header">
+          <div>
+            <h2>Database</h2>
+            <p class="notice">Project-scoped and environment-scoped access for <strong>${escapeHtml(project.name)}</strong> in <strong>${titleCase(env)}</strong>.</p>
+          </div>
+          <div class="database-header-actions">
+            <span class="badge ${isProduction ? 'failed' : 'live'}">${modeLabel}</span>
+            <button class="ghost" id="refreshDatabase" ${state.database.catalogLoading[env] ? 'disabled' : ''}>${state.database.catalogLoading[env] ? 'Refreshing...' : 'Refresh'}</button>
+          </div>
+        </div>
+        ${state.database.notice ? `<p class="notice">${escapeHtml(state.database.notice)}</p>` : ''}
+        ${state.database.catalogError[env] ? `<p class="notice notice-warning">${escapeHtml(state.database.catalogError[env])}</p>` : ''}
+        <div class="database-shell">
+          <aside class="database-sidebar">
+            <div class="db-sidebar-head">
+              <strong>Schemas</strong>
+              <span class="meta">${catalog?.schemas?.length || 0} visible</span>
+            </div>
+            ${catalog?.schemas?.length ? catalog.schemas.map((schema) => `
+              <div class="db-schema-group">
+                <div class="db-schema-name">${escapeHtml(schema.name)}</div>
+                ${schema.objects.map((object) => {
+                  const active = selection.schema === schema.name && selection.object === object.name;
+                  return `
+                    <button
+                      class="db-object-button ${active ? 'active' : ''}"
+                      data-db-select="true"
+                      data-schema="${escapeHtml(schema.name)}"
+                      data-object="${escapeHtml(object.name)}"
+                      data-type="${escapeHtml(object.type)}"
+                    >
+                      <span>${escapeHtml(object.name)}</span>
+                      <span class="meta">${object.type === 'table' ? `${object.estimatedRows || 0} rows` : object.type}</span>
+                    </button>
+                  `;
+                }).join('')}
+              </div>
+            `).join('') : `<div class="db-empty">${state.database.catalogLoading[env] ? 'Loading database catalog...' : 'No tables or views found for this environment yet.'}</div>`}
+          </aside>
+          <div class="database-main">
+            <div class="database-object-summary">
+              <div>
+                <h3>${selection.object ? `${escapeHtml(selection.schema)}.${escapeHtml(selection.object)}` : 'Choose a table or view'}</h3>
+                <p class="notice">${details ? `${titleCase(details.type)} with ${details.columns.length} columns, ~${details.estimatedRows} rows, ${formatBytes(details.totalBytes)}.` : 'Select a database object to inspect schema, browse rows, or run SQL against this environment.'}</p>
+              </div>
+              <div class="database-tabs">
+                <button class="${selection.tab === 'browse' ? 'active' : ''}" data-db-tab="browse">Browse</button>
+                <button class="${selection.tab === 'sql' ? 'active' : ''}" data-db-tab="sql">SQL</button>
+                <button class="${selection.tab === 'history' ? 'active' : ''}" data-db-tab="history">History</button>
+              </div>
+            </div>
+            ${details ? `
+              <div class="db-meta-grid">
+                <div class="db-meta-card">
+                  <strong>Columns</strong>
+                  <ul>${details.columns.map((column) => `<li><code>${escapeHtml(column.name)}</code> <span class="meta">${escapeHtml(column.dataType)}${column.nullable ? '' : ' • required'}</span></li>`).join('')}</ul>
+                </div>
+                <div class="db-meta-card">
+                  <strong>Keys and indexes</strong>
+                  <ul>
+                    <li><span class="meta">Primary key:</span> ${details.primaryKey?.length ? details.primaryKey.map((name) => `<code>${escapeHtml(name)}</code>`).join(', ') : 'None'}</li>
+                    <li><span class="meta">Foreign keys:</span> ${details.foreignKeys?.length ? `${details.foreignKeys.length} linked column${details.foreignKeys.length === 1 ? '' : 's'}` : 'None'}</li>
+                    <li><span class="meta">Indexes:</span> ${details.indexes?.length || 0}</li>
+                  </ul>
+                </div>
+              </div>
+            ` : ''}
+            ${selection.tab === 'browse' ? `
+              <div class="db-panel">
+                <div class="db-toolbar">
+                  <label>
+                    <span>Filter column</span>
+                    <select id="dbFilterColumn">
+                      <option value="">Any</option>
+                      ${(details?.columns || []).map((column) => `<option value="${escapeHtml(column.name)}" ${controls.filterColumn === column.name ? 'selected' : ''}>${escapeHtml(column.name)}</option>`).join('')}
+                    </select>
+                  </label>
+                  <label class="db-filter-grow">
+                    <span>Contains</span>
+                    <input id="dbFilterValue" type="text" value="${escapeHtml(controls.filterValue || '')}" placeholder="Search rows" />
+                  </label>
+                  <label>
+                    <span>Sort</span>
+                    <select id="dbSortColumn">
+                      <option value="">Default</option>
+                      ${(details?.columns || []).map((column) => `<option value="${escapeHtml(column.name)}" ${controls.sortColumn === column.name ? 'selected' : ''}>${escapeHtml(column.name)}</option>`).join('')}
+                    </select>
+                  </label>
+                  <label>
+                    <span>Direction</span>
+                    <select id="dbSortDirection">
+                      <option value="asc" ${controls.sortDirection !== 'desc' ? 'selected' : ''}>Asc</option>
+                      <option value="desc" ${controls.sortDirection === 'desc' ? 'selected' : ''}>Desc</option>
+                    </select>
+                  </label>
+                  <button id="applyDbBrowse" ${!selection.object ? 'disabled' : ''}>Apply</button>
+                </div>
+                <div class="db-toolbar db-pagination">
+                  <span class="meta">Page ${rows?.page || controls.page || 1}${rows?.hasMore ? ' • more rows available' : ''}</span>
+                  <div class="row">
+                    <button class="ghost" id="dbPrevPage" ${(controls.page || 1) <= 1 || state.database.rowLoading[env] ? 'disabled' : ''}>Previous</button>
+                    <button class="ghost" id="dbNextPage" ${!rows?.hasMore || state.database.rowLoading[env] ? 'disabled' : ''}>Next</button>
+                  </div>
+                </div>
+                ${state.database.objectError[env] ? `<p class="notice notice-warning">${escapeHtml(state.database.objectError[env])}</p>` : ''}
+                ${state.database.rowError[env] ? `<p class="notice notice-warning">${escapeHtml(state.database.rowError[env])}</p>` : ''}
+                ${state.database.rowLoading[env] ? '<div class="db-empty">Loading rows...</div>' : renderDataGrid(rows?.columns || details?.columns || [], rows?.rows || [], 'No rows returned for this object.')}
+              </div>
+            ` : ''}
+            ${selection.tab === 'sql' ? `
+              <div class="db-panel">
+                <div class="db-toolbar">
+                  <span class="meta">Read-only SQL. Allowed statements: <code>SELECT</code>, <code>WITH</code>, <code>EXPLAIN</code>.</span>
+                  <button id="runDbQuery" ${state.database.queryLoading[env] ? 'disabled' : ''}>${state.database.queryLoading[env] ? 'Running...' : 'Run Query'}</button>
+                </div>
+                <textarea id="dbSqlEditor" class="db-sql-editor" placeholder="select * from public.users order by id desc limit 50;">${escapeHtml(sqlDraft)}</textarea>
+                ${state.database.queryError[env] ? `<p class="notice notice-warning">${escapeHtml(state.database.queryError[env])}</p>` : ''}
+                ${queryResult ? `
+                  <div class="db-query-summary">
+                    <span class="meta">${queryResult.rowCount} row${queryResult.rowCount === 1 ? '' : 's'} returned in ${queryResult.durationMs}ms${queryResult.truncated ? ' • truncated to platform cap' : ''}</span>
+                  </div>
+                  ${renderDataGrid(queryResult.columns || [], queryResult.rows || [], 'The query completed but returned no rows.')}
+                ` : '<div class="db-empty">Run a read-only query to inspect data without leaving the app.</div>'}
+              </div>
+            ` : ''}
+            ${selection.tab === 'history' ? `
+              <div class="db-panel">
+                ${state.database.historyLoading[env] ? '<div class="db-empty">Loading history...</div>' : ''}
+                ${state.database.historyError[env] ? `<p class="notice notice-warning">${escapeHtml(state.database.historyError[env])}</p>` : ''}
+                ${history.length ? `
+                  <div class="db-history-list">
+                    ${history.map((entry) => `
+                      <div class="db-history-item">
+                        <div class="row spread">
+                          <strong>${escapeHtml(entry.action.replace(/_/g, ' '))}</strong>
+                          <span class="meta">${formatRelative(entry.created_at)}</span>
+                        </div>
+                        <div class="meta">${entry.query_preview ? escapeHtml(entry.query_preview) : `${escapeHtml(entry.schema_name || '')}${entry.object_name ? `.${escapeHtml(entry.object_name)}` : ''}`}</div>
+                        <div class="meta">${entry.success ? 'success' : `failed${entry.error_code ? ` • ${escapeHtml(entry.error_code)}` : ''}`}${entry.duration_ms ? ` • ${entry.duration_ms}ms` : ''}</div>
+                      </div>
+                    `).join('')}
+                  </div>
+                ` : '<div class="db-empty">Database history will appear here after you browse objects or run queries.</div>'}
+              </div>
+            ` : ''}
+            <div class="db-danger-zone">
+              <div>
+                <h3>Danger Zone</h3>
+                <p class="notice">This queues a full reset of the <strong>${titleCase(env)}</strong> customer database for this project. Use it only when you intend to erase all data.</p>
+              </div>
+              <button class="ghost danger" id="emptyDb" ${!state.projectId ? 'disabled' : ''}>Empty Database</button>
+            </div>
+          </div>
+        </div>
+      </section>
+    `;
   }
 
   renderAdvanced(project) {
@@ -2963,10 +3489,6 @@ class AppShell extends HTMLElement {
           <p class="notice">${state.repoMessage || 'Validations will be enforced on upload.'}</p>
         </div>
         
-        <div>
-          <h3>Database</h3>
-          <button class="ghost" id="emptyDb">Empty Database</button>         
-        </div>
         <div>
           <h3>Deploy Webhook</h3>
           <input id="deployWebhookUrl" type="text" placeholder="https://example.com/webhook" value="${state.deployWebhookUrl || ''}" />
@@ -3026,6 +3548,7 @@ class AppShell extends HTMLElement {
         </div>
         ` : ''}
       </div>
+      ${this.renderDatabaseCard(project)}
     `;
   }
 
@@ -3915,7 +4438,8 @@ class AppShell extends HTMLElement {
         appLogLoading: blankEnvMap(false),
         appLogError: blankEnvMap(''),
         appLogFrozenByEnv: blankEnvMap(false),
-        deployWebhookMessage: ''
+        deployWebhookMessage: '',
+        database: createDatabaseState()
       });
       await loadTasks(projectId);
       await loadSessions(projectId);
@@ -3923,6 +4447,8 @@ class AppShell extends HTMLElement {
       await loadLatestBuild(projectId, state.environment);
       await loadLastSuccessBuilds(projectId);
       await loadDeployWebhook(projectId);
+      setDatabaseState(resetDatabaseStateForProject());
+      await loadDatabaseCatalog(projectId, state.environment);
       connectSocket(projectId);
       if (DESKTOP_BRIDGE && projectId) {
         // repo sync happens only when running mobile simulators
@@ -4158,6 +4684,7 @@ class AppShell extends HTMLElement {
         if (state.projectId) {
           loadEnvVars(state.projectId, env);
           loadLatestBuild(state.projectId, env);
+          loadDatabaseCatalog(state.projectId, env);
           if (state.appLogsVisible && !state.appLogFrozenByEnv[env]) {
             fetchApplicationLogs({ force: true });
           } else if (state.appLogsVisible) {
@@ -4182,6 +4709,7 @@ class AppShell extends HTMLElement {
       if (state.projectId) {
         loadEnvVars(state.projectId, env);
         loadLatestBuild(state.projectId, env);
+        loadDatabaseCatalog(state.projectId, env);
         if (state.appLogsVisible && !state.appLogFrozenByEnv[env]) {
           fetchApplicationLogs({ force: true });
         } else if (state.appLogsVisible) {
@@ -5129,12 +5657,136 @@ class AppShell extends HTMLElement {
       setState({ envEditing: { ...state.envEditing, [state.environment]: false }, envMessage: '' });
     });
 
+    this.querySelector('#refreshDatabase')?.addEventListener('click', async () => {
+      await loadDatabaseCatalog(state.projectId, state.environment, { force: true });
+    });
+
+    this.querySelectorAll('[data-db-select="true"]').forEach((button) => {
+      button.addEventListener('click', async () => {
+        const schema = button.getAttribute('data-schema') || '';
+        const object = button.getAttribute('data-object') || '';
+        const type = button.getAttribute('data-type') || '';
+        const env = state.environment;
+        const selected = {
+          ...state.database.selected,
+          [env]: {
+            ...state.database.selected[env],
+            schema,
+            object,
+            type
+          }
+        };
+        const controls = {
+          ...state.database.controls,
+          [env]: {
+            ...databaseControls(env),
+            sortColumn: state.database.objectDetails[env]?.primaryKey?.[0] || ''
+          }
+        };
+        setDatabaseState({ selected, controls });
+        await loadDatabaseObject(state.projectId, env, schema, object);
+        await loadDatabaseRows(state.projectId, env);
+      });
+    });
+
+    this.querySelectorAll('[data-db-tab]').forEach((button) => {
+      button.addEventListener('click', async () => {
+        const tab = button.getAttribute('data-db-tab') || 'browse';
+        const env = state.environment;
+        setDatabaseState({
+          selected: {
+            ...state.database.selected,
+            [env]: {
+              ...state.database.selected[env],
+              tab
+            }
+          }
+        });
+        if (tab === 'history') {
+          await loadDatabaseHistory(state.projectId, env);
+        }
+      });
+    });
+
+    this.querySelector('#applyDbBrowse')?.addEventListener('click', async () => {
+      const env = state.environment;
+      const nextControls = {
+        ...databaseControls(env),
+        page: 1,
+        filterColumn: this.querySelector('#dbFilterColumn')?.value || '',
+        filterValue: this.querySelector('#dbFilterValue')?.value || '',
+        sortColumn: this.querySelector('#dbSortColumn')?.value || '',
+        sortDirection: this.querySelector('#dbSortDirection')?.value || 'asc'
+      };
+      setDatabaseState({
+        controls: {
+          ...state.database.controls,
+          [env]: nextControls
+        }
+      });
+      await loadDatabaseRows(state.projectId, env);
+    });
+
+    this.querySelector('#dbPrevPage')?.addEventListener('click', async () => {
+      const env = state.environment;
+      const nextControls = {
+        ...databaseControls(env),
+        page: Math.max(1, Number(databaseControls(env).page || 1) - 1)
+      };
+      setDatabaseState({
+        controls: {
+          ...state.database.controls,
+          [env]: nextControls
+        }
+      });
+      await loadDatabaseRows(state.projectId, env);
+    });
+
+    this.querySelector('#dbNextPage')?.addEventListener('click', async () => {
+      const env = state.environment;
+      const nextControls = {
+        ...databaseControls(env),
+        page: Number(databaseControls(env).page || 1) + 1
+      };
+      setDatabaseState({
+        controls: {
+          ...state.database.controls,
+          [env]: nextControls
+        }
+      });
+      await loadDatabaseRows(state.projectId, env);
+    });
+
+    this.querySelector('#dbSqlEditor')?.addEventListener('input', (event) => {
+      const env = state.environment;
+      const sqlDraft = {
+        ...state.database.sqlDraft,
+        [env]: event.target.value
+      };
+      storeDatabaseSql(state.user?.id, state.projectId, env, event.target.value);
+      setDatabaseState({ sqlDraft });
+    });
+
+    this.querySelector('#runDbQuery')?.addEventListener('click', async () => {
+      await runDatabaseQuery(state.projectId, state.environment);
+    });
+
     this.querySelector('#emptyDb')?.addEventListener('click', async () => {
-      const ok = await showConfirm(`Empty database for ${state.environment}?`, { confirmText: 'Empty' });
-      if (!ok) return;
+      const confirmation = await showPrompt(
+        `Type ${state.environment.toUpperCase()} to confirm wiping the ${state.environment} database.`,
+        {
+          placeholder: state.environment.toUpperCase(),
+          confirmText: 'Empty Database',
+          initialValue: ''
+        }
+      );
+      if (confirmation !== state.environment.toUpperCase()) {
+        setDatabaseState({ notice: 'Database reset cancelled.' });
+        return;
+      }
       api(`/projects/${state.projectId}/env/${state.environment}/empty-db`, { method: 'POST' })
-        .then(() => setState({ envMessage: 'Empty DB started' }))
-        .catch((err) => setState({ envMessage: err.message }));
+        .then(() => setDatabaseState({ notice: 'Database reset queued. Refresh after the worker completes the reset.' }))
+        .catch((err) => setDatabaseState({ notice: err.message || 'Database reset failed.' }));
     });
 
     this.querySelectorAll('.delete-latest-task').forEach((btn) => {
