@@ -12,6 +12,8 @@ const RUNTIME_LIMITS_FALLBACK = {
   business: { development: 200, testing: 100, production: 750 },
   agency: { development: 500, testing: 250, production: 750 }
 };
+const DATABASE_PAGE_SIZE_OPTIONS = [5, 10, 25, 50, 100];
+const DEFAULT_DATABASE_PAGE_SIZE = DATABASE_PAGE_SIZE_OPTIONS[0];
 
 function createDraftState() {
   return {
@@ -196,6 +198,8 @@ const initialState = {
   createProjectName: '',
   authModalOpen: false,
   authModalMode: 'register',
+  authErrorMessage: '',
+  authErrorCode: '',
   desktopSettings: {
     useLocalApi: false,
     localApiUrl: '',
@@ -258,14 +262,66 @@ const initialState = {
   taskDetails: {},
   sessionDetails: {},
   taskPromptDraft: '',
-  activeTaskId: null,
-  taskStatusMessage: '',
-  taskStatusPersistent: false,
+  taskSubmissionPending: null,
+  taskProcessingHydration: {
+    projectId: null,
+    tasksLoaded: false,
+    buildLoaded: false
+  },
+  toasts: [],
+  authNotice: '',
+  createProjectNotice: '',
+  projectNotice: '',
   runtimeUsage: { month: '', plan: '', usage: {} },
   runtimeUsageLoading: false,
   runtimeUsageError: '',
   runtimeQuotaNotice: {},
-  drafts: createDraftState()
+  drafts: createDraftState(),
+  database: {
+    catalogs: {
+      development: null,
+      testing: null,
+      production: null
+    },
+    catalogLoading: blankEnvMap(false),
+    catalogError: blankEnvMap(''),
+    selected: {
+      development: { schema: '', object: '', type: '', tab: 'browse' },
+      testing: { schema: '', object: '', type: '', tab: 'browse' },
+      production: { schema: '', object: '', type: '', tab: 'browse' }
+    },
+    objectDetails: {
+      development: null,
+      testing: null,
+      production: null
+    },
+    objectLoading: blankEnvMap(false),
+    objectError: blankEnvMap(''),
+    rows: {
+      development: null,
+      testing: null,
+      production: null
+    },
+    rowLoading: blankEnvMap(false),
+    rowError: blankEnvMap(''),
+    controls: blankDbControls(),
+    sqlDraft: blankEnvMap(''),
+    queryResult: {
+      development: null,
+      testing: null,
+      production: null
+    },
+    queryLoading: blankEnvMap(false),
+    queryError: blankEnvMap(''),
+    history: {
+      development: [],
+      testing: [],
+      production: []
+    },
+    historyLoading: blankEnvMap(false),
+    historyError: blankEnvMap(''),
+    notice: ''
+  }
 };
 const store = createStore(initialState);
 const state = store.state;
@@ -273,7 +329,6 @@ const state = store.state;
 let socketClient = null;
 let socketProjectId = null;
 let runtimeUsageTimer = null;
-let taskStatusTimer = null;
 let headerProgressTimer = null;
 let confirmResolver = null;
 let promptResolver = null;
@@ -285,6 +340,9 @@ let appLogTypewriter = null;
 let appLogLineQueue = [];
 let appLogQueueEnv = '';
 let appLogScrollAnchor = null;
+let toastCounter = 0;
+const toastTimers = new Map();
+const recentToastKeys = new Map();
 const APP_LOG_POLL_INTERVAL_MS = 2000;
 const APP_LOG_FETCH_LINES = 2000;
 const APP_LOG_TYPE_INTERVAL_MS = 40;
@@ -306,6 +364,23 @@ function envStorageKey(userId, projectId) {
 function projectStorageKey(userId) {
   if (!userId) return null;
   return `vibes_project_${userId}`;
+}
+
+function databaseSqlStorageKey(userId, projectId, environment) {
+  if (!userId || !projectId || !environment) return null;
+  return `vibes_db_sql_${userId}_${projectId}_${environment}`;
+}
+
+function loadStoredDatabaseSql(userId, projectId, environment) {
+  const key = databaseSqlStorageKey(userId, projectId, environment);
+  if (!key) return '';
+  return localStorage.getItem(key) || '';
+}
+
+function storeDatabaseSql(userId, projectId, environment, sql) {
+  const key = databaseSqlStorageKey(userId, projectId, environment);
+  if (!key) return;
+  localStorage.setItem(key, sql || '');
 }
 
 function userFromToken(token) {
@@ -798,7 +873,7 @@ async function ensureDesktopRepo(projectId) {
     });
     return localPath;
   } catch (err) {
-    setTaskStatus(`Repo sync failed: ${err?.message || err}`, { autoHide: true });
+    pushToast({ message: `Repo sync failed: ${err?.message || err}`, tone: 'error', dedupeKey: `repo-sync:${projectId}` });
     return '';
   } finally {
     setState({ localRunBusy: false });
@@ -851,7 +926,7 @@ async function forceSyncDesktopRepo(projectId) {
     });
     return true;
   } catch (err) {
-    setTaskStatus(`Repo refresh failed: ${err?.message || err}`, { autoHide: true });
+    pushToast({ message: `Repo refresh failed: ${err?.message || err}`, tone: 'error', dedupeKey: `repo-refresh:${projectId}` });
     return false;
   } finally {
     setState({ localRunBusy: false });
@@ -977,23 +1052,221 @@ function updateLocalRunLog(text, { append = false } = {}) {
   setState({ localRunLog: next });
 }
 
-function setTaskStatus(message, { autoHide = false, persistent = false } = {}) {
-  if (taskStatusTimer) {
-    clearTimeout(taskStatusTimer);
-    taskStatusTimer = null;
-  }
-  setState({ taskStatusMessage: message, taskStatusPersistent: persistent });
-  if (autoHide) {
-    taskStatusTimer = setTimeout(() => {
-      setState({ taskStatusMessage: '', taskStatusPersistent: false });
-    }, 3000);
+function clearExpiredToastKeys() {
+  const now = Date.now();
+  for (const [key, expiresAt] of recentToastKeys.entries()) {
+    if (expiresAt <= now) recentToastKeys.delete(key);
   }
 }
 
-function showError(err, { autoHide = true, persistent = false } = {}) {
+function dismissToast(id) {
+  const timer = toastTimers.get(id);
+  if (timer) {
+    clearTimeout(timer);
+    toastTimers.delete(id);
+  }
+  if (!state.toasts.some((toast) => toast.id === id)) return;
+  setState({ toasts: state.toasts.filter((toast) => toast.id !== id) });
+}
+
+function clearAllToasts() {
+  for (const timer of toastTimers.values()) {
+    clearTimeout(timer);
+  }
+  toastTimers.clear();
+  setState({ toasts: [] });
+}
+
+function pushToast({ message, tone = 'info', durationMs = 3000, dedupeKey = '', html = '', allowHtml = false } = {}) {
+  const text = String(message || '').trim();
+  const trustedHtml = allowHtml ? String(html || text || '').trim() : '';
+  if (!text && !trustedHtml) return null;
+  clearExpiredToastKeys();
+  if (dedupeKey) {
+    const active = state.toasts.some((toast) => toast.dedupeKey === dedupeKey);
+    const recent = recentToastKeys.has(dedupeKey);
+    if (active || recent) return null;
+  }
+  const id = `toast-${Date.now()}-${++toastCounter}`;
+  const createdAt = Date.now();
+  const expiresAt = createdAt + Math.max(500, Number(durationMs) || 3000);
+  const nextToast = {
+    id,
+    tone,
+    message: text,
+    html: trustedHtml,
+    allowHtml: Boolean(allowHtml && trustedHtml),
+    createdAt,
+    expiresAt,
+    dedupeKey
+  };
+  const nextToasts = [...state.toasts, nextToast].slice(-3);
+  const dropped = state.toasts.filter((toast) => !nextToasts.some((item) => item.id === toast.id));
+  dropped.forEach((toast) => {
+    const timer = toastTimers.get(toast.id);
+    if (timer) {
+      clearTimeout(timer);
+      toastTimers.delete(toast.id);
+    }
+  });
+  setState({ toasts: nextToasts });
+  if (dedupeKey) recentToastKeys.set(dedupeKey, expiresAt);
+  const timer = setTimeout(() => dismissToast(id), expiresAt - Date.now());
+  toastTimers.set(id, timer);
+  return id;
+}
+
+function setTaskProcessingHydration(projectId, patch = {}) {
+  const nextProjectId = projectId ?? state.projectId ?? null;
+  const base =
+    state.taskProcessingHydration?.projectId === nextProjectId
+      ? state.taskProcessingHydration
+      : { projectId: nextProjectId, tasksLoaded: false, buildLoaded: false };
+  setState({
+    taskProcessingHydration: {
+      ...base,
+      ...patch,
+      projectId: nextProjectId
+    }
+  });
+}
+
+function resetTaskProcessingState(projectId = state.projectId) {
+  setState({
+    taskSubmissionPending: null,
+    taskProcessingHydration: {
+      projectId: projectId ?? null,
+      tasksLoaded: false,
+      buildLoaded: false
+    }
+  });
+}
+
+function currentDevelopmentTask(tasks = state.tasks) {
+  return (Array.isArray(tasks) ? tasks : []).find((task) => String(task?.environment || 'development').toLowerCase() === 'development') || null;
+}
+
+function taskById(taskId, tasks = state.tasks) {
+  if (!taskId) return null;
+  return (Array.isArray(tasks) ? tasks : []).find((task) => String(task?.id) === String(taskId)) || null;
+}
+
+function taskBuildMatchesProcessingFlow(
+  task,
+  envState = projectEnvironmentState(state.projectId, 'development'),
+  latestBuild = state.latestBuild.development
+) {
+  if (!task?.commit_hash || !envState || !latestBuild?.ref_commit) return false;
+  const taskId = String(task.id || '');
+  const commitHash = String(task.commit_hash || '');
+  const selectedTaskMatches = String(envState.selected_task_id || '') === taskId;
+  const liveTaskMatches = String(envState.live_task_id || '') === taskId;
+  const selectedCommitMatches = String(envState.selected_commit_sha || '') === commitHash;
+  const liveCommitMatches = String(envState.live_commit_sha || '') === commitHash;
+  return latestBuild.ref_commit === commitHash && (selectedTaskMatches || liveTaskMatches || selectedCommitMatches || liveCommitMatches);
+}
+
+function currentDevelopmentTaskForBuild(
+  envState = projectEnvironmentState(state.projectId, 'development'),
+  latestBuild = state.latestBuild.development
+) {
+  const byLiveTask = taskById(envState?.live_task_id);
+  if (byLiveTask && taskBuildMatchesProcessingFlow(byLiveTask, envState, latestBuild)) return byLiveTask;
+  const bySelectedTask = taskById(envState?.selected_task_id);
+  if (bySelectedTask && taskBuildMatchesProcessingFlow(bySelectedTask, envState, latestBuild)) return bySelectedTask;
+  const latestTask = currentDevelopmentTask();
+  if (latestTask && taskBuildMatchesProcessingFlow(latestTask, envState, latestBuild)) return latestTask;
+  return null;
+}
+
+function deriveTaskProcessingView() {
+  if (state.environment !== 'development' || !state.projectId) return null;
+  const pending = state.taskSubmissionPending;
+  if (pending?.projectId === state.projectId && pending.environment === 'development') {
+    return { state: 'submission_pending', message: 'Reading Request', taskId: null };
+  }
+  const hydration = state.taskProcessingHydration || {};
+  if (hydration.projectId !== state.projectId || !hydration.tasksLoaded || !hydration.buildLoaded) {
+    return null;
+  }
+  const task = currentDevelopmentTask();
+  if (!task) return null;
+  const status = String(task.status || '').toLowerCase();
+  if (status === 'queued') {
+    return { state: 'queued', message: 'Reading Request', taskId: task.id };
+  }
+  if (status === 'running') {
+    return { state: 'running', message: 'Designing and implementing changes', taskId: task.id };
+  }
+  if (status !== 'completed') return null;
+  const envState = projectEnvironmentState(state.projectId, 'development');
+  const latestBuild = state.latestBuild.development;
+  if (!envState) return null;
+  const workspaceState = String(envState.workspace_state || '').toLowerCase();
+  const buildStatus = String(envState.build_status || '').toLowerCase();
+  const verifyStatus = String(latestBuild?.status || '').toLowerCase();
+  const taskLinkedBuild = taskBuildMatchesProcessingFlow(task, envState, latestBuild);
+  const followOnActive =
+    workspaceState === 'starting' ||
+    buildStatus === 'building' ||
+    (taskLinkedBuild && verifyStatus === 'building');
+  if (!followOnActive) return null;
+  return { state: 'deploying_or_verifying', message: 'Deploying your update', taskId: task.id };
+}
+
+function setInlineNotice(field, message = '') {
+  if (!field) return;
+  setState({ [field]: message || '' });
+}
+
+function showError(err, { noticeField = '', tone = 'error', dedupeKey = '' } = {}) {
   const message = err?.message || String(err || '');
   const isPlanError = Boolean(err?.code && String(err.code).startsWith('plan_'));
-  setTaskStatus(message, { autoHide: !isPlanError && autoHide, persistent: isPlanError || persistent });
+  if (noticeField) {
+    setInlineNotice(noticeField, message);
+    return;
+  }
+  if (isPlanError && state.projectId) {
+    setInlineNotice('projectNotice', message);
+    return;
+  }
+  pushToast({ message, tone, dedupeKey });
+}
+
+function notifyTaskTerminalResult(task, status) {
+  const normalizedStatus = String(status || '').toLowerCase();
+  if (!task?.id || !['failed', 'cancelled'].includes(normalizedStatus)) return;
+  pushToast({
+    message: normalizedStatus === 'failed' ? 'Task failed before deployment completed' : 'Task cancelled',
+    tone: normalizedStatus === 'failed' ? 'error' : 'warning',
+    dedupeKey: `task-result:${task.id}:${normalizedStatus}`
+  });
+}
+
+function notifyDevelopmentBuildTerminal(payload) {
+  if (payload?.environment !== 'development') return;
+  const status = String(payload.status || '').toLowerCase();
+  if (!['live', 'failed', 'cancelled'].includes(status)) return;
+  const envState = projectEnvironmentState(state.projectId, 'development');
+  const latestBuild = {
+    ...(state.latestBuild.development || {}),
+    ...(payload?.refCommit ? { ref_commit: payload.refCommit } : {}),
+    ...(payload?.status ? { status: payload.status } : {})
+  };
+  const task = currentDevelopmentTaskForBuild(envState, latestBuild);
+  if (!task?.id) return;
+  const tone = status === 'live' ? 'success' : status === 'failed' ? 'error' : 'warning';
+  const message =
+    status === 'live'
+      ? 'Your update is live'
+      : status === 'failed'
+        ? 'Deployment failed for the latest task'
+        : 'Deployment cancelled for the latest task';
+  pushToast({
+    message,
+    tone,
+    dedupeKey: `build-result:${state.projectId}:development:${latestBuild.ref_commit || ''}:${status}`
+  });
 }
 
 function showConfirmChoices(message, {
@@ -1161,6 +1434,38 @@ function formatPlanError(code, details = {}) {
   return null;
 }
 
+function formatAuthError(code) {
+  if (code === 'auth_registration_closed') {
+    return 'Sorry, customer registration is not yet open. We will let you know when it is and we hope to see you again soon!';
+  }
+  if (code === 'auth_email_required') {
+    return 'Please enter your email address.';
+  }
+  if (code === 'auth_invalid_credentials') {
+    return 'Invalid email or password.';
+  }
+  return 'Something went wrong. Please try again.';
+}
+
+function clearAuthError({ render = true } = {}) {
+  if (!state.authErrorMessage && !state.authErrorCode) return;
+  if (render) {
+    setState({ authErrorMessage: '', authErrorCode: '' });
+    return;
+  }
+  state.authErrorMessage = '';
+  state.authErrorCode = '';
+  document.querySelectorAll('.auth-panel-error').forEach((node) => node.remove());
+}
+
+function setAuthError(err) {
+  const code = String(err?.code || err?.details?.error || '');
+  setState({
+    authErrorCode: code,
+    authErrorMessage: formatAuthError(code)
+  });
+}
+
 async function api(path, options = {}) {
   const { timeoutMs, ...fetchOptions } = options;
   const controller = timeoutMs ? new AbortController() : null;
@@ -1179,7 +1484,7 @@ async function api(path, options = {}) {
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
     const code = data.error || 'request_failed';
-    const err = new Error(code);
+    const err = new Error(data.message || code);
     err.code = code;
     err.details = data || {};
     if (String(code).startsWith('plan_')) {
@@ -1205,12 +1510,14 @@ async function loadProjects() {
     if (projectId) storeProject(state.user?.id, projectId);
     const projectChanged = Boolean(state.projectId && projectId && state.projectId !== projectId);
     if (projectChanged) stopAppLogPolling();
+    if (projectChanged || !projectId) resetTaskProcessingState(projectId);
     setState({
       projects,
       projectId,
       environment: storedEnv || state.environment,
       ...(projectChanged
         ? {
+            database: createDatabaseState(),
             appLogsByEnv: blankEnvMap(''),
             appLogSnapshotByEnv: blankEnvMap(''),
             appLogLoading: blankEnvMap(false),
@@ -1244,7 +1551,9 @@ async function loadProjects() {
         appLogError: blankEnvMap(''),
         appLogFrozenByEnv: blankEnvMap(false),
         environment: 'development',
-        nerdLevel: 'beginner'
+        nerdLevel: 'beginner',
+        createProjectNotice: '',
+        database: createDatabaseState()
       });
       return;
     }
@@ -1275,6 +1584,8 @@ async function loadProjects() {
         }
       });
     }
+    setDatabaseState(resetDatabaseStateForProject());
+    await loadDatabaseCatalog(projectId, state.environment);
   } catch (err) {
     const message = err?.name === 'AbortError'
       ? 'Projects request timed out. Check your connection or API URL.'
@@ -1374,6 +1685,87 @@ function blankEnvMap(value = '') {
     testing: value,
     production: value
   };
+}
+
+function blankDbSelection() {
+  return {
+    development: { schema: '', object: '', type: '', tab: 'browse' },
+    testing: { schema: '', object: '', type: '', tab: 'browse' },
+    production: { schema: '', object: '', type: '', tab: 'browse' }
+  };
+}
+
+function blankDbControls() {
+  return {
+    development: { page: 1, pageSize: DEFAULT_DATABASE_PAGE_SIZE, sortColumn: '', sortDirection: 'asc', filterColumn: '', filterValue: '' },
+    testing: { page: 1, pageSize: DEFAULT_DATABASE_PAGE_SIZE, sortColumn: '', sortDirection: 'asc', filterColumn: '', filterValue: '' },
+    production: { page: 1, pageSize: DEFAULT_DATABASE_PAGE_SIZE, sortColumn: '', sortDirection: 'asc', filterColumn: '', filterValue: '' }
+  };
+}
+
+function blankDbRows() {
+  return {
+    development: null,
+    testing: null,
+    production: null
+  };
+}
+
+function blankDbHistory() {
+  return {
+    development: [],
+    testing: [],
+    production: []
+  };
+}
+
+function createDatabaseState() {
+  return {
+    catalogs: blankDbRows(),
+    catalogLoading: blankEnvMap(false),
+    catalogError: blankEnvMap(''),
+    selected: blankDbSelection(),
+    objectDetails: blankDbRows(),
+    objectLoading: blankEnvMap(false),
+    objectError: blankEnvMap(''),
+    rows: blankDbRows(),
+    rowLoading: blankEnvMap(false),
+    rowError: blankEnvMap(''),
+    controls: blankDbControls(),
+    sqlDraft: blankEnvMap(''),
+    queryResult: blankDbRows(),
+    queryLoading: blankEnvMap(false),
+    queryError: blankEnvMap(''),
+    history: blankDbHistory(),
+    historyLoading: blankEnvMap(false),
+    historyError: blankEnvMap(''),
+    notice: ''
+  };
+}
+
+function resetDatabaseStateForProject() {
+  const next = createDatabaseState();
+  for (const env of ['development', 'testing', 'production']) {
+    next.sqlDraft[env] = loadStoredDatabaseSql(state.user?.id, state.projectId, env);
+  }
+  return next;
+}
+
+function databaseSelection(env = state.environment) {
+  return state.database?.selected?.[env] || { schema: '', object: '', type: '', tab: 'browse' };
+}
+
+function databaseControls(env = state.environment) {
+  return state.database?.controls?.[env] || { page: 1, pageSize: DEFAULT_DATABASE_PAGE_SIZE, sortColumn: '', sortDirection: 'asc', filterColumn: '', filterValue: '' };
+}
+
+function setDatabaseState(patch = {}) {
+  setState({
+    database: {
+      ...state.database,
+      ...patch
+    }
+  });
 }
 
 function stopAppLogTypewriter() {
@@ -1643,6 +2035,9 @@ function ensureAppLogPolling() {
 async function loadTasks(projectId) {
   const tasks = await api(`/projects/${projectId}/tasks`);
   setState({ tasks });
+  if (projectId === state.projectId) {
+    setTaskProcessingHydration(projectId, { tasksLoaded: true });
+  }
 }
 
 async function loadSessions(projectId) {
@@ -1681,6 +2076,9 @@ async function loadLatestBuild(projectId, environment, options = {}) {
     latestBuild: { ...state.latestBuild },
     buildStatus: { ...state.buildStatus }
   });
+  if (projectId === state.projectId && environment === 'development') {
+    setTaskProcessingHydration(projectId, { buildLoaded: true });
+  }
   if (environment === state.environment) {
     ensureBuildLogPolling();
     if (
@@ -1808,6 +2206,175 @@ async function loadEnvVars(projectId, environment) {
   setState({ envVarsMap: { ...state.envVarsMap } });
 }
 
+function chooseDefaultDatabaseObject(catalog) {
+  for (const schema of catalog?.schemas || []) {
+    if (schema?.objects?.length) {
+      const object = schema.objects[0];
+      return {
+        schema: schema.name,
+        object: object.name,
+        type: object.type
+      };
+    }
+  }
+  return { schema: '', object: '', type: '' };
+}
+
+async function loadDatabaseCatalog(projectId, environment, { force = false } = {}) {
+  if (!projectId || !environment) return;
+  if (state.database.catalogLoading[environment]) return;
+  if (!force && state.database.catalogs[environment]) return;
+  const nextLoading = { ...state.database.catalogLoading, [environment]: true };
+  const nextError = { ...state.database.catalogError, [environment]: '' };
+  setDatabaseState({ catalogLoading: nextLoading, catalogError: nextError, notice: '' });
+  try {
+    const data = await api(`/projects/${projectId}/database/${environment}/catalog`, { timeoutMs: 15000 });
+    const catalogs = { ...state.database.catalogs, [environment]: data };
+    const selected = { ...state.database.selected };
+    const current = selected[environment];
+    const exists = data?.schemas?.some((schema) => schema.name === current.schema && schema.objects?.some((object) => object.name === current.object));
+    if (!exists) {
+      const fallback = chooseDefaultDatabaseObject(data);
+      selected[environment] = {
+        ...current,
+        ...fallback,
+        tab: current?.tab || 'browse'
+      };
+      state.database.controls[environment] = { page: 1, pageSize: DEFAULT_DATABASE_PAGE_SIZE, sortColumn: '', sortDirection: 'asc', filterColumn: '', filterValue: '' };
+    }
+    setDatabaseState({
+      catalogs,
+      selected,
+      controls: { ...state.database.controls },
+      catalogLoading: { ...state.database.catalogLoading, [environment]: false }
+    });
+    if (selected[environment]?.schema && selected[environment]?.object) {
+      await Promise.all([
+        loadDatabaseObject(projectId, environment, selected[environment].schema, selected[environment].object),
+        loadDatabaseRows(projectId, environment),
+        loadDatabaseHistory(projectId, environment)
+      ]);
+    }
+  } catch (err) {
+    setDatabaseState({
+      catalogLoading: { ...state.database.catalogLoading, [environment]: false },
+      catalogError: { ...state.database.catalogError, [environment]: err.message || 'Failed to load database catalog.' }
+    });
+  }
+}
+
+async function loadDatabaseObject(projectId, environment, schemaName, objectName) {
+  if (!projectId || !schemaName || !objectName) return;
+  setDatabaseState({
+    objectLoading: { ...state.database.objectLoading, [environment]: true },
+    objectError: { ...state.database.objectError, [environment]: '' }
+  });
+  try {
+    const data = await api(
+      `/projects/${projectId}/database/${environment}/objects/${encodeURIComponent(schemaName)}/${encodeURIComponent(objectName)}`,
+      { timeoutMs: 15000 }
+    );
+    const objectDetails = { ...state.database.objectDetails, [environment]: data };
+    const controls = { ...state.database.controls };
+    const nextControls = { ...(controls[environment] || databaseControls(environment)) };
+    if (!nextControls.sortColumn && data?.primaryKey?.[0]) {
+      nextControls.sortColumn = data.primaryKey[0];
+    }
+    controls[environment] = nextControls;
+    setDatabaseState({
+      objectDetails,
+      controls,
+      objectLoading: { ...state.database.objectLoading, [environment]: false }
+    });
+  } catch (err) {
+    setDatabaseState({
+      objectLoading: { ...state.database.objectLoading, [environment]: false },
+      objectError: { ...state.database.objectError, [environment]: err.message || 'Failed to load object details.' }
+    });
+  }
+}
+
+async function loadDatabaseRows(projectId, environment) {
+  const selected = databaseSelection(environment);
+  if (!projectId || !selected.schema || !selected.object) return;
+  const controls = databaseControls(environment);
+  const params = new URLSearchParams({
+    page: String(controls.page || 1),
+    pageSize: String(controls.pageSize || DEFAULT_DATABASE_PAGE_SIZE)
+  });
+  if (controls.sortColumn) params.set('sortColumn', controls.sortColumn);
+  if (controls.sortDirection) params.set('sortDirection', controls.sortDirection);
+  if (controls.filterColumn) params.set('filterColumn', controls.filterColumn);
+  if (controls.filterValue) params.set('filterValue', controls.filterValue);
+  setDatabaseState({
+    rowLoading: { ...state.database.rowLoading, [environment]: true },
+    rowError: { ...state.database.rowError, [environment]: '' }
+  });
+  try {
+    const data = await api(
+      `/projects/${projectId}/database/${environment}/objects/${encodeURIComponent(selected.schema)}/${encodeURIComponent(selected.object)}/rows?${params.toString()}`,
+      { timeoutMs: 15000 }
+    );
+    setDatabaseState({
+      rows: { ...state.database.rows, [environment]: data },
+      rowLoading: { ...state.database.rowLoading, [environment]: false }
+    });
+  } catch (err) {
+    setDatabaseState({
+      rowLoading: { ...state.database.rowLoading, [environment]: false },
+      rowError: { ...state.database.rowError, [environment]: err.message || 'Failed to load rows.' }
+    });
+  }
+}
+
+async function loadDatabaseHistory(projectId, environment) {
+  if (!projectId || !environment) return;
+  setDatabaseState({
+    historyLoading: { ...state.database.historyLoading, [environment]: true },
+    historyError: { ...state.database.historyError, [environment]: '' }
+  });
+  try {
+    const data = await api(`/projects/${projectId}/database/${environment}/history?limit=12`, { timeoutMs: 12000 });
+    setDatabaseState({
+      history: { ...state.database.history, [environment]: data?.entries || [] },
+      historyLoading: { ...state.database.historyLoading, [environment]: false }
+    });
+  } catch (err) {
+    setDatabaseState({
+      historyLoading: { ...state.database.historyLoading, [environment]: false },
+      historyError: { ...state.database.historyError, [environment]: err.message || 'Failed to load query history.' }
+    });
+  }
+}
+
+async function runDatabaseQuery(projectId, environment) {
+  if (!projectId || !environment) return;
+  const sql = state.database.sqlDraft[environment] || '';
+  setDatabaseState({
+    queryLoading: { ...state.database.queryLoading, [environment]: true },
+    queryError: { ...state.database.queryError, [environment]: '' },
+    notice: ''
+  });
+  try {
+    const data = await api(`/projects/${projectId}/database/${environment}/query`, {
+      method: 'POST',
+      body: JSON.stringify({ sql }),
+      timeoutMs: 15000
+    });
+    setDatabaseState({
+      queryResult: { ...state.database.queryResult, [environment]: data },
+      queryLoading: { ...state.database.queryLoading, [environment]: false },
+      notice: `Query completed in ${data.durationMs}ms.`
+    });
+    await loadDatabaseHistory(projectId, environment);
+  } catch (err) {
+    setDatabaseState({
+      queryLoading: { ...state.database.queryLoading, [environment]: false },
+      queryError: { ...state.database.queryError, [environment]: err.message || 'Query failed.' }
+    });
+  }
+}
+
 function formatDate(value) {
   if (!value) return '—';
   return new Date(value).toLocaleString();
@@ -1888,6 +2455,43 @@ function renderDevelopmentTaskStateBadge(item, project) {
     return '<span class="badge building">Starting</span>';
   }
   return '';
+}
+
+function formatBytes(value) {
+  const num = Number(value || 0);
+  if (!Number.isFinite(num) || num <= 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let size = num;
+  let idx = 0;
+  while (size >= 1024 && idx < units.length - 1) {
+    size /= 1024;
+    idx += 1;
+  }
+  return `${size >= 10 || idx === 0 ? Math.round(size) : size.toFixed(1)} ${units[idx]}`;
+}
+
+function formatCellValue(value) {
+  if (value == null) return '<span class="db-null">NULL</span>';
+  if (typeof value === 'object') return escapeHtml(JSON.stringify(value));
+  return escapeHtml(String(value));
+}
+
+function renderDataGrid(columns = [], rows = [], emptyMessage = 'No rows returned.') {
+  if (!columns.length) return `<div class="db-empty">${emptyMessage}</div>`;
+  return `
+    <div class="db-grid-wrap">
+      <table class="db-grid">
+        <thead>
+          <tr>${columns.map((column) => `<th>${escapeHtml(column.name || column)}</th>`).join('')}</tr>
+        </thead>
+        <tbody>
+          ${rows.length ? rows.map((row) => `
+            <tr>${columns.map((column) => `<td>${formatCellValue(row[column.name || column])}</td>`).join('')}</tr>
+          `).join('') : `<tr><td colspan="${columns.length}">${emptyMessage}</td></tr>`}
+        </tbody>
+      </table>
+    </div>
+  `;
 }
 
 function hostProjectName(name) {
@@ -2043,6 +2647,7 @@ function connectSocket(projectId) {
       const nextRuntimeNotice = { ...(state.runtimeQuotaNotice || {}) };
       if (nextRuntimeNotice[payload.projectId]) delete nextRuntimeNotice[payload.projectId];
       stopAppLogPolling();
+      resetTaskProcessingState(nextProjectId);
       setState({
         projects: remaining,
         projectId: nextProjectId,
@@ -2075,7 +2680,8 @@ function connectSocket(projectId) {
           appLogSnapshotByEnv: blankEnvMap(''),
           appLogLoading: blankEnvMap(false),
           appLogError: blankEnvMap(''),
-          appLogFrozenByEnv: blankEnvMap(false)
+          appLogFrozenByEnv: blankEnvMap(false),
+          createProjectNotice: ''
         });
       } else {
         loadTasks(nextProjectId);
@@ -2088,18 +2694,16 @@ function connectSocket(projectId) {
     });
     socketClient.on('taskUpdated', (payload) => {
       const idx = state.tasks.findIndex((t) => t.id === payload.id);
+      let nextTask = payload;
       if (idx >= 0) {
         state.tasks[idx] = { ...state.tasks[idx], ...payload };
+        nextTask = state.tasks[idx];
         setState({ tasks: [...state.tasks] });
       }
-      if (payload.id && payload.id === state.activeTaskId) {
-        if (payload.status === 'running') {
-          setTaskStatus('Designing and implementing changes', { persistent: true });
-        }
-        if (payload.status === 'completed') {
-          setTaskStatus('Deploying your update', { persistent: true });
-        }
+      if (payload.id && state.taskSubmissionPending?.projectId === state.projectId) {
+        setState({ taskSubmissionPending: null });
       }
+      notifyTaskTerminalResult(nextTask, payload.status);
     });
     socketClient.on('taskDeleted', (payload) => {
       const nextTasks = state.tasks.filter((t) => t.id !== payload.id);
@@ -2154,21 +2758,6 @@ function connectSocket(projectId) {
         state.progressVisibleUntil[env] = Date.now() + 3000;
         scheduleHeaderProgressRefresh();
       }
-      if (env === state.environment && state.taskStatusPersistent) {
-        if (payload.status === 'building' && !keepPreviewState) {
-          setTaskStatus('Deploying your update', { persistent: true });
-        }
-        if (payload.status === 'live' && !keepPreviewState) {
-          setTaskStatus('Your application is ready to view at the link to the left', { autoHide: true });
-          setState({ activeTaskId: null });
-        }
-        if (payload.status === 'cancelled') {
-          setTaskStatus('Build cancelled', { autoHide: true });
-        }
-        if (keepPreviewState && payload.status === 'building') {
-          setTaskStatus('Preview live. Verifying in background', { persistent: true });
-        }
-      }
       if (env === state.environment && (payload.status === 'failed' || payload.status === 'live' || payload.status === 'cancelled' || payload.status === 'building')) {
         loadLatestBuild(state.projectId, env);
       }
@@ -2197,6 +2786,7 @@ function connectSocket(projectId) {
         progressVisibleUntil: { ...state.progressVisibleUntil },
         runtimeQuotaNotice: nextRuntimeNotice
       });
+      notifyDevelopmentBuildTerminal(payload);
     });
     socketClient.on('runtimeQuotaExceeded', (payload) => {
       debugCounter('socket:runtimeQuotaExceeded', { environment: payload?.environment || null });
@@ -2208,9 +2798,6 @@ function connectSocket(projectId) {
       projectNotices[env] = message;
       nextRuntimeNotice[state.projectId] = projectNotices;
       setState({ runtimeQuotaNotice: nextRuntimeNotice });
-      if (env === state.environment) {
-        setTaskStatus(message, { persistent: true });
-      }
     });
   }
   if (socketClient.connected && socketProjectId) {
@@ -2236,11 +2823,17 @@ class HtmlRegionElement extends BaseElement {
   }
 }
 
-customElements.define('landing-auth-region', HtmlRegionElement);
-customElements.define('app-header-region', HtmlRegionElement);
-customElements.define('app-main-region', HtmlRegionElement);
-customElements.define('app-settings-region', HtmlRegionElement);
-customElements.define('app-dialogs-region', HtmlRegionElement);
+function defineHtmlRegionElement(name) {
+  if (customElements.get(name)) return;
+  customElements.define(name, class extends HtmlRegionElement {});
+}
+
+defineHtmlRegionElement('landing-auth-region');
+defineHtmlRegionElement('app-header-region');
+defineHtmlRegionElement('app-main-region');
+defineHtmlRegionElement('app-toast-region');
+defineHtmlRegionElement('app-settings-region');
+defineHtmlRegionElement('app-dialogs-region');
 
 class AppShell extends BaseElement {
   connectedCallback() {
@@ -2286,6 +2879,7 @@ class AppShell extends BaseElement {
     this.innerHTML = `
       ${this.renderIconSprite()}
       <landing-auth-region></landing-auth-region>
+      <app-toast-region></app-toast-region>
       <div data-authed-shell hidden>
         <app-header-region></app-header-region>
         <main>
@@ -2300,6 +2894,7 @@ class AppShell extends BaseElement {
   cacheRefs() {
     this.refs = {
       auth: this.querySelector('landing-auth-region'),
+      toasts: this.querySelector('app-toast-region'),
       authedShell: this.querySelector('[data-authed-shell]'),
       header: this.querySelector('app-header-region'),
       main: this.querySelector('app-main-region'),
@@ -2307,6 +2902,7 @@ class AppShell extends BaseElement {
       settings: this.querySelector('app-settings-region')
     };
     this.refs.auth?.setRenderer(() => this.renderAuth());
+    this.refs.toasts?.setRenderer(() => this.renderToasts());
     this.refs.header?.setRenderer(() => {
       const project = state.projects.find((p) => p.id === state.projectId) || null;
       return `
@@ -2362,15 +2958,39 @@ class AppShell extends BaseElement {
 
   performUpdate(nextProps, prevProps, changedKeys) {
     const isAuthed = Boolean(nextProps.token);
+    const toastChanged = !(changedKeys instanceof Set) || !changedKeys.size || changedKeys.has('toasts') || !prevProps;
     document.body.classList.toggle('app-dark', isAuthed && nextProps.darkMode);
     if (this.refs?.auth) this.refs.auth.hidden = isAuthed;
     if (this.refs?.authedShell) this.refs.authedShell.hidden = !isAuthed;
+    const onlyToastChange = changedKeys instanceof Set && changedKeys.size === 1 && changedKeys.has('toasts');
+    if (onlyToastChange) {
+      // Toasts are isolated so transient notifications do not churn the rest of the app shell.
+      this.refs?.toasts?.update(nextProps, prevProps, changedKeys);
+      if (toastChanged) this.bindToastEvents();
+      return;
+    }
     this.refs?.auth?.update(nextProps, prevProps, changedKeys);
+    this.refs?.toasts?.update(nextProps, prevProps, changedKeys);
     this.refs?.header?.update(nextProps, prevProps, changedKeys);
     this.refs?.main?.update(nextProps, prevProps, changedKeys);
     this.refs?.dialogs?.update(nextProps, prevProps, changedKeys);
     this.refs?.settings?.update(nextProps, prevProps, changedKeys);
+    if (toastChanged) this.bindToastEvents();
     this.bind();
+  }
+
+  renderToasts() {
+    if (!state.toasts.length) return '';
+    return `
+      <div class="toast-stack" aria-live="polite" aria-atomic="true">
+        ${state.toasts.map((toast) => `
+          <div class="toast toast-${escapeHtml(toast.tone || 'info')}" data-toast-id="${toast.id}">
+            <div class="toast-body">${toast.allowHtml ? toast.html : escapeHtml(toast.message || '')}</div>
+            <button class="toast-dismiss" type="button" data-dismiss-toast="${toast.id}" aria-label="Dismiss notification">Close</button>
+          </div>
+        `).join('')}
+      </div>
+    `;
   }
 
   renderIconSprite() {
@@ -2645,7 +3265,10 @@ class AppShell extends BaseElement {
         <main>
           <section class="hero" aria-labelledby="hero-title">
             <div class="hero-content">
-              <p class="eyebrow">The future of website development is here</p>
+              <div class="hero-intro">
+                <div class="hero-ribbon" aria-label="Coming soon">Coming Soon!</div>
+                <p class="eyebrow">The future of website development is here</p>
+              </div>
               <h1 id="hero-title">Zero Code Required</h1>
               <h1 id="hero-title">Scalable and Secure</h1>
               <h1 id="hero-title">AI Powered</h1>
@@ -2803,61 +3426,32 @@ class AppShell extends BaseElement {
             </div>
           </section>
 
-          <section class="section final-cta">
-            <div class="cta-panel">
-              <div>
-                <h2>Ready to build without the bottlenecks?</h2>
-                <p>
-                  Launch your next product with AI-managed architecture, instant iteration cycles, and zero
-                  lock-in.
-                </p>
-              </div>
-              <div class="download-panel">
-                <div class="download-header">
-                  <span class="tag">Desktop App</span>
-                  <p class="notice">Run projects locally with mobile simulators and device support.</p>
-                </div>
-                <div class="download-grid">
-                  <a class="ghost download-card" href="${API_URL}/downloads/desktop?platform=mac" target="_blank" rel="noreferrer">
-                    <strong>macOS</strong>
-                    <span>Download .dmg</span>
-                  </a>
-                  <a class="ghost download-card" href="${API_URL}/downloads/desktop?platform=windows" target="_blank" rel="noreferrer">
-                    <strong>Windows</strong>
-                    <span>Download .exe</span>
-                  </a>
-                  <a class="ghost download-card" href="${API_URL}/downloads/desktop?platform=linux" target="_blank" rel="noreferrer">
-                    <strong>Linux</strong>
-                    <span>Download .AppImage</span>
-                  </a>
-                </div>
-                <p class="notice">Downloads are hosted directly from the platform server.</p>
-              </div>
-            </div>
-          </section>
         </main>
 
         <div class="auth-modal ${state.authModalOpen ? 'open' : ''}" aria-hidden="${state.authModalOpen ? 'false' : 'true'}">
           <div class="auth-dialog" role="dialog" aria-modal="true" aria-labelledby="auth-title">
             <button class="auth-close" type="button" aria-label="Close">Close</button>
-            ${state.taskStatusMessage ? `<div class="notice plan-error">${state.taskStatusMessage}</div>` : ''}
             <div class="auth-panel" data-auth-panel="register" ${state.authModalMode === 'register' ? '' : 'style="display:none;"'}>
               <h2 id="auth-title">Register your workspace</h2>
               <p>Start with a single prompt. Scale when it clicks.</p>
+              ${state.authModalMode === 'register' && state.authErrorMessage ? `<div class="notice plan-error auth-panel-error">${escapeHtml(state.authErrorMessage)}</div>` : ''}
               <div class="grid">
                 <input id="registerEmail" type="email" placeholder="Email" value="${escapeHtml(authDraft.registerEmail || '')}" />
                 <input id="registerPassword" type="password" placeholder="Password (optional)" value="${escapeHtml(authDraft.registerPassword || '')}" />
                 <button id="registerBtn">Register</button>
               </div>
+              <p class="auth-switch-copy">Already have access? <button class="auth-switch" type="button" data-auth-switch="login">Log in</button></p>
             </div>
             <div class="auth-panel" data-auth-panel="login" ${state.authModalMode === 'login' ? '' : 'style="display:none;"'}>
               <h2>Welcome back</h2>
               <p>Pick up where your team left off.</p>
+              ${state.authModalMode === 'login' && state.authErrorMessage ? `<div class="notice plan-error auth-panel-error">${escapeHtml(state.authErrorMessage)}</div>` : ''}
               <div class="grid">
                 <input id="loginEmail" type="email" placeholder="Email" value="${escapeHtml(authDraft.loginEmail || '')}" />
                 <input id="loginPassword" type="password" placeholder="Password (optional)" value="${escapeHtml(authDraft.loginPassword || '')}" />
                 <button id="loginBtn">Log in</button>
               </div>
+              <p class="auth-switch-copy">Need an invite? <button class="auth-switch" type="button" data-auth-switch="register">Register</button></p>
             </div>
           </div>
         </div>
@@ -2906,6 +3500,7 @@ class AppShell extends BaseElement {
     return `
       <div class="content">
         ${quotaNotice ? `<div class="notice quota-notice">${quotaNotice}</div>` : ''}
+        ${state.projectNotice ? `<div class="notice plan-error">${state.projectNotice}</div>` : ''}
         <div class="grid">
           ${showAdvanced ? this.renderAdvanced(project) : ''}
           ${showSubmit ? this.renderSubmit(project) : ''}
@@ -2937,7 +3532,7 @@ class AppShell extends BaseElement {
       <div class="card">
         <h2>Launch the Future of Your SMB Website</h2>
         <p class="notice">Describe your business in plain English. We design, build, and deploy a site that grows with you.</p>
-        ${state.taskStatusMessage ? `<div class="notice plan-error">${state.taskStatusMessage}</div>` : ''}
+        ${state.createProjectNotice ? `<div class="notice plan-error">${state.createProjectNotice}</div>` : ''}
         <div class="stepper">
           <div class="step">
             <div class="step-num">1</div>
@@ -3048,13 +3643,14 @@ class AppShell extends BaseElement {
     const appLogError = state.appLogError[env] || '';
     const appLogLoading = Boolean(state.appLogLoading[env]);
     const appLogPreview = appLogText || (appLogLoading ? 'Connecting to application logs...' : (appLogError || 'No application logs yet.'));
+    const processingView = deriveTaskProcessingView();
     return `
       <div class="card">
         <div class="section-title">
           <h2>Submit Task</h2>
           <span class="badge ${badgeClass(state.buildStatus[env])}">${state.buildStatus[env]}</span>
         </div>
-        ${state.taskStatusMessage  ? `
+        ${processingView ? `
           <div class="task-status">
             <div class="status-cube" aria-hidden="true">
               <div class="cube">
@@ -3066,7 +3662,7 @@ class AppShell extends BaseElement {
                 <span class="face"></span>
               </div>
             </div>
-            <div class="status-text">${state.taskStatusMessage}</div>
+            <div class="status-text">${processingView.message}</div>
           </div>
         ` : ''}
         <p class="notice"><a class="tag view-project-link" href="${projectProtocol()}://${projectUrl(project, env)}" target="_blank" rel="noreferrer">${isDevelopment ? 'Open Development' : 'View your project'}</a></p>
@@ -3131,8 +3727,183 @@ class AppShell extends BaseElement {
     `;
   }
 
-  renderDatabaseCard() {
-    return '';
+  renderDatabaseCard(project) {
+    if (!project) return '';
+    const env = state.environment;
+    const catalog = state.database.catalogs[env];
+    const selection = databaseSelection(env);
+    const details = state.database.objectDetails[env];
+    const rows = state.database.rows[env];
+    const history = state.database.history[env] || [];
+    const controls = databaseControls(env);
+    const sqlDraft = state.database.sqlDraft[env] || '';
+    const queryResult = state.database.queryResult[env];
+    const isProduction = env === 'production';
+    const modeLabel = isProduction ? 'Read-only production' : 'Read-only';
+    return `
+      <section class="card database-workspace">
+        <div class="section-title database-header">
+          <div>
+            <h2>Database</h2>
+            <p class="notice">Project-scoped and environment-scoped access for <strong>${escapeHtml(project.name)}</strong> in <strong>${titleCase(env)}</strong>.</p>
+          </div>
+          <div class="database-header-actions">
+            <span class="badge ${isProduction ? 'failed' : 'live'}">${modeLabel}</span>
+            <button class="ghost" id="refreshDatabase" ${state.database.catalogLoading[env] ? 'disabled' : ''}>${state.database.catalogLoading[env] ? 'Refreshing...' : 'Refresh'}</button>
+          </div>
+        </div>
+        ${state.database.notice ? `<p class="notice">${escapeHtml(state.database.notice)}</p>` : ''}
+        ${state.database.catalogError[env] ? `<p class="notice notice-warning">${escapeHtml(state.database.catalogError[env])}</p>` : ''}
+        <div class="database-shell">
+          <aside class="database-sidebar">
+            <div class="db-sidebar-head">
+              <strong>Schemas</strong>
+              <span class="meta">${catalog?.schemas?.length || 0} visible</span>
+            </div>
+            ${catalog?.schemas?.length ? catalog.schemas.map((schema) => `
+              <div class="db-schema-group">
+                <div class="db-schema-name">${escapeHtml(schema.name)}</div>
+                ${schema.objects.map((object) => {
+                  const active = selection.schema === schema.name && selection.object === object.name;
+                  return `
+                    <button
+                      class="db-object-button ${active ? 'active' : ''}"
+                      data-db-select="true"
+                      data-schema="${escapeHtml(schema.name)}"
+                      data-object="${escapeHtml(object.name)}"
+                      data-type="${escapeHtml(object.type)}"
+                    >
+                      <span>${escapeHtml(object.name)}</span>
+                      <span class="meta">${object.type === 'table' ? `${object.estimatedRows || 0} rows` : object.type}</span>
+                    </button>
+                  `;
+                }).join('')}
+              </div>
+            `).join('') : `<div class="db-empty">${state.database.catalogLoading[env] ? 'Loading database catalog...' : 'No tables or views found for this environment yet.'}</div>`}
+          </aside>
+          <div class="database-main">
+            <div class="database-object-summary">
+              <div>
+                <h3>${selection.object ? `${escapeHtml(selection.schema)}.${escapeHtml(selection.object)}` : 'Choose a table or view'}</h3>
+                <p class="notice">${details ? `${titleCase(details.type)} with ${details.columns.length} columns, ~${details.estimatedRows} rows, ${formatBytes(details.totalBytes)}.` : 'Select a database object to inspect schema, browse rows, or run SQL against this environment.'}</p>
+              </div>
+              <div class="database-tabs">
+                <button class="${selection.tab === 'browse' ? 'active' : ''}" data-db-tab="browse">Browse</button>
+                <button class="${selection.tab === 'sql' ? 'active' : ''}" data-db-tab="sql">SQL</button>
+                <button class="${selection.tab === 'history' ? 'active' : ''}" data-db-tab="history">History</button>
+              </div>
+            </div>
+            ${details ? `
+              <div class="db-meta-grid">
+                <div class="db-meta-card">
+                  <strong>Columns</strong>
+                  <ul>${details.columns.map((column) => `<li><code>${escapeHtml(column.name)}</code> <span class="meta">${escapeHtml(column.dataType)}${column.nullable ? '' : ' • required'}</span></li>`).join('')}</ul>
+                </div>
+                <div class="db-meta-card">
+                  <strong>Keys and indexes</strong>
+                  <ul>
+                    <li><span class="meta">Primary key:</span> ${details.primaryKey?.length ? details.primaryKey.map((name) => `<code>${escapeHtml(name)}</code>`).join(', ') : 'None'}</li>
+                    <li><span class="meta">Foreign keys:</span> ${details.foreignKeys?.length ? `${details.foreignKeys.length} linked column${details.foreignKeys.length === 1 ? '' : 's'}` : 'None'}</li>
+                    <li><span class="meta">Indexes:</span> ${details.indexes?.length || 0}</li>
+                  </ul>
+                </div>
+              </div>
+            ` : ''}
+            ${selection.tab === 'browse' ? `
+              <div class="db-panel">
+                <div class="db-toolbar">
+                  <label>
+                    <span>Filter column</span>
+                    <select id="dbFilterColumn">
+                      <option value="">Any</option>
+                      ${(details?.columns || []).map((column) => `<option value="${escapeHtml(column.name)}" ${controls.filterColumn === column.name ? 'selected' : ''}>${escapeHtml(column.name)}</option>`).join('')}
+                    </select>
+                  </label>
+                  <label class="db-filter-grow">
+                    <span>Contains</span>
+                    <input id="dbFilterValue" type="text" value="${escapeHtml(controls.filterValue || '')}" placeholder="Search rows" />
+                  </label>
+                  <label>
+                    <span>Sort</span>
+                    <select id="dbSortColumn">
+                      <option value="">Default</option>
+                      ${(details?.columns || []).map((column) => `<option value="${escapeHtml(column.name)}" ${controls.sortColumn === column.name ? 'selected' : ''}>${escapeHtml(column.name)}</option>`).join('')}
+                    </select>
+                  </label>
+                  <label>
+                    <span>Direction</span>
+                    <select id="dbSortDirection">
+                      <option value="asc" ${controls.sortDirection !== 'desc' ? 'selected' : ''}>Asc</option>
+                      <option value="desc" ${controls.sortDirection === 'desc' ? 'selected' : ''}>Desc</option>
+                    </select>
+                  </label>
+                  <label>
+                    <span>Rows</span>
+                    <select id="dbPageSize">
+                      ${DATABASE_PAGE_SIZE_OPTIONS.map((size) => `<option value="${size}" ${Number(controls.pageSize || DEFAULT_DATABASE_PAGE_SIZE) === size ? 'selected' : ''}>${size}</option>`).join('')}
+                    </select>
+                  </label>
+                  <button id="applyDbBrowse" ${!selection.object ? 'disabled' : ''}>Apply</button>
+                </div>
+                <div class="db-toolbar db-pagination">
+                  <span class="meta">Page ${rows?.page || controls.page || 1} • ${rows?.pageSize || controls.pageSize || DEFAULT_DATABASE_PAGE_SIZE} rows per page${rows?.hasMore ? ' • more rows available' : ''}</span>
+                  <div class="row">
+                    <button class="ghost" id="dbPrevPage" ${(controls.page || 1) <= 1 || state.database.rowLoading[env] ? 'disabled' : ''}>Previous</button>
+                    <button class="ghost" id="dbNextPage" ${!rows?.hasMore || state.database.rowLoading[env] ? 'disabled' : ''}>Next</button>
+                  </div>
+                </div>
+                ${state.database.objectError[env] ? `<p class="notice notice-warning">${escapeHtml(state.database.objectError[env])}</p>` : ''}
+                ${state.database.rowError[env] ? `<p class="notice notice-warning">${escapeHtml(state.database.rowError[env])}</p>` : ''}
+                ${state.database.rowLoading[env] ? '<div class="db-empty">Loading rows...</div>' : renderDataGrid(rows?.columns || details?.columns || [], rows?.rows || [], 'No rows returned for this object.')}
+              </div>
+            ` : ''}
+            ${selection.tab === 'sql' ? `
+              <div class="db-panel">
+                <div class="db-toolbar">
+                  <span class="meta">Read-only SQL. Allowed statements: <code>SELECT</code>, <code>WITH</code>, <code>EXPLAIN</code>.</span>
+                  <button id="runDbQuery" ${state.database.queryLoading[env] ? 'disabled' : ''}>${state.database.queryLoading[env] ? 'Running...' : 'Run Query'}</button>
+                </div>
+                <textarea id="dbSqlEditor" class="db-sql-editor" placeholder="select * from public.users order by id desc limit 50;">${escapeHtml(sqlDraft)}</textarea>
+                ${state.database.queryError[env] ? `<p class="notice notice-warning">${escapeHtml(state.database.queryError[env])}</p>` : ''}
+                ${queryResult ? `
+                  <div class="db-query-summary">
+                    <span class="meta">${queryResult.rowCount} row${queryResult.rowCount === 1 ? '' : 's'} returned in ${queryResult.durationMs}ms${queryResult.truncated ? ' • truncated to platform cap' : ''}</span>
+                  </div>
+                  ${renderDataGrid(queryResult.columns || [], queryResult.rows || [], 'The query completed but returned no rows.')}
+                ` : '<div class="db-empty">Run a read-only query to inspect data without leaving the app.</div>'}
+              </div>
+            ` : ''}
+            ${selection.tab === 'history' ? `
+              <div class="db-panel">
+                ${state.database.historyLoading[env] ? '<div class="db-empty">Loading history...</div>' : ''}
+                ${state.database.historyError[env] ? `<p class="notice notice-warning">${escapeHtml(state.database.historyError[env])}</p>` : ''}
+                ${history.length ? `
+                  <div class="db-history-list">
+                    ${history.map((entry) => `
+                      <div class="db-history-item">
+                        <div class="row spread">
+                          <strong>${escapeHtml(entry.action.replace(/_/g, ' '))}</strong>
+                          <span class="meta">${formatRelative(entry.created_at)}</span>
+                        </div>
+                        <div class="meta">${entry.query_preview ? escapeHtml(entry.query_preview) : `${escapeHtml(entry.schema_name || '')}${entry.object_name ? `.${escapeHtml(entry.object_name)}` : ''}`}</div>
+                        <div class="meta">${entry.success ? 'success' : `failed${entry.error_code ? ` • ${escapeHtml(entry.error_code)}` : ''}`}${entry.duration_ms ? ` • ${entry.duration_ms}ms` : ''}</div>
+                      </div>
+                    `).join('')}
+                  </div>
+                ` : '<div class="db-empty">Database history will appear here after you browse objects or run queries.</div>'}
+              </div>
+            ` : ''}
+            <div class="db-danger-zone">
+              <div>
+                <h3>Danger Zone</h3>
+                <p class="notice">This queues a full reset of the <strong>${titleCase(env)}</strong> customer database for this project. Use it only when you intend to erase all data.</p>
+              </div>
+              <button class="ghost danger" id="emptyDb" ${!state.projectId ? 'disabled' : ''}>Empty Database</button>
+            </div>
+          </div>
+        </div>
+      </section>
+    `;
   }
 
   renderAdvanced(project) {
@@ -3165,10 +3936,6 @@ class AppShell extends BaseElement {
           <p class="notice">${state.repoMessage || 'Validations will be enforced on upload.'}</p>
         </div>
         
-        <div>
-          <h3>Database</h3>
-          <button class="ghost" id="emptyDb">Empty Database</button>         
-        </div>
         <div>
           <h3>Deploy Webhook</h3>
           <input id="deployWebhookUrl" type="text" placeholder="https://example.com/webhook" value="${escapeHtml(deployWebhookValue || '')}" />
@@ -3228,6 +3995,7 @@ class AppShell extends BaseElement {
         </div>
         ` : ''}
       </div>
+      ${this.renderDatabaseCard(project)}
     `;
   }
 
@@ -3829,6 +4597,8 @@ class AppShell extends BaseElement {
       }
       stopRuntimeUsagePolling();
       stopAppLogPolling();
+      resetTaskProcessingState(null);
+      clearAllToasts();
       setState({
         token: '',
         user: null,
@@ -3847,7 +4617,10 @@ class AppShell extends BaseElement {
         appLogLoading: blankEnvMap(false),
         appLogError: blankEnvMap(''),
         appLogFrozenByEnv: blankEnvMap(false),
-        runtimeQuotaNotice: {}
+        runtimeQuotaNotice: {},
+        authNotice: '',
+        createProjectNotice: '',
+        projectNotice: ''
       });
     });
 
@@ -4054,6 +4827,7 @@ class AppShell extends BaseElement {
     this.querySelector('#loginBtn')?.addEventListener('click', async () => {
       const email = this.querySelector('#loginEmail').value;
       const password = this.querySelector('#loginPassword').value;
+      setState({ authNotice: '' });
       try {
         const data = await api('/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) });
         localStorage.setItem('vibes_token', data.token);
@@ -4062,19 +4836,23 @@ class AppShell extends BaseElement {
           user: data.user,
           desktopSettings: loadDesktopSettings(data.user?.id),
           authModalOpen: false,
-          taskStatusMessage: '',
-          taskStatusPersistent: false
+          authNotice: '',
+          createProjectNotice: '',
+          authErrorMessage: '',
+          authErrorCode: '',
+          projectNotice: ''
         });
         await loadProjects();
         connectSocket(state.projectId);
       } catch (err) {
-        showError(err);
+        setAuthError(err);
       }
     });
 
     this.querySelector('#registerBtn')?.addEventListener('click', async () => {
       const email = this.querySelector('#registerEmail').value;
       const password = this.querySelector('#registerPassword').value;
+      setState({ authNotice: '' });
       try {
         const data = await api('/auth/register', { method: 'POST', body: JSON.stringify({ email, password }) });
         localStorage.setItem('vibes_token', data.token);
@@ -4083,14 +4861,23 @@ class AppShell extends BaseElement {
           user: data.user,
           desktopSettings: loadDesktopSettings(data.user?.id),
           authModalOpen: false,
-          taskStatusMessage: '',
-          taskStatusPersistent: false
+          authNotice: '',
+          createProjectNotice: '',
+          authErrorMessage: '',
+          authErrorCode: '',
+          projectNotice: ''
         });
         await loadProjects();
         connectSocket(state.projectId);
       } catch (err) {
-        showError(err);
+        setAuthError(err);
       }
+    });
+
+    ['#loginEmail', '#loginPassword', '#registerEmail', '#registerPassword'].forEach((selector) => {
+      this.querySelector(selector)?.addEventListener('input', () => {
+        clearAuthError({ render: false });
+      });
     });
 
     const authModal = this.querySelector('.auth-modal');
@@ -4118,18 +4905,29 @@ class AppShell extends BaseElement {
           setState({
             authModalOpen: true,
             authModalMode: mode,
-            taskStatusMessage: '',
-            taskStatusPersistent: false
+            authNotice: '',
+            authErrorMessage: '',
+            authErrorCode: ''
           });
         });
       });
 
       authModal.querySelector('.auth-close')?.addEventListener('click', () => {
-        setState({ authModalOpen: false });
+        setState({ authModalOpen: false, authNotice: '', authErrorMessage: '', authErrorCode: '' });
+      });
+      authModal.querySelectorAll('[data-auth-switch]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          setState({
+            authModalMode: btn.getAttribute('data-auth-switch') || 'register',
+            authNotice: '',
+            authErrorMessage: '',
+            authErrorCode: ''
+          });
+        });
       });
       authModal.addEventListener('click', (event) => {
         if (event.target === authModal) {
-          setState({ authModalOpen: false });
+          setState({ authModalOpen: false, authNotice: '', authErrorMessage: '', authErrorCode: '' });
         }
       });
     }
@@ -4138,6 +4936,7 @@ class AppShell extends BaseElement {
       const projectId = e.target.value;
       if (projectId === '__new__') {
         stopAppLogPolling();
+        resetTaskProcessingState(null);
         setState({
           projectId: null,
           environment: 'development',
@@ -4155,7 +4954,9 @@ class AppShell extends BaseElement {
           appLogError: blankEnvMap(''),
           appLogFrozenByEnv: blankEnvMap(false),
           deployWebhookUrl: '',
-          deployWebhookMessage: ''
+          deployWebhookMessage: '',
+          createProjectNotice: '',
+          projectNotice: ''
         });
         localStorage.setItem('vibes_nerd_level', 'beginner');
         const key = projectStorageKey(state.user?.id);
@@ -4165,6 +4966,7 @@ class AppShell extends BaseElement {
       const storedEnv = loadStoredEnv(state.user?.id, projectId);
       storeProject(state.user?.id, projectId);
       stopAppLogPolling();
+      resetTaskProcessingState(projectId);
       setState({
         projectId,
         environment: storedEnv || state.environment,
@@ -4180,7 +4982,10 @@ class AppShell extends BaseElement {
         appLogLoading: blankEnvMap(false),
         appLogError: blankEnvMap(''),
         appLogFrozenByEnv: blankEnvMap(false),
-        deployWebhookMessage: ''
+        deployWebhookMessage: '',
+        createProjectNotice: '',
+        projectNotice: '',
+        database: createDatabaseState()
       });
       await loadTasks(projectId);
       await loadSessions(projectId);
@@ -4188,6 +4993,8 @@ class AppShell extends BaseElement {
       await loadLatestBuild(projectId, state.environment);
       await loadLastSuccessBuilds(projectId);
       await loadDeployWebhook(projectId);
+      setDatabaseState(resetDatabaseStateForProject());
+      await loadDatabaseCatalog(projectId, state.environment);
       connectSocket(projectId);
       if (DESKTOP_BRIDGE && projectId) {
         // repo sync happens only when running mobile simulators
@@ -4196,13 +5003,13 @@ class AppShell extends BaseElement {
 
     this.querySelector('#createProjectBtn')?.addEventListener('click', async () => {
       const name = this.querySelector('#createProjectName')?.value?.trim();
-      if (!name) return setTaskStatus('Enter a project name', { autoHide: true });
+      if (!name) return setInlineNotice('createProjectNotice', 'Enter a project name');
       if (name.length > 30) {
-        return setTaskStatus('Project name must be 30 characters or fewer', { autoHide: true });
+        return setInlineNotice('createProjectNotice', 'Project name must be 30 characters or fewer');
       }
-      if (isProjectNameTaken(name)) return setTaskStatus('Project name already exists', { autoHide: true });
+      if (isProjectNameTaken(name)) return setInlineNotice('createProjectNotice', 'Project name already exists');
       try {
-        setState({ taskStatusMessage: '', taskStatusPersistent: false });
+        setState({ createProjectNotice: '' });
         const interfaces = [];
         if (state.createInterfaces.web) interfaces.push('web');
         if (state.createInterfaces.mobile) interfaces.push('mobile');
@@ -4214,13 +5021,14 @@ class AppShell extends BaseElement {
         await loadProjects();
         storeEnv(state.user?.id, project.id, 'development');
         stopAppLogPolling();
+        resetTaskProcessingState(project.id);
         setState({
           projectId: project.id,
           environment: 'development',
           nerdLevel: 'beginner',
           createProjectName: '',
-          taskStatusMessage: '',
-          taskStatusPersistent: false,
+          createProjectNotice: '',
+          projectNotice: '',
           appLogsByEnv: blankEnvMap(''),
           appLogSnapshotByEnv: blankEnvMap(''),
           appLogLoading: blankEnvMap(false),
@@ -4234,16 +5042,17 @@ class AppShell extends BaseElement {
         }
       } catch (err) {
         if (String(err.message || '').toLowerCase().includes('already exists')) {
-          setTaskStatus('Project name already exists. Please choose another.', { autoHide: true });
+          setInlineNotice('createProjectNotice', 'Project name already exists. Please choose another.');
           return;
         }
-        showError(err);
+        showError(err, { noticeField: 'createProjectNotice' });
       }
     });
 
     this.querySelector('#createProjectName')?.addEventListener('input', (event) => {
       setDraft(['createProject'], event.target.value, { context: 'create-project' });
       state.createProjectName = event.target.value || '';
+      if (state.createProjectNotice) setState({ createProjectNotice: '' });
     });
 
     this.querySelector('#createInterfaceWeb')?.addEventListener('change', (event) => {
@@ -4343,6 +5152,7 @@ class AppShell extends BaseElement {
         });
         if (!nextProjectId) {
           stopAppLogPolling();
+          resetTaskProcessingState(null);
           setState({
             tasks: [],
             sessions: [],
@@ -4356,15 +5166,18 @@ class AppShell extends BaseElement {
             appLogsByEnv: blankEnvMap(''),
             appLogSnapshotByEnv: blankEnvMap(''),
             appLogLoading: blankEnvMap(false),
-            appLogError: blankEnvMap(''),
-            appLogFrozenByEnv: blankEnvMap(false),
-            environment: 'development',
-            nerdLevel: 'beginner'
-          });
+          appLogError: blankEnvMap(''),
+          appLogFrozenByEnv: blankEnvMap(false),
+          environment: 'development',
+          nerdLevel: 'beginner',
+          createProjectNotice: '',
+          projectNotice: ''
+        });
           return;
         }
         const storedEnv = loadStoredEnv(state.user?.id, nextProjectId);
-        setState({ environment: storedEnv || state.environment });
+        resetTaskProcessingState(nextProjectId);
+        setState({ environment: storedEnv || state.environment, projectNotice: '' });
         await loadTasks(nextProjectId);
         await loadSessions(nextProjectId);
         await loadEnvVars(nextProjectId, state.environment);
@@ -4382,14 +5195,20 @@ class AppShell extends BaseElement {
       const project = state.projects.find((p) => p.id === state.projectId);
       if (!project) return;
       const name = this.querySelector('#projectNameInput')?.value?.trim();
-      if (!name) return setTaskStatus('Enter a project name', { autoHide: true });
-      if (isProjectNameTaken(name, project.id)) return setTaskStatus('Project name already exists', { autoHide: true });
+      if (!name) {
+        pushToast({ message: 'Enter a project name', tone: 'warning', dedupeKey: 'project-rename:empty' });
+        return;
+      }
+      if (isProjectNameTaken(name, project.id)) {
+        pushToast({ message: 'Project name already exists', tone: 'warning', dedupeKey: 'project-rename:duplicate' });
+        return;
+      }
       try {
         await api(`/projects/${project.id}`, { method: 'PUT', body: JSON.stringify({ name }) });
         await loadProjects();
       } catch (err) {
         if (String(err.message || '').toLowerCase().includes('already exists')) {
-          setTaskStatus('Project name already exists. Please choose another.', { autoHide: true });
+          pushToast({ message: 'Project name already exists. Please choose another.', tone: 'warning', dedupeKey: 'project-rename:duplicate' });
           return;
         }
         showError(err);
@@ -4419,11 +5238,15 @@ class AppShell extends BaseElement {
     this.querySelectorAll('input[name="env"]').forEach((input) => {
       input.addEventListener('change', (e) => {
         const env = e.target.value;
-        setState({ environment: env });
+        setState({ environment: env, taskSubmissionPending: null, projectNotice: '' });
         storeEnv(state.user?.id, state.projectId, env);
+        if (env === 'development') {
+          setTaskProcessingHydration(state.projectId, { buildLoaded: false });
+        }
         if (state.projectId) {
           loadEnvVars(state.projectId, env);
           loadLatestBuild(state.projectId, env);
+          loadDatabaseCatalog(state.projectId, env);
           if (state.appLogsVisible && !state.appLogFrozenByEnv[env]) {
             fetchApplicationLogs({ force: true });
           } else if (state.appLogsVisible) {
@@ -4442,12 +5265,18 @@ class AppShell extends BaseElement {
       setState({
         environment: env,
         envEditing: { ...state.envEditing, [env]: false },
-        envMessage: ''
+        envMessage: '',
+        taskSubmissionPending: null,
+        projectNotice: ''
       });
       storeEnv(state.user?.id, state.projectId, env);
+      if (env === 'development') {
+        setTaskProcessingHydration(state.projectId, { buildLoaded: false });
+      }
       if (state.projectId) {
         loadEnvVars(state.projectId, env);
         loadLatestBuild(state.projectId, env);
+        loadDatabaseCatalog(state.projectId, env);
         if (state.appLogsVisible && !state.appLogFrozenByEnv[env]) {
           fetchApplicationLogs({ force: true });
         } else if (state.appLogsVisible) {
@@ -4544,18 +5373,22 @@ class AppShell extends BaseElement {
         body: JSON.stringify(body)
       });
       if (response?.status === 'already_live') {
-        setTaskStatus(`${modeLabel} is already live`, { autoHide: true });
+        pushToast({ message: `${modeLabel} is already live`, tone: 'info', dedupeKey: `env-action:${state.projectId}:development:already-live:${modeKey}` });
       } else if (response?.status === 'already_starting') {
-        setTaskStatus(`Development is already starting in ${modeLabel}`, { autoHide: true });
+        pushToast({ message: `Development is already starting in ${modeLabel}`, tone: 'info', dedupeKey: `env-action:${state.projectId}:development:already-starting:${modeKey}` });
       } else {
-        setTaskStatus(`${wasAwake ? 'Switching Development to' : 'Waking Development in'} ${modeLabel}`, { autoHide: true });
+        pushToast({
+          message: `${wasAwake ? 'Switching Development to' : 'Waking Development in'} ${modeLabel}`,
+          tone: 'info',
+          dedupeKey: `env-action:${state.projectId}:development:wake:${modeKey}`
+        });
       }
       return response;
     };
 
     const runDevelopmentTaskAction = async (mode, commitHash, taskId) => {
       if (!commitHash) {
-        setTaskStatus('No commit hash available', { autoHide: true });
+        pushToast({ message: 'No commit hash available', tone: 'warning', dedupeKey: 'task-action:missing-commit' });
         return;
       }
       const modeLabel = developmentModeText(mode);
@@ -4566,7 +5399,7 @@ class AppShell extends BaseElement {
           taskId: taskId || null,
           commitHash
         });
-        setTaskStatus(`Starting ${modeLabel}`, { autoHide: true });
+        pushToast({ message: `Starting ${modeLabel}`, tone: 'info', dedupeKey: `env-action:${state.projectId}:development:start:${mode}:${commitHash}` });
       } catch (err) {
         showError(err);
         loadProjects();
@@ -4581,19 +5414,20 @@ class AppShell extends BaseElement {
         return;
       }
       if (env === 'development' && (action === 'select-preview' || action === 'select-full-build')) {
-        const project = currentProjectState();
-        const envState = projectEnvironmentState(project, env);
-        const modeKey = action === 'select-preview' ? 'workspace' : 'verified';
-        const modeLabel = developmentModeText(modeKey);
-        if (state.deploymentPolicy?.verifiedOnly && modeKey === 'workspace') {
-          setTaskStatus('Preview Mode is disabled by verified-only deploys', { autoHide: true });
+      const project = currentProjectState();
+      const envState = projectEnvironmentState(project, env);
+      const modeKey = action === 'select-preview' ? 'workspace' : 'verified';
+      const modeLabel = developmentModeText(modeKey);
+      setState({ projectNotice: '' });
+      if (state.deploymentPolicy?.verifiedOnly && modeKey === 'workspace') {
+          pushToast({ message: 'Preview Mode is disabled by verified-only deploys', tone: 'warning', dedupeKey: 'env-action:development:verified-only' });
           return;
         }
         if (developmentSelectedMode(project) === modeKey) return;
         if (!isDevelopmentAwake(envState)) {
           try {
             await saveDevelopmentSelection({ mode: modeKey });
-            setTaskStatus(`${modeLabel} selected`, { autoHide: true });
+            pushToast({ message: `${modeLabel} selected`, tone: 'info', dedupeKey: `env-action:${state.projectId}:development:select:${modeKey}` });
           } catch (err) {
             showError(err);
           }
@@ -4624,7 +5458,7 @@ class AppShell extends BaseElement {
               live_task_id: null,
               live_commit_sha: null
             });
-            setTaskStatus(`${modeLabel} selected`, { autoHide: true });
+            pushToast({ message: `${modeLabel} selected`, tone: 'info', dedupeKey: `env-action:${state.projectId}:development:select:${modeKey}` });
           }
         } catch (err) {
           showError(err);
@@ -4634,6 +5468,7 @@ class AppShell extends BaseElement {
       }
       if (env === 'development' && action === 'wake-development') {
         try {
+          setState({ projectNotice: '' });
           const selectedMode = developmentSelectedMode(currentProjectState());
           await wakeDevelopment({ mode: selectedMode });
         } catch (err) {
@@ -4645,7 +5480,8 @@ class AppShell extends BaseElement {
       if (env === 'development' && action === 'sleep-development') {
         const ok = await showConfirm('Sleep Development?', { confirmText: 'Sleep' });
         if (!ok) return;
-        setTaskStatus('Sleeping Development…', { autoHide: true });
+        setState({ projectNotice: '' });
+        pushToast({ message: 'Sleeping Development...', tone: 'info', dedupeKey: `env-action:${state.projectId}:development:sleep` });
         try {
           await api(`/projects/${state.projectId}/stop`, {
             method: 'POST',
@@ -4663,11 +5499,12 @@ class AppShell extends BaseElement {
         return;
       }
       if (action === 'cancel') {
+        setState({ projectNotice: '' });
         if (state.buildStatus[env] === 'canceling') {
-          setTaskStatus('Build cancel is already in progress.', { autoHide: true });
+          pushToast({ message: 'Build cancel is already in progress.', tone: 'info', dedupeKey: `env-action:${state.projectId}:${env}:cancel-pending` });
           return;
         }
-        setTaskStatus('Canceling build…', { autoHide: true });
+        pushToast({ message: 'Canceling build...', tone: 'info', dedupeKey: `env-action:${state.projectId}:${env}:cancel` });
         state.buildStatus[env] = 'canceling';
         setState({ buildStatus: { ...state.buildStatus } });
         try {
@@ -4686,7 +5523,8 @@ class AppShell extends BaseElement {
       if (action === 'stop') {
         const ok = await showConfirm(`Stop the ${titleCase(env)} environment?`, { confirmText: 'Stop' });
         if (!ok) return;
-        setTaskStatus('Stopping environment…', { autoHide: true });
+        setState({ projectNotice: '' });
+        pushToast({ message: 'Stopping environment...', tone: 'info', dedupeKey: `env-action:${state.projectId}:${env}:stop` });
         try {
           await api(`/projects/${state.projectId}/stop`, {
             method: 'POST',
@@ -4783,10 +5621,12 @@ class AppShell extends BaseElement {
           nerdLevel: level,
           environment: 'development',
           envEditing: { ...state.envEditing, development: false },
-          envMessage: ''
+          envMessage: '',
+          taskSubmissionPending: null
         });
         storeEnv(state.user?.id, state.projectId, 'development');
         if (state.projectId) {
+          setTaskProcessingHydration(state.projectId, { buildLoaded: false });
           loadEnvVars(state.projectId, 'development');
           loadLatestBuild(state.projectId, 'development');
         }
@@ -4802,25 +5642,46 @@ class AppShell extends BaseElement {
 
     this.querySelector('#submitTask')?.addEventListener('click', async () => {
       const prompt = this.querySelector('#taskPrompt').value;
-      if (!prompt) return setTaskStatus('Enter a task prompt', { autoHide: true });
+      if (!prompt) {
+        pushToast({ message: 'Enter a task prompt', tone: 'warning', dedupeKey: 'task-submit:empty' });
+        return;
+      }
       const submitEnv = state.environment;
+      setState({ projectNotice: '' });
       prepareAppLogsForDeploy(submitEnv);
       if (state.appLogsVisible) {
         // Keep the panel cleared while waiting for the next build to start.
         stopAppLogPolling();
         updateAppLogPanel({ forceScroll: true });
       }
-      setTaskStatus('Reading Request', { persistent: true });
+      setState({
+        taskSubmissionPending: {
+          projectId: state.projectId,
+          environment: submitEnv,
+          createdAt: Date.now()
+        }
+      });
       try {
         const task = await api(`/projects/${state.projectId}/tasks`, {
           method: 'POST',
           body: JSON.stringify({ prompt, environment: state.environment })
         });
-        setState({ tasks: [task, ...state.tasks], taskPromptDraft: '', activeTaskId: task.id });
-        state.drafts.taskPrompt.value = '';
-        state.drafts.taskPrompt.dirty = false;
+        setState({
+          tasks: [task, ...state.tasks],
+          taskPromptDraft: '',
+          taskSubmissionPending: null,
+          drafts: {
+            ...state.drafts,
+            taskPrompt: {
+              ...state.drafts.taskPrompt,
+              value: '',
+              dirty: false
+            }
+          }
+        });
         this.querySelector('#taskPrompt').value = '';
       } catch (err) {
+        setState({ taskSubmissionPending: null });
         showError(err);
       }
     });
@@ -4841,12 +5702,12 @@ class AppShell extends BaseElement {
     this.querySelector('#copyAppLogs')?.addEventListener('click', async () => {
       const text = state.appLogsByEnv[state.environment] || '';
       if (!text) {
-        setTaskStatus('No application logs to copy yet.', { autoHide: true });
+        pushToast({ message: 'No application logs to copy yet.', tone: 'warning', dedupeKey: `copy-app-logs:${state.projectId}:${state.environment}:empty` });
         return;
       }
       try {
         await navigator.clipboard.writeText(text);
-        setTaskStatus('Copied application logs', { autoHide: true });
+        pushToast({ message: 'Copied application logs', tone: 'success', dedupeKey: `copy-app-logs:${state.projectId}:${state.environment}` });
       } catch {
         const temp = document.createElement('textarea');
         temp.value = text;
@@ -4854,7 +5715,7 @@ class AppShell extends BaseElement {
         temp.select();
         document.execCommand('copy');
         temp.remove();
-        setTaskStatus('Copied application logs', { autoHide: true });
+        pushToast({ message: 'Copied application logs', tone: 'success', dedupeKey: `copy-app-logs:${state.projectId}:${state.environment}` });
       }
     });
 
@@ -4880,12 +5741,12 @@ class AppShell extends BaseElement {
     this.querySelector('#copyVerifyLogs')?.addEventListener('click', async () => {
       const text = state.failedBuildLog[state.environment] || '';
       if (!text) {
-        setTaskStatus('No full build logs to copy yet.', { autoHide: true });
+        pushToast({ message: 'No full build logs to copy yet.', tone: 'warning', dedupeKey: `copy-verify-logs:${state.projectId}:${state.environment}:empty` });
         return;
       }
       try {
         await navigator.clipboard.writeText(text);
-        setTaskStatus('Copied full build logs', { autoHide: true });
+        pushToast({ message: 'Copied full build logs', tone: 'success', dedupeKey: `copy-verify-logs:${state.projectId}:${state.environment}` });
       } catch {
         const temp = document.createElement('textarea');
         temp.value = text;
@@ -4893,14 +5754,14 @@ class AppShell extends BaseElement {
         temp.select();
         document.execCommand('copy');
         temp.remove();
-        setTaskStatus('Copied full build logs', { autoHide: true });
+        pushToast({ message: 'Copied full build logs', tone: 'success', dedupeKey: `copy-verify-logs:${state.projectId}:${state.environment}` });
       }
     });
 
     this.querySelector('#saveSession')?.addEventListener('click', () => {
       const canSaveSession = state.tasks.some((t) => t.environment === 'development' && !t.session_id);
       if (!canSaveSession) {
-        setTaskStatus('Add at least one task before saving a session.', { autoHide: true });
+        pushToast({ message: 'Add at least one task before saving a session.', tone: 'warning', dedupeKey: 'save-session:empty' });
         return;
       }
       seedDraft(['sessionSave'], '', state.projectId || 'no-project');
@@ -4913,7 +5774,10 @@ class AppShell extends BaseElement {
 
     this.querySelector('#confirmSave')?.addEventListener('click', async () => {
       const message = this.querySelector('#saveMessage').value;
-      if (!message) return setTaskStatus('Enter a message', { autoHide: true });
+      if (!message) {
+        pushToast({ message: 'Enter a message', tone: 'warning', dedupeKey: 'save-session:missing-message' });
+        return;
+      }
       try {
         const session = await api(`/projects/${state.projectId}/sessions`, {
           method: 'POST',
@@ -5411,12 +6275,134 @@ class AppShell extends BaseElement {
       setState({ envEditing: { ...state.envEditing, [state.environment]: false }, envMessage: '' });
     });
 
+    this.querySelector('#refreshDatabase')?.addEventListener('click', async () => {
+      await loadDatabaseCatalog(state.projectId, state.environment, { force: true });
+    });
+
+    this.querySelectorAll('[data-db-select="true"]').forEach((button) => {
+      button.addEventListener('click', async () => {
+        const schema = button.getAttribute('data-schema') || '';
+        const object = button.getAttribute('data-object') || '';
+        const type = button.getAttribute('data-type') || '';
+        const env = state.environment;
+        const selected = {
+          ...state.database.selected,
+          [env]: {
+            ...state.database.selected[env],
+            schema,
+            object,
+            type
+          }
+        };
+        const controls = {
+          ...state.database.controls,
+          [env]: {
+            ...databaseControls(env),
+            sortColumn: state.database.objectDetails[env]?.primaryKey?.[0] || ''
+          }
+        };
+        setDatabaseState({ selected, controls });
+        await loadDatabaseObject(state.projectId, env, schema, object);
+        await loadDatabaseRows(state.projectId, env);
+      });
+    });
+
+    this.querySelectorAll('[data-db-tab]').forEach((button) => {
+      button.addEventListener('click', async () => {
+        const tab = button.getAttribute('data-db-tab') || 'browse';
+        const env = state.environment;
+        setDatabaseState({
+          selected: {
+            ...state.database.selected,
+            [env]: {
+              ...state.database.selected[env],
+              tab
+            }
+          }
+        });
+        if (tab === 'history') {
+          await loadDatabaseHistory(state.projectId, env);
+        }
+      });
+    });
+
+    this.querySelector('#applyDbBrowse')?.addEventListener('click', async () => {
+      const env = state.environment;
+      const nextControls = {
+        ...databaseControls(env),
+        page: 1,
+        pageSize: Number(this.querySelector('#dbPageSize')?.value || DEFAULT_DATABASE_PAGE_SIZE),
+        filterColumn: this.querySelector('#dbFilterColumn')?.value || '',
+        filterValue: this.querySelector('#dbFilterValue')?.value || '',
+        sortColumn: this.querySelector('#dbSortColumn')?.value || '',
+        sortDirection: this.querySelector('#dbSortDirection')?.value || 'asc'
+      };
+      setDatabaseState({
+        controls: {
+          ...state.database.controls,
+          [env]: nextControls
+        }
+      });
+      await loadDatabaseRows(state.projectId, env);
+    });
+
+    this.querySelector('#dbPrevPage')?.addEventListener('click', async () => {
+      const env = state.environment;
+      const nextControls = {
+        ...databaseControls(env),
+        page: Math.max(1, Number(databaseControls(env).page || 1) - 1)
+      };
+      setDatabaseState({
+        controls: {
+          ...state.database.controls,
+          [env]: nextControls
+        }
+      });
+      await loadDatabaseRows(state.projectId, env);
+    });
+
+    this.querySelector('#dbNextPage')?.addEventListener('click', async () => {
+      const env = state.environment;
+      const nextControls = {
+        ...databaseControls(env),
+        page: Number(databaseControls(env).page || 1) + 1
+      };
+      setDatabaseState({
+        controls: {
+          ...state.database.controls,
+          [env]: nextControls
+        }
+      });
+      await loadDatabaseRows(state.projectId, env);
+    });
+
+    this.querySelector('#dbSqlEditor')?.addEventListener('input', (event) => {
+      const env = state.environment;
+      storeDatabaseSql(state.user?.id, state.projectId, env, event.target.value);
+      // Treat the SQL editor as a local draft so typing does not rerender the whole main region.
+      state.database.sqlDraft[env] = event.target.value;
+    });
+
+    this.querySelector('#runDbQuery')?.addEventListener('click', async () => {
+      await runDatabaseQuery(state.projectId, state.environment);
+    });
+
     this.querySelector('#emptyDb')?.addEventListener('click', async () => {
-      const ok = await showConfirm(`Empty database for ${state.environment}?`, { confirmText: 'Empty' });
-      if (!ok) return;
+      const confirmation = await showPrompt(
+        `Type ${state.environment.toUpperCase()} to confirm wiping the ${state.environment} database.`,
+        {
+          placeholder: state.environment.toUpperCase(),
+          confirmText: 'Empty Database',
+          initialValue: ''
+        }
+      );
+      if (confirmation !== state.environment.toUpperCase()) {
+        setDatabaseState({ notice: 'Database reset cancelled.' });
+        return;
+      }
       api(`/projects/${state.projectId}/env/${state.environment}/empty-db`, { method: 'POST' })
-        .then(() => setState({ envMessage: 'Empty DB started' }))
-        .catch((err) => setState({ envMessage: err.message }));
+        .then(() => setDatabaseState({ notice: 'Database reset queued. Refresh after the worker completes the reset.' }))
+        .catch((err) => setDatabaseState({ notice: err.message || 'Database reset failed.' }));
     });
 
     this.querySelectorAll('.delete-latest-task').forEach((btn) => {
@@ -5434,7 +6420,11 @@ class AppShell extends BaseElement {
     this.querySelectorAll('.deploy-button').forEach((btn) => {
       btn.addEventListener('click', async () => {
         const commitHash = btn.getAttribute('data-commit');
-        if (!commitHash) return setTaskStatus('No commit hash available', { autoHide: true });
+        if (!commitHash) {
+          pushToast({ message: 'No commit hash available', tone: 'warning', dedupeKey: 'deploy:missing-commit' });
+          return;
+        }
+        setState({ projectNotice: '' });
         prepareAppLogsForDeploy(state.environment);
         if (state.appLogsVisible) {
           fetchApplicationLogs({ force: true });
@@ -5450,7 +6440,7 @@ class AppShell extends BaseElement {
             setState({
               pendingDeployCommit: { ...state.pendingDeployCommit }
             });
-            setTaskStatus('This commit is already live', { autoHide: true });
+            pushToast({ message: 'This commit is already live', tone: 'info', dedupeKey: `deploy:${state.projectId}:${state.environment}:${commitHash}:already-live` });
             return;
           }
           if (response?.status === 'already_building') {
@@ -5458,7 +6448,7 @@ class AppShell extends BaseElement {
             setState({
               pendingDeployCommit: { ...state.pendingDeployCommit }
             });
-            setTaskStatus('A deploy for this commit is already in progress', { autoHide: true });
+            pushToast({ message: 'A deploy for this commit is already in progress', tone: 'info', dedupeKey: `deploy:${state.projectId}:${state.environment}:${commitHash}:already-building` });
             return;
           }
           state.pendingDeployCommit[state.environment] = commitHash;
@@ -5485,10 +6475,13 @@ class AppShell extends BaseElement {
         const block = btn.closest('.detail-block');
         const pre = block?.querySelector('pre');
         const text = pre?.textContent || '';
-        if (!text) return setTaskStatus('Nothing to copy', { autoHide: true });
+        if (!text) {
+          pushToast({ message: 'Nothing to copy', tone: 'warning', dedupeKey: 'copy-task:empty' });
+          return;
+        }
         try {
           await navigator.clipboard.writeText(text);
-          setTaskStatus('Copied', { autoHide: true });
+          pushToast({ message: 'Copied', tone: 'success', dedupeKey: 'copy-task:success' });
         } catch {
           const temp = document.createElement('textarea');
           temp.value = text;
@@ -5496,7 +6489,7 @@ class AppShell extends BaseElement {
           temp.select();
           document.execCommand('copy');
           temp.remove();
-          setTaskStatus('Copied', { autoHide: true });
+          pushToast({ message: 'Copied', tone: 'success', dedupeKey: 'copy-task:success' });
         }
       });
     });
@@ -5504,9 +6497,19 @@ class AppShell extends BaseElement {
     ensureAppLogPolling();
     updateAppLogPanel();
   }
+
+  bindToastEvents() {
+    this.querySelectorAll('[data-dismiss-toast]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        dismissToast(btn.getAttribute('data-dismiss-toast'));
+      });
+    });
+  }
 }
 
-customElements.define('app-shell', AppShell);
+if (!customElements.get('app-shell')) {
+  customElements.define('app-shell', AppShell);
+}
 
 if (state.token) {
   if (!state.user) {

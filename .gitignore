@@ -19,3 +19,4 @@ validation/evidence/*
 !validation/evidence/.gitkeep
 .vp-task/
 .codex-last-message.txt
+.last-build-*

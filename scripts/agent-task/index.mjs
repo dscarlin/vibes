@@ -31,6 +31,14 @@ const repoRoot = repoRootFrom(import.meta.url);
 const promptTemplatePath = path.join(repoRoot, 'scripts', 'agent-task', 'codex-wrapper-prompt.txt');
 const PLATFORM_NODEGROUP_NAME = 'platform-core';
 const MIN_PLATFORM_NODE_COUNT = 2;
+const DEFAULT_NOTIFY_EMAIL = 'ottobotowner@gmail.com';
+const DEFAULT_NOTIFY_ON = 'always';
+const DEFAULT_NOTIFY_FROM_EMAIL = 'noreply@vibesplatform.ai';
+const DEFAULT_NOTIFY_REPLY_TO = 'ottobotowner@gmail.com';
+const DEFAULT_NOTIFY_REGION = 'us-east-1';
+const NOTIFY_MODES = new Set(['always', 'success', 'failure', 'never']);
+const TASK_DATABASE_ENV_SUFFIXES = ['_development', '_testing', '_production'];
+const NON_BLOCKING_VALIDATION_STAGE_NAMES = new Set(['validation', 'feature-validation']);
 
 function usage() {
   console.error(
@@ -49,6 +57,8 @@ function usage() {
       '  --timeout-minutes <minutes>',
       '  --feature-validation-cmd <shell command>',
       '  --feature-validation-file <path>',
+      '  --notify-email <email>',
+      '  --notify-on <always|success|failure|never>',
       '  --skip-push',
       '  --skip-cleanup',
       '  --keep-clone'
@@ -103,6 +113,38 @@ function requiredArg(args, key) {
     throw new Error(`Missing required argument: --${key.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`)}`);
   }
   return value;
+}
+
+function normalizeNotifyOn(value) {
+  const normalized = String(value || DEFAULT_NOTIFY_ON).trim().toLowerCase();
+  if (NOTIFY_MODES.has(normalized)) return normalized;
+  throw new Error(`Invalid --notify-on value: ${value}`);
+}
+
+function resolveNotificationSettings(args = {}, stored = {}) {
+  return {
+    email: String(args.notifyEmail || stored.notifyEmail || DEFAULT_NOTIFY_EMAIL).trim() || DEFAULT_NOTIFY_EMAIL,
+    notifyOn: normalizeNotifyOn(args.notifyOn || stored.notifyOn || DEFAULT_NOTIFY_ON),
+    fromEmail: DEFAULT_NOTIFY_FROM_EMAIL,
+    replyTo: DEFAULT_NOTIFY_REPLY_TO,
+    region: DEFAULT_NOTIFY_REGION
+  };
+}
+
+function notificationShouldSend(status, notifyOn) {
+  const normalizedStatus = String(status || '').trim().toLowerCase();
+  const normalizedNotifyOn = normalizeNotifyOn(notifyOn);
+  if (normalizedNotifyOn === 'never') return false;
+  if (normalizedNotifyOn === 'always') return true;
+  if (normalizedNotifyOn === 'success') {
+    return normalizedStatus === 'succeeded' || normalizedStatus === 'completed_unpublished';
+  }
+  if (normalizedNotifyOn === 'failure') {
+    return normalizedStatus === 'failed'
+      || normalizedStatus === 'validation_warning'
+      || normalizedStatus === 'published_with_validation_failures';
+  }
+  return true;
 }
 
 async function readPrompt(args) {
@@ -259,8 +301,13 @@ async function runStage(manifest, stageName, work, { skipIfComplete = true, deta
   }
 }
 
-function stageFailed(manifest) {
-  return Object.values(manifest?.stages || {}).find((stage) => stage?.status === 'failed') || null;
+function failedStageEntries(manifest) {
+  return Object.entries(manifest?.stages || {}).filter(([, stage]) => stage?.status === 'failed');
+}
+
+function validationFailurePresent(manifest, validationAnalysis = { warnings: [] }) {
+  if (Array.isArray(validationAnalysis?.warnings) && validationAnalysis.warnings.length > 0) return true;
+  return failedStageEntries(manifest).some(([name]) => NON_BLOCKING_VALIDATION_STAGE_NAMES.has(name));
 }
 
 function cleanupHasErrors(manifest) {
@@ -513,7 +560,7 @@ async function restoreWorkerIrsaTrust(manifest) {
   await saveManifest(manifest);
 }
 
-async function runSqlThroughCluster(manifest, databaseUrl, sql, { namespace = '' } = {}) {
+async function runSqlThroughCluster(manifest, databaseUrl, sql, { namespace = '', tuplesOnly = false } = {}) {
   const kubeNamespace = namespace || manifest.cluster?.sharedPlatformNamespace || 'vibes-platform';
   const parts = dbParts(databaseUrl);
   const podName = `agent-task-db-${manifest.task?.slug || 'task'}-${shortRandom(4)}`;
@@ -538,7 +585,7 @@ async function runSqlThroughCluster(manifest, databaseUrl, sql, { namespace = ''
       ].join(' ')
     ]);
     await runCommand('kubectl', ['-n', kubeNamespace, 'wait', '--for=condition=Ready', `pod/${podName}`, '--timeout=180s']);
-    await runCommand('kubectl', [
+    const result = await runCommand('kubectl', [
       '-n',
       kubeNamespace,
       'exec',
@@ -546,8 +593,9 @@ async function runSqlThroughCluster(manifest, databaseUrl, sql, { namespace = ''
       '--',
       'sh',
       '-lc',
-      `psql -v ON_ERROR_STOP=1 -d ${shellQuote(parts.database)} <<'SQL'\n${sql}\nSQL`
+      `psql ${tuplesOnly ? '-tA ' : ''}-v ON_ERROR_STOP=1 -d ${shellQuote(parts.database)} <<'SQL'\n${sql}\nSQL`
     ]);
+    return result.stdout;
   } finally {
     await runCommand('kubectl', [
       '-n',
@@ -592,25 +640,150 @@ async function deleteValidationUser(manifest, databaseUrl, schema, email) {
   );
 }
 
-async function dropDatabases(manifest, adminUrl, databases = []) {
-  if (!databases.length) return;
-  for (const database of databases) {
-    if (!database) continue;
+function quoteLiteral(value) {
+  return `'${String(value ?? '').replace(/'/g, "''")}'`;
+}
+
+function escapeLikePattern(value) {
+  return String(value ?? '').replace(/[\\%_]/g, '\\$&');
+}
+
+function taskDatabaseNameMatchesPrefix(databaseName, projectDatabasePrefix) {
+  const database = String(databaseName || '').trim();
+  const prefix = String(projectDatabasePrefix || '').trim();
+  if (!database || !prefix) return false;
+  return database.startsWith(`${prefix}_`) && TASK_DATABASE_ENV_SUFFIXES.some((suffix) => database.endsWith(suffix));
+}
+
+function normalizeTaskDatabaseNames(databases = [], { projectDatabasePrefix = '' } = {}) {
+  const prefix = String(projectDatabasePrefix || '').trim();
+  const seen = new Set();
+  const normalized = [];
+  for (const database of Array.isArray(databases) ? databases : []) {
+    const name = String(database || '').trim();
+    if (!name) continue;
+    if (prefix && !taskDatabaseNameMatchesPrefix(name, prefix)) continue;
+    if (seen.has(name)) continue;
+    seen.add(name);
+    normalized.push(name);
+  }
+  return normalized;
+}
+
+function summaryTaskDatabaseNames(summary) {
+  return Array.isArray(summary?.project?.databases)
+    ? summary.project.databases.map((entry) => entry?.db_name)
+    : [];
+}
+
+async function listTaskDatabasesByPrefix(
+  manifest,
+  adminUrl,
+  projectDatabasePrefix,
+  { runSql = runSqlThroughCluster } = {}
+) {
+  const prefix = String(projectDatabasePrefix || '').trim();
+  if (!prefix) return [];
+  const prefixPattern = `${escapeLikePattern(prefix)}\\_%`;
+  const suffixFilter = TASK_DATABASE_ENV_SUFFIXES
+    .map((suffix) => `datname like ${quoteLiteral(`%${escapeLikePattern(suffix)}`)} escape '\\'`)
+    .join(' or ');
+  const sql = [
+    'select datname',
+    'from pg_database',
+    `where datname like ${quoteLiteral(prefixPattern)} escape '\\'`,
+    `  and (${suffixFilter})`,
+    'order by datname;'
+  ].join('\n');
+  const stdout = await runSql(manifest, adminUrl, sql, {
+    namespace: manifest.cluster?.sharedPlatformNamespace,
+    tuplesOnly: true
+  });
+  return String(stdout || '')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
+async function resolveTaskDatabaseCleanupPlan(
+  manifest,
+  { summary = null, listDatabasesByPrefix = listTaskDatabasesByPrefix } = {}
+) {
+  const persistedCleanup = manifest.cleanup?.validation;
+  const projectDatabasePrefix = String(manifest.task?.projectDatabasePrefix || '').trim();
+  if (persistedCleanup && Array.isArray(persistedCleanup.databases)) {
+    return {
+      attempted: true,
+      source: String(persistedCleanup.databaseSource || 'manifest'),
+      databases: normalizeTaskDatabaseNames(persistedCleanup.databases, { projectDatabasePrefix })
+    };
+  }
+
+  if (Array.isArray(summary?.project?.databases)) {
+    return {
+      attempted: true,
+      source: 'summary',
+      databases: normalizeTaskDatabaseNames(summaryTaskDatabaseNames(summary), { projectDatabasePrefix })
+    };
+  }
+
+  if (!manifest.status?.overlayReady) {
+    return {
+      attempted: false,
+      source: null,
+      databases: []
+    };
+  }
+
+  if (!projectDatabasePrefix) {
+    throw new Error('Task database cleanup requires manifest.task.projectDatabasePrefix after overlay setup');
+  }
+
+  const adminUrl = String(manifest.database?.customerAdminUrl || '').trim();
+  if (!adminUrl) {
+    throw new Error('Task database cleanup requires manifest.database.customerAdminUrl after overlay setup');
+  }
+
+  const discovered = await listDatabasesByPrefix(manifest, adminUrl, projectDatabasePrefix);
+  return {
+    attempted: true,
+    source: 'prefix_scan',
+    databases: normalizeTaskDatabaseNames(discovered, { projectDatabasePrefix })
+  };
+}
+
+async function dropDatabases(manifest, adminUrl, databases = [], { runSql = runSqlThroughCluster } = {}) {
+  const uniqueDatabases = normalizeTaskDatabaseNames(databases);
+  if (!uniqueDatabases.length) return;
+  if (!adminUrl) {
+    throw new Error('Task database cleanup requires a customer admin database URL');
+  }
+  const failedDatabases = [];
+  for (const database of uniqueDatabases) {
     try {
-      await runSqlThroughCluster(
+      await runSql(
         manifest,
         adminUrl,
         `drop database if exists ${quoteIdent(database)} with (force);`,
         { namespace: manifest.cluster?.sharedPlatformNamespace }
       );
     } catch {
-      await runSqlThroughCluster(
-        manifest,
-        adminUrl,
-        `drop database if exists ${quoteIdent(database)};`,
-        { namespace: manifest.cluster?.sharedPlatformNamespace }
-      ).catch(() => null);
+      try {
+        await runSql(
+          manifest,
+          adminUrl,
+          `drop database if exists ${quoteIdent(database)};`,
+          { namespace: manifest.cluster?.sharedPlatformNamespace }
+        );
+      } catch {
+        failedDatabases.push(database);
+      }
     }
+  }
+  if (failedDatabases.length) {
+    const error = new Error(`Failed to drop task databases: ${failedDatabases.join(', ')}`);
+    error.failedDatabases = failedDatabases;
+    throw error;
   }
 }
 
@@ -1046,12 +1219,12 @@ kubectl -n ${shellQuote(manifest.task.namespaces.platform)} logs deploy/${shellQ
     '',
     `Run artifacts live in \`${runDir}\`.`,
     '',
-    '- `./.vp-task/bin/await-platform` blocks until the task platform deployments are available.',
+    '- `./.vp-task/bin/await-platform` is for manual replica debugging only.',
     '- `./.vp-task/bin/platform-urls` prints the task-scoped hosts.',
-    '- `./.vp-task/bin/redeploy-platform` rebuilds and reapplies the task platform from this clone.',
-    '- `./.vp-task/bin/validate-platform` runs the full user/project/task validation flow and writes evidence outside the clone.',
+    '- `./.vp-task/bin/redeploy-platform` is manual-only and intentionally not used by the CLI runner.',
+    '- `./.vp-task/bin/validate-platform` is manual-only and intentionally not used by the CLI runner.',
     '- `./.vp-task/bin/validate-feature` runs the optional feature-specific validation command for this run.',
-    '- `./.vp-task/bin/tail-server`, `tail-worker`, and `tail-web` stream platform logs.',
+    '- `./.vp-task/bin/tail-server`, `tail-worker`, and `tail-web` are for manual replica debugging only.',
     '- `./.vp-task/bin/status` prints the manifest path and current task context.'
   ].join('\n');
   await fs.writeFile(path.join(overlayDir, 'COMMANDS.md'), `${commandsDoc}\n`, 'utf8');
@@ -1295,37 +1468,60 @@ async function runFeatureValidation(manifest) {
   const evidenceDir = path.join(manifest.paths.runDir, 'validation', 'feature');
   await ensureDir(evidenceDir);
   const mergedEnv = parseEnv(await fs.readFile(path.join(manifest.repo.cloneDir, '.env'), 'utf8'));
-  await spawnLogged({
-    cmd: 'sh',
-    args: ['-lc', command],
-    cwd: manifest.repo.cloneDir,
-    env: {
-      ...process.env,
-      ...mergedEnv,
-      REPLICA_OUTPUT_DIR: manifest.paths.generatedDir,
-      VALIDATION_METADATA_ENV_FILE: path.join(manifest.paths.generatedDir, 'metadata.env'),
-      AGENT_TASK_MANIFEST_PATH: manifest.paths.manifestPath,
-      AGENT_TASK_RUN_DIR: manifest.paths.runDir,
-      AGENT_TASK_VALIDATION_SUMMARY_PATH: manifest.validation?.lastSummaryPath || '',
-      AGENT_TASK_VALIDATION_EVIDENCE_DIR: manifest.validation?.lastEvidenceDir || ''
-    },
-    stdoutPath: path.join(evidenceDir, 'feature-validation.stdout.log'),
-    stderrPath: path.join(evidenceDir, 'feature-validation.stderr.log'),
-    timeoutMs: 30 * 60 * 1000
-  });
   manifest.featureValidation = {
     command,
     evidenceDir,
     stdoutPath: path.join(evidenceDir, 'feature-validation.stdout.log'),
     stderrPath: path.join(evidenceDir, 'feature-validation.stderr.log'),
-    completedAt: new Date().toISOString()
+    startedAt: new Date().toISOString(),
+    completedAt: null,
+    failedAt: null,
+    error: null
   };
   await saveManifest(manifest);
-  return manifest.featureValidation;
+  try {
+    await spawnLogged({
+      cmd: 'sh',
+      args: ['-lc', command],
+      cwd: manifest.repo.cloneDir,
+      env: {
+        ...process.env,
+        ...mergedEnv,
+        REPLICA_OUTPUT_DIR: manifest.paths.generatedDir,
+        VALIDATION_METADATA_ENV_FILE: path.join(manifest.paths.generatedDir, 'metadata.env'),
+        AGENT_TASK_MANIFEST_PATH: manifest.paths.manifestPath,
+        AGENT_TASK_RUN_DIR: manifest.paths.runDir,
+        AGENT_TASK_VALIDATION_SUMMARY_PATH: manifest.validation?.lastSummaryPath || '',
+        AGENT_TASK_VALIDATION_EVIDENCE_DIR: manifest.validation?.lastEvidenceDir || ''
+      },
+      stdoutPath: path.join(evidenceDir, 'feature-validation.stdout.log'),
+      stderrPath: path.join(evidenceDir, 'feature-validation.stderr.log'),
+      timeoutMs: 30 * 60 * 1000
+    });
+    manifest.featureValidation = {
+      ...manifest.featureValidation,
+      completedAt: new Date().toISOString(),
+      failedAt: null,
+      error: null
+    };
+    await saveManifest(manifest);
+    return manifest.featureValidation;
+  } catch (error) {
+    manifest.featureValidation = {
+      ...manifest.featureValidation,
+      completedAt: null,
+      failedAt: new Date().toISOString(),
+      error: serializeError(error)
+    };
+    await saveManifest(manifest);
+    throw error;
+  }
 }
 
 function overallRunStatus(manifest, validationAnalysis) {
-  const failedStage = stageFailed(manifest);
+  const failedEntries = failedStageEntries(manifest);
+  const hardFailedStage = failedEntries.find(([name]) => !NON_BLOCKING_VALIDATION_STAGE_NAMES.has(name))?.[1] || null;
+  const validationFailure = validationFailurePresent(manifest, validationAnalysis);
   const publish = manifest.status?.publish || null;
   const cleanup = manifest.cleanup || {};
   const cleanupStage = stageRecord(manifest, 'cleanup');
@@ -1333,12 +1529,15 @@ function overallRunStatus(manifest, validationAnalysis) {
   if (cleanup.completedAt) {
     if (cleanupHasErrors(manifest)) return 'failed';
     if (publish && !publish.skipPush && !publish.remoteVerifiedAt) return 'failed';
-    if (failedStage) return 'failed';
+    if (hardFailedStage) return 'failed';
+    if (validationFailure) {
+      return publish?.skipPush ? 'validation_warning' : 'published_with_validation_failures';
+    }
     return publish?.skipPush ? 'completed_unpublished' : 'succeeded';
   }
-  if (failedStage || manifest.status?.lastError) return 'failed';
+  if (hardFailedStage || manifest.status?.lastError) return 'failed';
   if (publish?.committedAt) return 'cleaning_up';
-  if (validationAnalysis?.warnings?.length) return 'validation_warning';
+  if (validationFailure) return 'validation_warning';
   return 'running';
 }
 
@@ -1346,6 +1545,9 @@ function nextActionForReport(status) {
   if (status === 'running') return 'Wait for the active run to finish or resume it if interrupted.';
   if (status === 'cleaning_up') return 'Wait for cleanup to complete or rerun cleanup from the manifest.';
   if (status === 'validation_warning') return 'Review validation evidence and rerun after fixing the warning conditions.';
+  if (status === 'published_with_validation_failures') {
+    return 'Review the pushed branch and validation evidence before merge or follow-up deployment work.';
+  }
   if (status === 'completed_unpublished') return 'Review the branch and push manually if desired.';
   if (status === 'failed') return 'Inspect final-report.json and the stage evidence, then resume or run cleanup.';
   return 'Review the pushed branch and preserved evidence.';
@@ -1354,6 +1556,8 @@ function nextActionForReport(status) {
 async function writeRunReport(manifest) {
   if (!manifest?.paths?.reportPath) return;
   const validationAnalysis = await analyzeValidationArtifacts(manifest);
+  const validationStage = stageRecord(manifest, 'validation');
+  const featureValidationStage = stageRecord(manifest, 'feature-validation');
   const report = {
     version: 1,
     generatedAt: new Date().toISOString(),
@@ -1368,11 +1572,16 @@ async function writeRunReport(manifest) {
       skipPush: Boolean(manifest.request?.skipPush),
       skipCleanup: Boolean(manifest.request?.skipCleanup),
       keepClone: Boolean(manifest.request?.keepClone),
-      featureValidationConfigured: Boolean(manifest.request?.featureValidationCommand)
+      featureValidationConfigured: Boolean(manifest.request?.featureValidationCommand),
+      notifyEmail: manifest.request?.notifyEmail || null,
+      notifyOn: manifest.request?.notifyOn || null
     },
     stages: manifest.stages || {},
     publish: manifest.status?.publish || null,
     validation: {
+      stageStatus: validationStage?.status || null,
+      stageError: validationStage?.error || null,
+      skippedReason: validationStage?.reason || null,
       lastLabel: manifest.validation?.lastLabel || null,
       evidenceDir: manifest.validation?.lastEvidenceDir || null,
       summaryPath: manifest.validation?.lastSummaryPath || null,
@@ -1385,7 +1594,13 @@ async function writeRunReport(manifest) {
           }
         : null
     },
-    featureValidation: manifest.featureValidation || null,
+    featureValidation: {
+      ...(manifest.featureValidation || {}),
+      stageStatus: featureValidationStage?.status || null,
+      stageError: featureValidationStage?.error || manifest.featureValidation?.error || null,
+      skippedReason: featureValidationStage?.reason || null
+    },
+    notifications: manifest.notifications || null,
     cleanup: manifest.cleanup || {},
     paths: {
       manifestPath: manifest.paths.manifestPath,
@@ -1398,14 +1613,287 @@ async function writeRunReport(manifest) {
   await writeJson(manifest.paths.reportPath, report);
 }
 
-async function cleanupValidation(manifest) {
-  if (!manifest.validation?.lastEvidenceDir || !manifest.validation?.lastSummaryPath) return;
-  const summary = await readJson(manifest.validation.lastSummaryPath);
-  const registerPath = path.join(manifest.validation.lastEvidenceDir, '01-register.json');
+function formatStageSummary(stages = {}) {
+  return Object.entries(stages)
+    .map(([name, stage]) => `${name}: ${stage?.status || 'unknown'}`)
+    .join('\n');
+}
+
+function runNotificationSubject(command, manifest, report) {
+  return `[agent-task:${report.status}] ${manifest.repo?.featureBranch || manifest.runId} (${command})`;
+}
+
+function runNotificationBody(command, manifest, report) {
+  const validationWarnings = Array.isArray(report?.validation?.warnings) ? report.validation.warnings : [];
+  const cleanupErrors = Array.isArray(report?.cleanup?.errors) ? report.cleanup.errors : [];
+  const validationStageStatus = report?.validation?.stageStatus || 'not-run';
+  const featureValidationStageStatus = report?.featureValidation?.stageStatus || 'not-run';
+  return [
+    'Vibes Platform agent-task notification',
+    '',
+    `Command: ${command}`,
+    `Generated: ${new Date().toISOString()}`,
+    `Status: ${report.status}`,
+    `Next action: ${report.nextAction || ''}`,
+    '',
+    `Run ID: ${manifest.runId}`,
+    `Feature branch: ${manifest.repo?.featureBranch || ''}`,
+    `Base branch: ${manifest.repo?.baseBranch || ''}`,
+    `Model: ${manifest.request?.model || ''}`,
+    `Notify email: ${manifest.request?.notifyEmail || DEFAULT_NOTIFY_EMAIL}`,
+    `Notify on: ${manifest.request?.notifyOn || DEFAULT_NOTIFY_ON}`,
+    '',
+    `Commit: ${report.publish?.commitHash || 'not committed'}`,
+    `Remote verified: ${report.publish?.remoteVerifiedAt || 'no'}`,
+    `Validation stage: ${validationStageStatus}`,
+    `Validation error: ${report.validation?.stageError?.message || 'none'}`,
+    `Feature validation stage: ${featureValidationStageStatus}`,
+    `Feature validation error: ${report.featureValidation?.stageError?.message || 'none'}`,
+    `Cleanup completed: ${report.cleanup?.completedAt || 'no'}`,
+    `Cleanup errors: ${cleanupErrors.length ? cleanupErrors.join(' | ') : 'none'}`,
+    `Validation warnings: ${validationWarnings.length ? validationWarnings.join(', ') : 'none'}`,
+    '',
+    'Artifacts:',
+    `Report: ${manifest.paths?.reportPath || ''}`,
+    `Manifest: ${manifest.paths?.manifestPath || ''}`,
+    `Run dir: ${manifest.paths?.runDir || ''}`,
+    '',
+    'Stages:',
+    formatStageSummary(report.stages || {}),
+    '',
+    `Last error: ${report.lastError?.message || 'none'}`
+  ].join('\n');
+}
+
+function domainFromEmailAddress(value) {
+  const parts = String(value || '').trim().toLowerCase().split('@');
+  if (parts.length !== 2 || !parts[1]) return '';
+  return parts[1];
+}
+
+function sesSenderIdentityCandidates(fromEmail) {
+  return Array.from(new Set([String(fromEmail || '').trim(), domainFromEmailAddress(fromEmail)].filter(Boolean)));
+}
+
+async function readSesIdentity(region, identity) {
+  try {
+    const { stdout } = await runCommand('aws', ['sesv2', 'get-email-identity', '--region', region, '--email-identity', identity]);
+    return stdout ? JSON.parse(stdout) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function assertSesSenderIdentity(region, fromEmail) {
+  let pendingIdentity = '';
+  for (const candidate of sesSenderIdentityCandidates(fromEmail)) {
+    const identity = await readSesIdentity(region, candidate);
+    if (!identity) continue;
+    if (identity.VerifiedForSendingStatus) return candidate;
+    pendingIdentity = candidate;
+  }
+  if (pendingIdentity) {
+    throw new Error(
+      `SES sender identity exists but is not verified for ${pendingIdentity}. Finish SES verification before using CLI email notifications.`
+    );
+  }
+  throw new Error(
+    `SES sender identity is not configured for ${fromEmail} or its domain ${domainFromEmailAddress(fromEmail)}. Verify the sender identity in SES before using CLI email notifications.`
+  );
+}
+
+async function sendSesEmail({ subject, bodyText, toAddress, fromEmail, replyTo, region, evidenceDir, prefix }) {
+  await ensureDir(evidenceDir);
+  const stamp = `${timestampSlug()}-${shortRandom(6)}`;
+  const payloadPath = path.join(evidenceDir, `${prefix}-${stamp}.payload.json`);
+  const responsePath = path.join(evidenceDir, `${prefix}-${stamp}.response.json`);
+  await assertSesSenderIdentity(region, fromEmail);
+  const { stdout: accountStdout } = await runCommand('aws', ['sesv2', 'get-account', '--region', region]);
+  const account = accountStdout ? JSON.parse(accountStdout) : {};
+  if (!account?.ProductionAccessEnabled) {
+    try {
+      await runCommand('aws', ['sesv2', 'get-email-identity', '--region', region, '--email-identity', toAddress]);
+    } catch {
+      throw new Error(
+        `SES account is still in sandbox mode and the recipient identity ${toAddress} is not verified. Verify the recipient or move SES out of sandbox before using CLI email notifications.`
+      );
+    }
+  }
+  const payload = {
+    FromEmailAddress: fromEmail,
+    Destination: {
+      ToAddresses: [toAddress]
+    },
+    ReplyToAddresses: [replyTo],
+    Content: {
+      Simple: {
+        Subject: {
+          Data: subject,
+          Charset: 'UTF-8'
+        },
+        Body: {
+          Text: {
+            Data: bodyText,
+            Charset: 'UTF-8'
+          }
+        }
+      }
+    }
+  };
+  await writeJson(payloadPath, payload);
+  const { stdout } = await runCommand('aws', [
+    'sesv2',
+    'send-email',
+    '--region',
+    region,
+    '--cli-input-json',
+    `file://${payloadPath}`
+  ]);
+  const response = stdout ? JSON.parse(stdout) : {};
+  await writeJson(responsePath, response);
+  return {
+    payloadPath,
+    responsePath,
+    response,
+    sentAt: new Date().toISOString()
+  };
+}
+
+async function sendRunNotification(manifest, args, command) {
+  if (!manifest?.paths?.reportPath) return;
+  const settings = resolveNotificationSettings(args, manifest.request || {});
+  const report = await readJson(manifest.paths.reportPath).catch(async () => {
+    await writeRunReport(manifest);
+    return readJson(manifest.paths.reportPath);
+  });
+  const shouldSend = notificationShouldSend(report.status, settings.notifyOn);
+  const notifications = Array.isArray(manifest.notifications?.attempts) ? manifest.notifications.attempts : [];
+  const evidenceDir = path.join(manifest.paths.runDir, 'notifications');
+  const attempt = {
+    command,
+    at: new Date().toISOString(),
+    notifyEmail: settings.email,
+    notifyOn: settings.notifyOn,
+    fromEmail: settings.fromEmail,
+    replyTo: settings.replyTo,
+    status: shouldSend ? 'pending' : 'skipped',
+    reason: shouldSend ? '' : `notify_on_${settings.notifyOn}`
+  };
+
+  if (shouldSend) {
+    try {
+      const result = await sendSesEmail({
+        subject: runNotificationSubject(command, manifest, report),
+        bodyText: runNotificationBody(command, manifest, report),
+        toAddress: settings.email,
+        fromEmail: settings.fromEmail,
+        replyTo: settings.replyTo,
+        region: settings.region,
+        evidenceDir,
+        prefix: command
+      });
+      attempt.status = 'sent';
+      attempt.payloadPath = result.payloadPath;
+      attempt.responsePath = result.responsePath;
+      attempt.messageId = result.response?.MessageId || null;
+      attempt.sentAt = result.sentAt;
+    } catch (error) {
+      attempt.status = 'failed';
+      attempt.error = serializeError(error);
+      console.error(`agent-task notification failed: ${error.message}`);
+    }
+  }
+
+  manifest.notifications = {
+    ...(manifest.notifications || {}),
+    attempts: [...notifications, attempt]
+  };
+  await saveManifest(manifest);
+}
+
+function janitorNotificationSubject({ apply, candidates }) {
+  const action = apply ? 'apply' : 'dry-run';
+  return `[agent-task:janitor] ${action} ${candidates.length} candidate(s)`;
+}
+
+function janitorNotificationBody({ runsRoot, olderThanHours, apply, keepClone, janitorReportPath, candidates }) {
+  return [
+    'Vibes Platform agent-task janitor notification',
+    '',
+    `Generated: ${new Date().toISOString()}`,
+    `Mode: ${apply ? 'apply' : 'dry-run'}`,
+    `Runs root: ${runsRoot}`,
+    `Older-than hours: ${olderThanHours}`,
+    `Keep clone: ${keepClone}`,
+    `Candidate count: ${candidates.length}`,
+    `Report: ${janitorReportPath}`,
+    '',
+    'Candidates:',
+    ...(candidates.length
+      ? candidates.map((candidate) =>
+          [
+            `- ${candidate.runId}`,
+            `  reasons: ${(candidate.reasons || []).join(', ') || 'none'}`,
+            `  applied: ${candidate.applied ? 'yes' : 'no'}`,
+            `  error: ${candidate.error?.message || 'none'}`,
+            `  manifest: ${candidate.manifestPath || ''}`
+          ].join('\n')
+        )
+      : ['- none'])
+  ].join('\n');
+}
+
+async function sendJanitorNotification(args, details) {
+  const settings = resolveNotificationSettings(args, {});
+  const status = details.apply && details.candidates.some((candidate) => candidate.error) ? 'failed' : 'succeeded';
+  if (!notificationShouldSend(status, settings.notifyOn)) return;
+  const evidenceDir = path.join(details.runsRoot, 'janitor');
+  try {
+    await sendSesEmail({
+      subject: janitorNotificationSubject(details),
+      bodyText: janitorNotificationBody(details),
+      toAddress: settings.email,
+      fromEmail: settings.fromEmail,
+      replyTo: settings.replyTo,
+      region: settings.region,
+      evidenceDir,
+      prefix: 'janitor'
+    });
+  } catch (error) {
+    console.error(`agent-task janitor notification failed: ${error.message}`);
+  }
+}
+
+async function cleanupValidation(
+  manifest,
+  {
+    readJsonFile = readJson,
+    pathExistsFn = pathExists,
+    listDatabasesByPrefix = listTaskDatabasesByPrefix,
+    dropTaskDatabases = dropDatabases,
+    deleteTaskValidationUser = deleteValidationUser,
+    save = saveManifest
+  } = {}
+) {
+  const summaryPath = String(manifest.validation?.lastSummaryPath || '').trim();
+  const evidenceDir = String(manifest.validation?.lastEvidenceDir || '').trim();
+  const summary = summaryPath ? await readJsonFile(summaryPath).catch(() => null) : null;
+  const validationCleanup = {
+    ...(manifest.cleanup?.validation || {}),
+    projectId: summary?.project?.id || manifest.cleanup?.validation?.projectId || null,
+    userEmail: summary?.user?.email || manifest.cleanup?.validation?.userEmail || null,
+    failedDatabases: Array.isArray(manifest.cleanup?.validation?.failedDatabases)
+      ? manifest.cleanup.validation.failedDatabases
+      : []
+  };
+
   let token = '';
-  if (await pathExists(registerPath)) {
-    const register = await readJson(registerPath);
-    token = String(register?.body?.token || '').trim();
+  if (evidenceDir) {
+    const registerPath = path.join(evidenceDir, '01-register.json');
+    if (await pathExistsFn(registerPath)) {
+      const register = await readJsonFile(registerPath).catch(() => null);
+      token = String(register?.body?.token || '').trim();
+    }
   }
 
   if (token && summary?.project?.id) {
@@ -1420,19 +1908,56 @@ async function cleanupValidation(manifest) {
     }, { timeoutMs: 10 * 60 * 1000, intervalMs: 5000 }).catch(() => null);
   }
 
-  const databaseNames = Array.isArray(summary?.project?.databases)
-    ? summary.project.databases.map((entry) => entry.db_name).filter(Boolean)
-    : [];
-  await dropDatabases(manifest, manifest.database.customerAdminUrl, databaseNames);
-  const validationUserEmail = summary?.user?.email || '';
-  await deleteValidationUser(manifest, manifest.database.baseDatabaseUrl, manifest.task.schema, validationUserEmail);
-  manifest.cleanup.validation = {
-    completedAt: new Date().toISOString(),
-    projectId: summary?.project?.id || null,
-    userEmail: validationUserEmail || null,
-    databases: databaseNames
-  };
-  await saveManifest(manifest);
+  let databasePlan = null;
+  let databaseError = null;
+  try {
+    databasePlan = await resolveTaskDatabaseCleanupPlan(manifest, { summary, listDatabasesByPrefix });
+  } catch (error) {
+    databaseError = error;
+    validationCleanup.failedDatabases = Array.isArray(error.failedDatabases) ? error.failedDatabases : [];
+  }
+
+  if (databasePlan?.attempted) {
+    validationCleanup.databases = databasePlan.databases;
+    validationCleanup.databaseSource = databasePlan.source;
+    validationCleanup.failedDatabases = [];
+    manifest.cleanup.validation = validationCleanup;
+    await save(manifest);
+    try {
+      await dropTaskDatabases(manifest, manifest.database?.customerAdminUrl, databasePlan.databases);
+    } catch (error) {
+      databaseError = error;
+      validationCleanup.failedDatabases = Array.isArray(error.failedDatabases) ? error.failedDatabases : [];
+    }
+  }
+
+  let validationUserError = null;
+  if (summary?.user?.email) {
+    try {
+      await deleteTaskValidationUser(manifest, manifest.database.baseDatabaseUrl, manifest.task.schema, summary.user.email);
+    } catch (error) {
+      validationUserError = error;
+    }
+  }
+
+  if (databasePlan?.attempted || summary) {
+    manifest.cleanup.validation = {
+      ...validationCleanup,
+      completedAt: new Date().toISOString()
+    };
+    await save(manifest);
+  }
+
+  const cleanupErrors = [];
+  if (databaseError) cleanupErrors.push(databaseError.message);
+  if (validationUserError) cleanupErrors.push(`validation user cleanup: ${validationUserError.message}`);
+  if (cleanupErrors.length) {
+    const error = new Error(cleanupErrors.join(' | '));
+    if (Array.isArray(databaseError?.failedDatabases)) {
+      error.failedDatabases = databaseError.failedDatabases;
+    }
+    throw error;
+  }
 }
 
 function forbiddenValuesForManifest(manifest) {
@@ -1710,7 +2235,9 @@ async function createRunManifest(args) {
       skipPush: Boolean(args.skipPush),
       skipCleanup: Boolean(args.skipCleanup),
       keepClone: Boolean(args.keepClone),
-      featureValidationCommand
+      featureValidationCommand,
+      notifyEmail: resolveNotificationSettings(args, {}).email,
+      notifyOn: resolveNotificationSettings(args, {}).notifyOn
     },
     repo: {
       sourceRoot: repoRoot,
@@ -1787,20 +2314,17 @@ async function executeRun(manifest, args = {}) {
       return { generatedDir: manifest.paths.generatedDir };
     });
 
-    await runStage(manifest, 'platform-capacity', async () => {
-      await ensurePlatformNodegroupCapacity(manifest);
-      return manifest.resources.platformNodegroupScaling || {};
-    });
+    if (!['completed', 'skipped'].includes(stageRecord(manifest, 'platform-capacity')?.status || '')) {
+      await skipStage(manifest, 'platform-capacity', 'Automatic replica capacity changes are disabled');
+    }
 
-    await runStage(manifest, 'worker-irsa-trust', async () => {
-      await ensureWorkerIrsaTrust(manifest);
-      return manifest.resources.workerIrsaTrust || {};
-    });
+    if (!['completed', 'skipped'].includes(stageRecord(manifest, 'worker-irsa-trust')?.status || '')) {
+      await skipStage(manifest, 'worker-irsa-trust', 'Automatic replica IRSA changes are disabled');
+    }
 
-    await runStage(manifest, 'deploy-pre-codex', async () => {
-      await deployPlatform(manifest, 'pre-codex');
-      return manifest.status.lastDeploy || {};
-    });
+    if (!['completed', 'skipped'].includes(stageRecord(manifest, 'deploy-pre-codex')?.status || '')) {
+      await skipStage(manifest, 'deploy-pre-codex', 'Automatic replica deploy is disabled');
+    }
 
     await runStage(
       manifest,
@@ -1817,25 +2341,26 @@ async function executeRun(manifest, args = {}) {
       }
     );
 
-    await runStage(manifest, 'deploy-post-codex', async () => {
-      await deployPlatform(manifest, 'post-codex');
-      return manifest.status.lastDeploy || {};
-    });
+    if (!['completed', 'skipped'].includes(stageRecord(manifest, 'deploy-post-codex')?.status || '')) {
+      await skipStage(manifest, 'deploy-post-codex', 'Automatic replica deploy is disabled');
+    }
 
-    await runStage(manifest, 'validation', async () => {
-      const summary = await runValidation(manifest, 'post-codex');
-      await assertValidationReadyForPublish(manifest);
-      return {
-        summaryPath: manifest.validation?.lastSummaryPath || null,
-        task: summary?.task || null,
-        fullBuild: summary?.full_build || null
-      };
-    });
+    if (!['completed', 'skipped'].includes(stageRecord(manifest, 'validation')?.status || '')) {
+      await skipStage(
+        manifest,
+        'validation',
+        'Full replica validation is disabled; rely on targeted validations instead'
+      );
+    }
 
     if (options.featureValidationCommand) {
-      await runStage(manifest, 'feature-validation', async () => {
-        return runFeatureValidation(manifest);
-      });
+      try {
+        await runStage(manifest, 'feature-validation', async () => {
+          return runFeatureValidation(manifest);
+        });
+      } catch (error) {
+        console.warn(`feature-validation failed but publish will continue: ${error.message}`);
+      }
     } else if (!stageRecord(manifest, 'feature-validation')) {
       await skipStage(manifest, 'feature-validation', 'No feature validation command configured');
     }
@@ -1892,26 +2417,50 @@ async function executeRun(manifest, args = {}) {
 async function runFlow(args) {
   await ensureKubeAccess();
   const manifest = await createRunManifest(args);
-  await executeRun(manifest, args);
+  let primaryError = null;
+  try {
+    await executeRun(manifest, args);
+  } catch (error) {
+    primaryError = error;
+  } finally {
+    await sendRunNotification(manifest, args, 'run');
+  }
+  if (primaryError) throw primaryError;
 }
 
 async function resumeFlow(args) {
   await ensureKubeAccess();
   const manifest = await loadManifestForResume(requiredArg(args, 'manifest'));
-  await executeRun(manifest, args);
+  let primaryError = null;
+  try {
+    await executeRun(manifest, args);
+  } catch (error) {
+    primaryError = error;
+  } finally {
+    await sendRunNotification(manifest, args, 'resume');
+  }
+  if (primaryError) throw primaryError;
 }
 
 async function cleanupFlow(args) {
   const manifest = await loadManifestForResume(requiredArg(args, 'manifest'));
-  await runStage(
-    manifest,
-    'cleanup',
-    async () => {
-      await cleanupManifest(manifest, { keepClone: Boolean(args.keepClone) });
-      return manifest.cleanup;
-    },
-    { skipIfComplete: false, details: { keepClone: Boolean(args.keepClone) } }
-  );
+  let primaryError = null;
+  try {
+    await runStage(
+      manifest,
+      'cleanup',
+      async () => {
+        await cleanupManifest(manifest, { keepClone: Boolean(args.keepClone) });
+        return manifest.cleanup;
+      },
+      { skipIfComplete: false, details: { keepClone: Boolean(args.keepClone) } }
+    );
+  } catch (error) {
+    primaryError = error;
+  } finally {
+    await sendRunNotification(manifest, args, 'cleanup');
+  }
+  if (primaryError) throw primaryError;
 }
 
 async function namespaceExists(namespace) {
@@ -1997,6 +2546,14 @@ async function janitorFlow(args) {
     keepClone,
     candidates
   });
+  await sendJanitorNotification(args, {
+    runsRoot,
+    olderThanHours,
+    apply,
+    keepClone,
+    janitorReportPath,
+    candidates
+  });
   console.log(`Janitor report: ${janitorReportPath}`);
   if (candidates.length) {
     console.log(JSON.stringify(candidates, null, 2));
@@ -2034,13 +2591,21 @@ async function main() {
 const isEntrypoint = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
 
 export {
+  resolveNotificationSettings,
+  notificationShouldSend,
+  domainFromEmailAddress,
+  sesSenderIdentityCandidates,
   buildTaskContext,
+  cleanupValidation,
   cleanupCompletedCleanly,
+  dropDatabases,
   deriveTaskSlug,
   ensureManifestDefaults,
+  normalizeNotifyOn,
   overallRunStatus,
   parseArgs,
   agentTaskGuardEnv,
+  resolveTaskDatabaseCleanupPlan,
   shouldRunCleanupStage,
   validationWarningsFromArtifacts
 };
