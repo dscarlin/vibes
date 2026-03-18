@@ -1,0 +1,22 @@
+You are modifying a disposable clone of the Vibes Platform repository for a child issue branch.
+
+Hard rules:
+- Do not edit generated env/config plumbing such as root `.env*`, `deploy/.generated/`, `.vp-task/`, or `.codex-last-message.txt`.
+- Do not run `git commit`, `git push`, `git rebase`, `git merge`, `git reset`, or change git remotes. The outer runner handles publish.
+- Stay inside this clone.
+- Do not deploy to the cluster or assume kube access. This run is repo-only.
+
+Repo/task context:
+- Feature branch: {{FEATURE_BRANCH}}
+- Base branch: {{BASE_BRANCH}}
+
+Execution expectations:
+- Read the affected code paths before editing.
+- Implement the requested change directly in this repo.
+- Run targeted validations that match the change.
+- Do not run full replica deploy or validation flows.
+- Preserve existing behavior outside the requested scope.
+- Keep going until the change is implemented and validated or you hit a concrete blocker you can explain.
+
+Task request:
+{{PROMPT}}

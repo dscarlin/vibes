@@ -10,6 +10,7 @@ import {
   dropDatabases,
   deriveTaskSlug,
   ensureManifestDefaults,
+  normalizeExecutionMode,
   normalizeNotifyOn,
   notificationShouldSend,
   overallRunStatus,
@@ -40,6 +41,28 @@ test('parseArgs handles resume and feature validation flags', () => {
   assert.equal(args.notifyEmail, 'alerts@example.com');
   assert.equal(args.notifyOn, 'failure');
   assert.equal(args.skipCleanup, true);
+});
+
+test('parseArgs handles repo-only execution mode and traceability flags', () => {
+  const args = parseArgs([
+    'run',
+    '--branch',
+    'ai/issue/ABC-123',
+    '--prompt-file',
+    '/tmp/prompt.md',
+    '--execution-mode',
+    'repo-only',
+    '--issue-key',
+    'ABC-123',
+    '--parent-run-id',
+    'run-123',
+    '--origin-meeting-id',
+    'meeting-123'
+  ]);
+  assert.equal(args.executionMode, 'repo-only');
+  assert.equal(args.issueKey, 'ABC-123');
+  assert.equal(args.parentRunId, 'run-123');
+  assert.equal(args.originMeetingId, 'meeting-123');
 });
 
 test('resolveNotificationSettings defaults to ottobotowner always', () => {
@@ -81,6 +104,11 @@ test('notificationShouldSend matches requested mode', () => {
 
 test('normalizeNotifyOn rejects invalid values', () => {
   assert.throws(() => normalizeNotifyOn('sometimes'), /Invalid --notify-on value/);
+});
+
+test('normalizeExecutionMode rejects invalid values', () => {
+  assert.equal(normalizeExecutionMode('repo-only'), 'repo-only');
+  assert.throws(() => normalizeExecutionMode('cluster-only'), /Invalid --execution-mode value/);
 });
 
 test('sesSenderIdentityCandidates falls back to the sender domain', () => {
@@ -236,6 +264,9 @@ test('validationWarningsFromArtifacts accepts a fully verified result', () => {
 
 test('overallRunStatus reports success only after verified push and clean cleanup', () => {
   const manifest = ensureManifestDefaults({
+    request: {
+      executionMode: 'repo-only'
+    },
     cleanup: {
       completedAt: '2026-03-16T00:00:00Z',
       errors: []
@@ -256,6 +287,7 @@ test('overallRunStatus reports success only after verified push and clean cleanu
   });
 
   assert.equal(overallRunStatus(manifest, { warnings: [] }), 'succeeded');
+  assert.equal(manifest.request.executionMode, 'repo-only');
 });
 
 test('overallRunStatus fails when push verification is missing', () => {

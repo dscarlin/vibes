@@ -1,4 +1,4 @@
-.PHONY: setup dev certs stop logs worker-kustomize aws-dev-up aws-dev-down server-apply web-apply build-push deploy-all desktop-release status-check db-tunnel stop-db-tunnel replica-plan replica-up replica-destroy-plan replica-down replica-validate replica-seed-secrets-plan replica-seed-secrets agent-task agent-task-resume agent-task-cleanup agent-task-janitor agent-task-test
+.PHONY: setup dev certs stop logs worker-kustomize aws-dev-up aws-dev-down server-apply web-apply build-push deploy-all desktop-release status-check db-tunnel stop-db-tunnel replica-plan replica-up replica-destroy-plan replica-down replica-validate replica-seed-secrets-plan replica-seed-secrets agent-task agent-task-resume agent-task-cleanup agent-task-janitor agent-task-test meeting-plans jira-stories jira-plans jira-build jira-code
 
 AWS_REGION ?= us-east-1
 RDS_CA_FILE ?= ./rds-ca.pem
@@ -118,3 +118,17 @@ agent-task-janitor:
 
 agent-task-test:
 	node --test ./scripts/agent-task/*.test.mjs
+
+meeting-plans:
+	node ./scripts/automation/index.mjs meeting-plans $(ARGS)
+
+jira-stories:
+	node ./scripts/automation/index.mjs jira-stories $(ARGS)
+
+jira-plans:
+	node ./scripts/automation/index.mjs jira-plans $(ARGS)
+
+jira-build:
+	node ./scripts/automation/index.mjs jira-build $(ARGS)
+
+jira-code: jira-build

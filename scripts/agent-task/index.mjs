@@ -29,6 +29,7 @@ import {
 
 const repoRoot = repoRootFrom(import.meta.url);
 const promptTemplatePath = path.join(repoRoot, 'scripts', 'agent-task', 'codex-wrapper-prompt.txt');
+const repoOnlyPromptTemplatePath = path.join(repoRoot, 'scripts', 'agent-task', 'codex-wrapper-repo-only-prompt.txt');
 const PLATFORM_NODEGROUP_NAME = 'platform-core';
 const MIN_PLATFORM_NODE_COUNT = 2;
 const DEFAULT_NOTIFY_EMAIL = 'ottobotowner@gmail.com';
@@ -37,6 +38,8 @@ const DEFAULT_NOTIFY_FROM_EMAIL = 'noreply@vibesplatform.ai';
 const DEFAULT_NOTIFY_REPLY_TO = 'ottobotowner@gmail.com';
 const DEFAULT_NOTIFY_REGION = 'us-east-1';
 const NOTIFY_MODES = new Set(['always', 'success', 'failure', 'never']);
+const EXECUTION_MODES = new Set(['full', 'repo-only']);
+const CODEX_AUTH_MODES = new Set(['api-key', 'chatgpt']);
 const TASK_DATABASE_ENV_SUFFIXES = ['_development', '_testing', '_production'];
 const NON_BLOCKING_VALIDATION_STAGE_NAMES = new Set(['validation', 'feature-validation']);
 
@@ -54,9 +57,13 @@ function usage() {
       '  --task-slug <slug>',
       '  --commit-message <message>',
       '  --model <model>',
+      '  --execution-mode <full|repo-only>',
       '  --timeout-minutes <minutes>',
       '  --feature-validation-cmd <shell command>',
       '  --feature-validation-file <path>',
+      '  --issue-key <ISSUE-KEY>',
+      '  --parent-run-id <run-id>',
+      '  --origin-meeting-id <meeting-id>',
       '  --notify-email <email>',
       '  --notify-on <always|success|failure|never>',
       '  --skip-push',
@@ -119,6 +126,19 @@ function normalizeNotifyOn(value) {
   const normalized = String(value || DEFAULT_NOTIFY_ON).trim().toLowerCase();
   if (NOTIFY_MODES.has(normalized)) return normalized;
   throw new Error(`Invalid --notify-on value: ${value}`);
+}
+
+function normalizeExecutionMode(value) {
+  const normalized = String(value || 'full').trim().toLowerCase();
+  if (EXECUTION_MODES.has(normalized)) return normalized;
+  throw new Error(`Invalid --execution-mode value: ${value}`);
+}
+
+function normalizeCodexAuthMode(value, executionMode = 'full') {
+  const fallback = normalizeExecutionMode(executionMode) === 'repo-only' ? 'chatgpt' : 'api-key';
+  const normalized = String(value || fallback).trim().toLowerCase();
+  if (CODEX_AUTH_MODES.has(normalized)) return normalized;
+  throw new Error(`Invalid Codex auth mode: ${value}`);
 }
 
 function resolveNotificationSettings(args = {}, stored = {}) {
@@ -199,12 +219,17 @@ async function saveManifest(manifest) {
 }
 
 function ensureManifestDefaults(manifest) {
-  manifest.version = Math.max(Number(manifest.version || 0), 2);
+  manifest.version = Math.max(Number(manifest.version || 0), 3);
   manifest.paths = manifest.paths || {};
   if (manifest.paths.runDir && !manifest.paths.reportPath) {
     manifest.paths.reportPath = path.join(manifest.paths.runDir, 'final-report.json');
   }
   manifest.request = manifest.request || {};
+  manifest.request.executionMode = normalizeExecutionMode(manifest.request.executionMode || 'full');
+  manifest.request.codexAuthMode = normalizeCodexAuthMode(
+    manifest.request.codexAuthMode || '',
+    manifest.request.executionMode
+  );
   manifest.resources = manifest.resources || {};
   manifest.resources.platformImages = Array.isArray(manifest.resources.platformImages)
     ? manifest.resources.platformImages
@@ -1275,15 +1300,17 @@ async function deployPlatform(manifest, phase) {
 }
 
 async function buildCodexPrompt(manifest, prompt) {
-  const template = await fs.readFile(promptTemplatePath, 'utf8');
+  const executionMode = normalizeExecutionMode(manifest.request?.executionMode || 'full');
+  const templatePath = executionMode === 'repo-only' ? repoOnlyPromptTemplatePath : promptTemplatePath;
+  const template = await fs.readFile(templatePath, 'utf8');
   return template
     .replaceAll('{{FEATURE_BRANCH}}', manifest.repo.featureBranch)
     .replaceAll('{{BASE_BRANCH}}', manifest.repo.baseBranch)
     .replaceAll('{{MANIFEST_PATH}}', manifest.paths.manifestPath)
     .replaceAll('{{COMMANDS_PATH}}', path.join(manifest.repo.cloneDir, '.vp-task', 'COMMANDS.md'))
-    .replaceAll('{{API_URL}}', `https://${manifest.task.hosts.api}`)
-    .replaceAll('{{APP_URL}}', `https://${manifest.task.hosts.app}`)
-    .replaceAll('{{ROOT_HOST}}', manifest.task.hosts.root)
+    .replaceAll('{{API_URL}}', manifest.task?.hosts?.api ? `https://${manifest.task.hosts.api}` : '')
+    .replaceAll('{{APP_URL}}', manifest.task?.hosts?.app ? `https://${manifest.task.hosts.app}` : '')
+    .replaceAll('{{ROOT_HOST}}', manifest.task?.hosts?.root || '')
     .replaceAll('{{PROMPT}}', prompt.trim());
 }
 
@@ -1294,12 +1321,23 @@ async function runCodex(manifest, prompt, model, timeoutMs) {
   const codexHome = await prepareCodexHome(manifest);
   try {
     const fullPrompt = await buildCodexPrompt(manifest, prompt);
-    const mergedEnv = parseEnv(await fs.readFile(path.join(manifest.repo.cloneDir, '.env'), 'utf8'));
+    const rootEnvPath = path.join(manifest.repo.cloneDir, '.env');
+    const mergedEnv = await pathExists(rootEnvPath)
+      ? parseEnv(await fs.readFile(rootEnvPath, 'utf8'))
+      : {};
+    const codexAuthMode = normalizeCodexAuthMode(
+      process.env.AGENT_TASK_CODEX_AUTH_MODE || manifest.request?.codexAuthMode || '',
+      manifest.request?.executionMode || 'full'
+    );
     const env = {
       ...process.env,
       ...mergedEnv,
       CODEX_HOME: codexHome
     };
+    if (codexAuthMode === 'chatgpt') {
+      delete env.OPENAI_API_KEY;
+      await runCommand(binary, ['login', 'status'], { cwd: repoRoot });
+    }
     const args = [
       'exec',
       '--ephemeral',
@@ -2196,6 +2234,7 @@ function resolveRunOptions(manifest, args = {}) {
     prompt: String(manifest.request?.prompt || ''),
     commitMessage: String(args.commitMessage || manifest.request?.commitMessage || `feat: ${manifest.repo.featureBranch}`),
     model: String(args.model || manifest.request?.model || 'gpt-5.4'),
+    executionMode: normalizeExecutionMode(args.executionMode || manifest.request?.executionMode || 'full'),
     timeoutMs: Math.max(
       15,
       Number(args.timeoutMinutes || manifest.request?.timeoutMinutes || 120)
@@ -2231,11 +2270,16 @@ async function createRunManifest(args) {
       prompt,
       commitMessage: String(args.commitMessage || `feat: ${featureBranch}`),
       model: String(args.model || 'gpt-5.4'),
+      executionMode: normalizeExecutionMode(args.executionMode || 'full'),
+      codexAuthMode: normalizeCodexAuthMode(process.env.AGENT_TASK_CODEX_AUTH_MODE || '', args.executionMode || 'full'),
       timeoutMinutes: Math.max(15, Number(args.timeoutMinutes || 120)),
       skipPush: Boolean(args.skipPush),
       skipCleanup: Boolean(args.skipCleanup),
       keepClone: Boolean(args.keepClone),
       featureValidationCommand,
+      issueKey: String(args.issueKey || '').trim(),
+      parentRunId: String(args.parentRunId || '').trim(),
+      originMeetingId: String(args.originMeetingId || '').trim(),
       notifyEmail: resolveNotificationSettings(args, {}).email,
       notifyOn: resolveNotificationSettings(args, {}).notifyOn
     },
@@ -2309,21 +2353,28 @@ async function executeRun(manifest, args = {}) {
       }
     );
 
-    await runStage(manifest, 'overlay', async () => {
-      await buildTaskOverlay(manifest);
-      return { generatedDir: manifest.paths.generatedDir };
-    });
+    if (options.executionMode === 'repo-only') {
+      await skipStage(manifest, 'overlay', 'Repo-only execution skips task overlay');
+      await skipStage(manifest, 'platform-capacity', 'Repo-only execution skips cluster capacity changes');
+      await skipStage(manifest, 'worker-irsa-trust', 'Repo-only execution skips IRSA changes');
+      await skipStage(manifest, 'deploy-pre-codex', 'Repo-only execution skips replica deploy');
+    } else {
+      await runStage(manifest, 'overlay', async () => {
+        await buildTaskOverlay(manifest);
+        return { generatedDir: manifest.paths.generatedDir };
+      });
 
-    if (!['completed', 'skipped'].includes(stageRecord(manifest, 'platform-capacity')?.status || '')) {
-      await skipStage(manifest, 'platform-capacity', 'Automatic replica capacity changes are disabled');
-    }
+      if (!['completed', 'skipped'].includes(stageRecord(manifest, 'platform-capacity')?.status || '')) {
+        await skipStage(manifest, 'platform-capacity', 'Automatic replica capacity changes are disabled');
+      }
 
-    if (!['completed', 'skipped'].includes(stageRecord(manifest, 'worker-irsa-trust')?.status || '')) {
-      await skipStage(manifest, 'worker-irsa-trust', 'Automatic replica IRSA changes are disabled');
-    }
+      if (!['completed', 'skipped'].includes(stageRecord(manifest, 'worker-irsa-trust')?.status || '')) {
+        await skipStage(manifest, 'worker-irsa-trust', 'Automatic replica IRSA changes are disabled');
+      }
 
-    if (!['completed', 'skipped'].includes(stageRecord(manifest, 'deploy-pre-codex')?.status || '')) {
-      await skipStage(manifest, 'deploy-pre-codex', 'Automatic replica deploy is disabled');
+      if (!['completed', 'skipped'].includes(stageRecord(manifest, 'deploy-pre-codex')?.status || '')) {
+        await skipStage(manifest, 'deploy-pre-codex', 'Automatic replica deploy is disabled');
+      }
     }
 
     await runStage(
@@ -2342,14 +2393,22 @@ async function executeRun(manifest, args = {}) {
     );
 
     if (!['completed', 'skipped'].includes(stageRecord(manifest, 'deploy-post-codex')?.status || '')) {
-      await skipStage(manifest, 'deploy-post-codex', 'Automatic replica deploy is disabled');
+      await skipStage(
+        manifest,
+        'deploy-post-codex',
+        options.executionMode === 'repo-only'
+          ? 'Repo-only execution skips replica deploy'
+          : 'Automatic replica deploy is disabled'
+      );
     }
 
     if (!['completed', 'skipped'].includes(stageRecord(manifest, 'validation')?.status || '')) {
       await skipStage(
         manifest,
         'validation',
-        'Full replica validation is disabled; rely on targeted validations instead'
+        options.executionMode === 'repo-only'
+          ? 'Repo-only execution skips full replica validation'
+          : 'Full replica validation is disabled; rely on targeted validations instead'
       );
     }
 
@@ -2415,7 +2474,9 @@ async function executeRun(manifest, args = {}) {
 }
 
 async function runFlow(args) {
-  await ensureKubeAccess();
+  if (normalizeExecutionMode(args.executionMode || 'full') !== 'repo-only') {
+    await ensureKubeAccess();
+  }
   const manifest = await createRunManifest(args);
   let primaryError = null;
   try {
@@ -2429,8 +2490,10 @@ async function runFlow(args) {
 }
 
 async function resumeFlow(args) {
-  await ensureKubeAccess();
   const manifest = await loadManifestForResume(requiredArg(args, 'manifest'));
+  if (normalizeExecutionMode(manifest.request?.executionMode || args.executionMode || 'full') !== 'repo-only') {
+    await ensureKubeAccess();
+  }
   let primaryError = null;
   try {
     await executeRun(manifest, args);
@@ -2595,12 +2658,17 @@ export {
   notificationShouldSend,
   domainFromEmailAddress,
   sesSenderIdentityCandidates,
+  ensureKubeAccess,
   buildTaskContext,
+  buildTaskOverlay,
   cleanupValidation,
+  cleanupManifest,
   cleanupCompletedCleanly,
+  deployPlatform,
   dropDatabases,
   deriveTaskSlug,
   ensureManifestDefaults,
+  normalizeExecutionMode,
   normalizeNotifyOn,
   overallRunStatus,
   parseArgs,

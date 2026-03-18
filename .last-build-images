@@ -1,5 +1,5 @@
 REGISTRY=897297231794.dkr.ecr.us-east-1.amazonaws.com
-TAG=fc5c0cf-dirty-20260317161139
-897297231794.dkr.ecr.us-east-1.amazonaws.com/vibes-server:fc5c0cf-dirty-20260317161139
-897297231794.dkr.ecr.us-east-1.amazonaws.com/vibes-web:fc5c0cf-dirty-20260317161139
-897297231794.dkr.ecr.us-east-1.amazonaws.com/vibes-worker:fc5c0cf-dirty-20260317161139
+TAG=6e4bf15
+897297231794.dkr.ecr.us-east-1.amazonaws.com/vibes-server:6e4bf15
+897297231794.dkr.ecr.us-east-1.amazonaws.com/vibes-web:6e4bf15
+897297231794.dkr.ecr.us-east-1.amazonaws.com/vibes-worker:6e4bf15
